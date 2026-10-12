@@ -1,0 +1,369 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id                        String              @id @default(cuid())
+  email                     String              @unique
+  phone                     String?             @unique
+  password                  String?
+  resetToken                String?
+  resetTokenExpiry          DateTime?
+  verificationCode          String?
+  verificationExpiry        DateTime?
+  name                      String
+  role                      String
+  department                String?
+  avatarUrl                 String?
+  isSignupCompleted         Boolean             @default(false)
+  createdAt                 DateTime            @default(now())
+  updatedAt                 DateTime            @updatedAt
+  allocations               Allocation[]
+  approvalRequestsApproving ApprovalRequest[]   @relation("ApprovalApprover")
+  approvalRequestsRequested ApprovalRequest[]   @relation("ApprovalRequester")
+  chatMessages              ChatMessage[]       @relation("ChatAuthor")
+  chatReadStates            ChatReadState[]
+  documentsUploaded         Document[]          @relation("DocUploader")
+  documentVersionsUploaded  DocumentVersion[]   @relation("DocVersionUploader")
+  issuesOwned               Issue[]             @relation("IssueOwner")
+  issuesRaised              Issue[]             @relation("IssueRaiser")
+  leaveRequests             LeaveRequest[]      @relation("LeaveRequester")
+  leaveReviews              LeaveRequest[]      @relation("LeaveReviewer")
+  notifications             Notification[]
+  ownedProjects             Project[]           @relation("ProjectOwner")
+  memberships               ProjectMembership[]
+  qualityChecks             QualityCheck[]      @relation("QualityCheckedBy")
+  reminders                 Reminder[]
+  risksOwned                Risk[]              @relation("RiskOwner")
+  statusOverrides           StatusOverrideLog[]
+  tasks                     Task[]              @relation("TaskAssignee")
+}
+
+model Project {
+  id               String              @id @default(cuid())
+  name             String
+  goal             String
+  ownerId          String
+  sponsor          String
+  startDate        DateTime
+  endDate          DateTime
+  plannedBudget    Float               @default(0)
+  contingency      Float               @default(0)
+  spendToDate      Float               @default(0)
+  statusOverride   String?
+  baselineId       String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  allocations      Allocation[]
+  approvalRequests ApprovalRequest[]
+  baselines        Baseline[]
+  changeLogs       ChangeLogEntry[]
+  chatMessages     ChatMessage[]
+  documents        Document[]
+  issues           Issue[]
+  milestones       Milestone[]
+  phases           Phase[]
+  owner            User                @relation("ProjectOwner", fields: [ownerId], references: [id])
+  memberships      ProjectMembership[]
+  risks            Risk[]
+  statusLogs       StatusOverrideLog[]
+}
+
+model ProjectMembership {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String   @default("Member")
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+}
+
+model Baseline {
+  id           String   @id @default(cuid())
+  projectId    String
+  name         String
+  version      Int      @default(1)
+  approvedBy   String
+  approvedAt   DateTime @default(now())
+  dataSnapshot String
+  createdAt    DateTime @default(now())
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Phase {
+  id            String   @id @default(cuid())
+  projectId     String
+  name          String
+  plannedStart  DateTime
+  plannedEnd    DateTime
+  order         Int
+  plannedBudget Float    @default(0)
+  spendToDate   Float    @default(0)
+  isArchived    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks         Task[]
+
+  @@unique([projectId, name])
+}
+
+model Task {
+  id             String         @id @default(cuid())
+  phaseId        String
+  title          String
+  assigneeId     String?
+  priority       String         @default("Normal")
+  plannedStart   DateTime
+  plannedEnd     DateTime
+  plannedHours   Int            @default(0)
+  actualHours    Int            @default(0)
+  state          String         @default("Not started")
+  dependsOn      String?
+  isBaselined    Boolean        @default(false)
+  hasRiskFlag    Boolean        @default(false)
+  riskFlagReason String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  issues         Issue[]
+  qualityChecks  QualityCheck[]
+  risks          Risk[]
+  assignee       User?          @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  phase          Phase          @relation(fields: [phaseId], references: [id], onDelete: Cascade)
+}
+
+model QualityCheck {
+  id        String    @id @default(cuid())
+  taskId    String
+  label     String
+  mandatory Boolean   @default(false)
+  checkedBy String?
+  checkedAt DateTime?
+  createdAt DateTime  @default(now())
+  checker   User?     @relation("QualityCheckedBy", fields: [checkedBy], references: [id])
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}
+
+model Milestone {
+  id           String    @id @default(cuid())
+  projectId    String
+  title        String
+  baselineDate DateTime
+  forecastDate DateTime
+  actualDate   DateTime?
+  isBaselined  Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  project      Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Risk {
+  id             String    @id @default(cuid())
+  projectId      String
+  taskId         String?
+  description    String
+  severity       String    @default("Medium")
+  mitigation     String?
+  ownerId        String
+  lastReviewedAt DateTime  @default(now())
+  closedAt       DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  owner          User      @relation("RiskOwner", fields: [ownerId], references: [id])
+  project        Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task           Task?     @relation(fields: [taskId], references: [id])
+}
+
+model Issue {
+  id            String    @id @default(cuid())
+  projectId     String
+  taskId        String?
+  title         String
+  severity      String
+  state         String    @default("Open")
+  ownerId       String
+  detail        String
+  raisedBy      String
+  raisedAt      DateTime  @default(now())
+  closedAt      DateTime?
+  reopenComment String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  owner         User      @relation("IssueOwner", fields: [ownerId], references: [id])
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  raiser        User      @relation("IssueRaiser", fields: [raisedBy], references: [id])
+  task          Task?     @relation(fields: [taskId], references: [id])
+}
+
+model Allocation {
+  id             String   @id @default(cuid())
+  userId         String
+  projectId      String
+  weekStartDate  DateTime
+  allocatedHours Float    @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, projectId, weekStartDate])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  projectId String?
+  title     String
+  message   String
+  type      String
+  isRead    Boolean  @default(false)
+  isPush    Boolean  @default(false)
+  linkUrl   String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ChangeLogEntry {
+  id         String   @id @default(cuid())
+  projectId  String
+  what       String?
+  fromValue  String?
+  toValue    String?
+  actorId    String?
+  at         DateTime @default(now())
+  sourceType String?
+  sourceId   String?
+  entityType String?
+  entityId   String?
+  action     String?
+  details    String?
+  changedBy  String?
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model StatusOverrideLog {
+  id           String   @id @default(cuid())
+  projectId    String
+  fromStatus   String
+  toStatus     String
+  reason       String
+  overriddenBy String
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [overriddenBy], references: [id])
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  projectId String
+  authorId  String
+  body      String
+  mentions  String   @default("[]")
+  sentAt    DateTime @default(now())
+  author    User     @relation("ChatAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model ChatReadState {
+  id         String   @id @default(cuid())
+  projectId  String
+  userId     String
+  lastReadAt DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+}
+
+model ApprovalRequest {
+  id                String    @id @default(cuid())
+  projectId         String
+  type              String
+  summary           String
+  detail            String
+  impact            String
+  requestedBy       String
+  requestedAt       DateTime  @default(now())
+  approverId        String
+  state             String    @default("Pending")
+  decidedAt         DateTime?
+  decisionNote      String?
+  payload           String
+  version           Int       @default(1)
+  previousRequestId String?
+  approver          User      @relation("ApprovalApprover", fields: [approverId], references: [id])
+  project           Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requester         User      @relation("ApprovalRequester", fields: [requestedBy], references: [id], onDelete: Cascade)
+}
+
+model Document {
+  id             String            @id @default(cuid())
+  projectId      String
+  title          String
+  description    String?
+  fileType       String
+  currentVersion Int               @default(1)
+  uploadedBy     String
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  project        Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  uploader       User              @relation("DocUploader", fields: [uploadedBy], references: [id])
+  versions       DocumentVersion[]
+}
+
+model DocumentVersion {
+  id         String   @id @default(cuid())
+  documentId String
+  version    Int
+  fileName   String
+  fileSize   Int
+  mimeType   String
+  s3Key      String
+  s3Bucket   String
+  uploadedBy String
+  uploadedAt DateTime @default(now())
+  comment    String?
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  uploader   User     @relation("DocVersionUploader", fields: [uploadedBy], references: [id])
+
+  @@unique([documentId, version])
+}
+
+model Reminder {
+  id           String   @id @default(cuid())
+  userId       String
+  title        String
+  description  String?
+  reminderDate DateTime
+  isCompleted  Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model LeaveRequest {
+  id          String    @id @default(cuid())
+  requestedBy String
+  startDate   DateTime
+  endDate     DateTime
+  dayType     String    @default("Full day") // "Full day" | "Half day"
+  leaveType   String    // "Annual Leave" | "Sick Leave" | "Personal Leave" | "Unpaid Leave" | "Other"
+  reason      String?
+  status      String    @default("Pending") // "Pending" | "Approved" | "Sent back" | "Declined"
+  reviewNote  String?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  requester   User      @relation("LeaveRequester", fields: [requestedBy], references: [id], onDelete: Cascade)
+  reviewer    User?     @relation("LeaveReviewer", fields: [reviewedBy], references: [id])
+}

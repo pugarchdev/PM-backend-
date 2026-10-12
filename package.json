@@ -1,0 +1,38 @@
+{
+  "name": "backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "api/index.js",
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "build": "esbuild ./server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.js && esbuild ./server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=api/index.js",
+    "start": "node dist/server.js",
+    "postinstall": "prisma generate",
+    "db:push": "prisma db push --schema=prisma/schema.prisma",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:create-ceo": "tsx prisma/create-ceo.ts",
+    "db:studio": "prisma studio --schema=prisma/schema.prisma",
+    "db:generate": "prisma generate --schema=prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1133.0",
+    "@prisma/client": "^5.22.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "multer": "^2.4.0",
+    "socket.io": "^4.8.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^22.14.0",
+    "esbuild": "^0.25.0",
+    "prisma": "^5.22.0",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2"
+  }
+}
