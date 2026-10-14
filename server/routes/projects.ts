@@ -84,8 +84,8 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     // CEO sees ALL projects
     if (user.role === 'CEO') {
       whereClause = {};
-    } else if (user.role === 'ProjectOwner') {
-      // Project Owner sees projects they own OR where they are a member
+    } else if (user.role === 'CTO') {
+      // CTO sees projects they own OR where they are a member
       whereClause = {
         OR: [
           { ownerId: user.id },
@@ -149,7 +149,7 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
 
     const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0 } = validation.data;
 
-    // Determine project owner: CEO can designate any owner or themselves; ProjectOwner is always owner
+    // Determine project owner: CEO can designate any owner or themselves; CTO is always owner
     let designatedOwnerId = user.id;
     if (user.role === 'CEO' && validation.data.ownerId) {
       const targetUser = await prisma.user.findUnique({ where: { id: validation.data.ownerId } });
@@ -319,7 +319,7 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
       if (!isMember && !hasAssignedTask) {
         return res.status(403).json({ error: 'Forbidden: You are not a member of this project' });
       }
-    } else if (user.role === 'ProjectOwner') {
+    } else if (user.role === 'CTO') {
       const isOwnerOrMember =
         project.ownerId === user.id || project.memberships.some((m) => m.userId === user.id);
       if (!isOwnerOrMember) {

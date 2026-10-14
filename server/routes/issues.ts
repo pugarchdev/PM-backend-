@@ -201,8 +201,8 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: 'Forbidden: Employees can only update their own issues.' });
     }
 
-    if (user.role === 'ProjectOwner' && issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: Project Owners can only update issues on their own projects or issues they raised.' });
+    if (user.role === 'CTO' && issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: CTO can only update issues on their own projects or issues they raised.' });
     }
 
     const validation = IssueUpdateSchema.safeParse(req.body);
@@ -246,10 +246,10 @@ router.post('/:id/close', requireAuth, async (req: AuthRequest, res: Response) =
           error: 'Forbidden: Employees can only close issues they raised or own.',
         });
       }
-    } else if (user.role === 'ProjectOwner') {
+    } else if (user.role === 'CTO') {
       if (issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
         return res.status(403).json({
-          error: 'Forbidden: Project Owners can only close issues on their own projects.',
+          error: 'Forbidden: CTO can only close issues on their own projects.',
         });
       }
     }
@@ -287,17 +287,17 @@ router.post('/:id/reopen', requireAuth, async (req: AuthRequest, res: Response) 
       return res.status(404).json({ error: 'Issue not found' });
     }
 
-    // RBAC: Employee can only reopen their own issues; ProjectOwner can reopen on own projects; CEO can reopen all
+    // RBAC: Employee can only reopen their own issues; CTO can reopen on own projects; CEO can reopen all
     if (user.role === 'Employee') {
       if (issue.raisedBy !== user.id && issue.ownerId !== user.id) {
         return res.status(403).json({
           error: 'Forbidden: Employees can only reopen issues they raised or own.',
         });
       }
-    } else if (user.role === 'ProjectOwner') {
+    } else if (user.role === 'CTO') {
       if (issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
         return res.status(403).json({
-          error: 'Forbidden: Project Owners can only reopen issues on their own projects or issues they raised.',
+          error: 'Forbidden: CTO can only reopen issues on their own projects or issues they raised.',
         });
       }
     }

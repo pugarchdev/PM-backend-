@@ -3,8 +3,8 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 
 const CEO_DATA = {
-  name: 'Eleanor Foley',
-  email: 'eleanor.foley@fernandfoley.internal',
+  name: 'Harish Adatiya',
+  email: 'harish.adatiya24@gmail.com',
   phone: '+442079460991',
   role: 'CEO' as const,
   department: 'Executive Leadership',

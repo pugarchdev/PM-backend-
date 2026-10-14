@@ -10,7 +10,7 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
   let projectFilter: any = {};
   if (user.role === 'CEO') {
     projectFilter = {}; // CEO sees all
-  } else if (user.role === 'ProjectOwner') {
+  } else if (user.role === 'CTO') {
     projectFilter = {
       OR: [
         { ownerId: user.id },

@@ -43,6 +43,8 @@ model User {
   risksOwned                Risk[]              @relation("RiskOwner")
   statusOverrides           StatusOverrideLog[]
   tasks                     Task[]              @relation("TaskAssignee")
+
+  @@index([role])
 }
 
 model Project {
@@ -65,6 +67,7 @@ model Project {
   baselines        Baseline[]
   changeLogs       ChangeLogEntry[]
   chatMessages     ChatMessage[]
+  chatReadStates   ChatReadState[]
   documents        Document[]
   issues           Issue[]
   milestones       Milestone[]
@@ -73,6 +76,8 @@ model Project {
   memberships      ProjectMembership[]
   risks            Risk[]
   statusLogs       StatusOverrideLog[]
+
+  @@index([ownerId])
 }
 
 model ProjectMembership {
@@ -85,6 +90,8 @@ model ProjectMembership {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([projectId, userId])
+  @@index([projectId])
+  @@index([userId])
 }
 
 model Baseline {
@@ -97,6 +104,9 @@ model Baseline {
   dataSnapshot String
   createdAt    DateTime @default(now())
   project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, version])
+  @@index([projectId])
 }
 
 model Phase {
@@ -115,6 +125,7 @@ model Phase {
   tasks         Task[]
 
   @@unique([projectId, name])
+  @@index([projectId])
 }
 
 model Task {
@@ -137,8 +148,12 @@ model Task {
   issues         Issue[]
   qualityChecks  QualityCheck[]
   risks          Risk[]
-  assignee       User?          @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  assignee       User?          @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
   phase          Phase          @relation(fields: [phaseId], references: [id], onDelete: Cascade)
+
+  @@index([phaseId])
+  @@index([assigneeId])
+  @@index([state])
 }
 
 model QualityCheck {
@@ -149,8 +164,11 @@ model QualityCheck {
   checkedBy String?
   checkedAt DateTime?
   createdAt DateTime  @default(now())
-  checker   User?     @relation("QualityCheckedBy", fields: [checkedBy], references: [id])
+  checker   User?     @relation("QualityCheckedBy", fields: [checkedBy], references: [id], onDelete: SetNull)
   task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@index([checkedBy])
 }
 
 model Milestone {
@@ -164,6 +182,9 @@ model Milestone {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   project      Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([forecastDate])
 }
 
 model Risk {
@@ -180,7 +201,11 @@ model Risk {
   updatedAt      DateTime  @updatedAt
   owner          User      @relation("RiskOwner", fields: [ownerId], references: [id])
   project        Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  task           Task?     @relation(fields: [taskId], references: [id])
+  task           Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([ownerId])
+  @@index([taskId])
 }
 
 model Issue {
@@ -201,7 +226,12 @@ model Issue {
   owner         User      @relation("IssueOwner", fields: [ownerId], references: [id])
   project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
   raiser        User      @relation("IssueRaiser", fields: [raisedBy], references: [id])
-  task          Task?     @relation(fields: [taskId], references: [id])
+  task          Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([ownerId])
+  @@index([taskId])
+  @@index([state])
 }
 
 model Allocation {
@@ -216,6 +246,8 @@ model Allocation {
   user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, projectId, weekStartDate])
+  @@index([projectId])
+  @@index([userId])
 }
 
 model Notification {
@@ -230,6 +262,9 @@ model Notification {
   linkUrl   String?
   createdAt DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@index([projectId])
 }
 
 model ChangeLogEntry {
@@ -249,6 +284,10 @@ model ChangeLogEntry {
   changedBy  String?
   createdAt  DateTime @default(now())
   project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([actorId])
+  @@index([at])
 }
 
 model StatusOverrideLog {
@@ -261,6 +300,9 @@ model StatusOverrideLog {
   createdAt    DateTime @default(now())
   user         User     @relation(fields: [overriddenBy], references: [id])
   project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([overriddenBy])
 }
 
 model ChatMessage {
@@ -272,6 +314,9 @@ model ChatMessage {
   sentAt    DateTime @default(now())
   author    User     @relation("ChatAuthor", fields: [authorId], references: [id], onDelete: Cascade)
   project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, sentAt])
+  @@index([authorId])
 }
 
 model ChatReadState {
@@ -279,9 +324,12 @@ model ChatReadState {
   projectId  String
   userId     String
   lastReadAt DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([projectId, userId])
+  @@index([userId])
+  @@index([projectId])
 }
 
 model ApprovalRequest {
@@ -303,6 +351,10 @@ model ApprovalRequest {
   approver          User      @relation("ApprovalApprover", fields: [approverId], references: [id])
   project           Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
   requester         User      @relation("ApprovalRequester", fields: [requestedBy], references: [id], onDelete: Cascade)
+
+  @@index([projectId, state])
+  @@index([approverId])
+  @@index([requestedBy])
 }
 
 model Document {
@@ -318,6 +370,9 @@ model Document {
   project        Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
   uploader       User              @relation("DocUploader", fields: [uploadedBy], references: [id])
   versions       DocumentVersion[]
+
+  @@index([projectId])
+  @@index([uploadedBy])
 }
 
 model DocumentVersion {
@@ -336,6 +391,7 @@ model DocumentVersion {
   uploader   User     @relation("DocVersionUploader", fields: [uploadedBy], references: [id])
 
   @@unique([documentId, version])
+  @@index([uploadedBy])
 }
 
 model Reminder {
@@ -348,6 +404,8 @@ model Reminder {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, reminderDate])
 }
 
 model LeaveRequest {
@@ -365,5 +423,9 @@ model LeaveRequest {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   requester   User      @relation("LeaveRequester", fields: [requestedBy], references: [id], onDelete: Cascade)
-  reviewer    User?     @relation("LeaveReviewer", fields: [reviewedBy], references: [id])
+  reviewer    User?     @relation("LeaveReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+
+  @@index([requestedBy])
+  @@index([reviewedBy])
+  @@index([status])
 }

@@ -222,7 +222,7 @@ router.patch('/:id', async (req: AuthRequest, res: Response) => {
       });
     }
 
-    if (user.role === 'ProjectOwner' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
+    if (user.role === 'CTO' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
       return res.status(403).json({
         error: 'Forbidden: You can only update tasks on projects you own or tasks assigned to you.',
       });
@@ -346,7 +346,7 @@ router.post('/:id/state', async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: 'Employees can only update their own assigned tasks.' });
     }
 
-    if (user.role === 'ProjectOwner' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
+    if (user.role === 'CTO' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
       return res.status(403).json({ error: 'You can only update tasks on projects you own or tasks assigned to you.' });
     }
 
@@ -528,7 +528,7 @@ router.post('/:id/quality-checks', async (req: AuthRequest, res: Response) => {
       });
     }
 
-    if (user.role === 'ProjectOwner' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
+    if (user.role === 'CTO' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
       return res.status(403).json({
         error: 'Forbidden: You can only add quality checks on projects you own or tasks assigned to you.',
       });
@@ -577,7 +577,7 @@ router.post('/quality-checks/:id/toggle', async (req: AuthRequest, res: Response
       });
     }
 
-    if (user.role === 'ProjectOwner' && check.task.phase.project.ownerId !== user.id && check.task.assigneeId !== user.id) {
+    if (user.role === 'CTO' && check.task.phase.project.ownerId !== user.id && check.task.assigneeId !== user.id) {
       return res.status(403).json({
         error: 'Forbidden: You can only check off quality requirements on projects you own or tasks assigned to you.',
       });

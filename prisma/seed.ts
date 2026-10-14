@@ -6,14 +6,21 @@ async function main() {
   console.log('Seeding Fern & Foley — Projects database...');
 
   // 1. Clean existing data in dependency order
-  await prisma.notification.deleteMany();
-  await prisma.changeLogEntry.deleteMany();
+  await prisma.leaveRequest.deleteMany();
+  await prisma.reminder.deleteMany();
+  await prisma.documentVersion.deleteMany();
+  await prisma.document.deleteMany();
+  await prisma.approvalRequest.deleteMany();
+  await prisma.chatReadState.deleteMany();
+  await prisma.chatMessage.deleteMany();
   await prisma.statusOverrideLog.deleteMany();
+  await prisma.changeLogEntry.deleteMany();
+  await prisma.notification.deleteMany();
   await prisma.allocation.deleteMany();
   await prisma.issue.deleteMany();
   await prisma.risk.deleteMany();
-  await prisma.milestone.deleteMany();
   await prisma.qualityCheck.deleteMany();
+  await prisma.milestone.deleteMany();
   await prisma.task.deleteMany();
   await prisma.phase.deleteMany();
   await prisma.baseline.deleteMany();
@@ -24,8 +31,8 @@ async function main() {
   // 2. Create Users
   const ceo = await prisma.user.create({
     data: {
-      name: 'Eleanor Foley',
-      email: 'eleanor.foley@fernandfoley.internal',
+      name: 'Harish Adatiya',
+      email: 'harish.adatiya24@gmail.com',
       phone: '+442079460991',
       role: 'CEO',
       department: 'Executive Leadership',
@@ -36,12 +43,12 @@ async function main() {
 
   const poMarcus = await prisma.user.create({
     data: {
-      name: 'Marcus Vance',
-      email: 'marcus.vance@fernandfoley.internal',
+      name: 'Sanket Chandekar',
+      email: 'sanket.chandekar@pugarch.in',
       phone: '+442079460992',
-      role: 'ProjectOwner',
+      role: 'CTO',
       department: 'Engineering & Operations',
-      avatarUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
+      avatarUrl: 'https://api.dicebear.com/7.x/initials/svg?seed=Sanket%20Chandekar',
       isSignupCompleted: true,
     } as any,
   });
@@ -51,7 +58,7 @@ async function main() {
       name: 'Sarah Chen',
       email: 'sarah.chen@fernandfoley.internal',
       phone: '+442079460993',
-      role: 'ProjectOwner',
+      role: 'CTO',
       department: 'Brand & Supply Chain',
       avatarUrl: 'https://images.unsplash.com/photo-1580489944761-15a19d654956?w=150&auto=format&fit=crop&q=80',
       isSignupCompleted: true,
@@ -108,7 +115,7 @@ async function main() {
       name: 'Oat Mill Line 3',
       goal: 'Expand fine milling capacity to 4,200 tons/month to support European retailer demand and prevent seasonal shortages.',
       ownerId: poMarcus.id,
-      sponsor: 'Eleanor Foley',
+      sponsor: 'Harish Adatiya',
       startDate: makeDate('2026-06-01T00:00:00Z'),
       endDate: makeDate('2026-11-30T00:00:00Z'),
       plannedBudget: 1850000,
@@ -454,7 +461,7 @@ async function main() {
       name: 'Packaging Refresh',
       goal: 'Transition all retail oat porridge and granola SKUs to 100% compostable barrier film with FSC certified paperboard.',
       ownerId: poSarah.id,
-      sponsor: 'Eleanor Foley',
+      sponsor: 'Harish Adatiya',
       startDate: makeDate('2026-05-15T00:00:00Z'),
       endDate: makeDate('2026-10-15T00:00:00Z'),
       plannedBudget: 420000,
@@ -612,7 +619,7 @@ async function main() {
       name: 'Ashford Warehouse Move',
       goal: 'Consolidate 3 regional storage units into a single high-bay 8,500-pallet automated facility in Ashford.',
       ownerId: poMarcus.id,
-      sponsor: 'Eleanor Foley',
+      sponsor: 'Harish Adatiya',
       startDate: makeDate('2026-07-01T00:00:00Z'),
       endDate: makeDate('2026-12-20T00:00:00Z'),
       plannedBudget: 980000,
@@ -714,7 +721,7 @@ async function main() {
       name: 'Trade Ordering Portal',
       goal: 'Self-service wholesale portal enabling 450+ retail stockists to order pallet quantities with automated credit checks.',
       ownerId: poSarah.id,
-      sponsor: 'Eleanor Foley',
+      sponsor: 'Harish Adatiya',
       startDate: makeDate('2026-08-01T00:00:00Z'),
       endDate: makeDate('2026-12-15T00:00:00Z'),
       plannedBudget: 310000,

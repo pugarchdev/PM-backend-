@@ -19,7 +19,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       whereClause = { requestedBy: user.id };
     } else if (user.role === 'CEO') {
       whereClause = {}; // CEO sees all approvals
-    } else if (user.role === 'ProjectOwner') {
+    } else if (user.role === 'CTO') {
       whereClause = {
         OR: [
           { approverId: user.id },

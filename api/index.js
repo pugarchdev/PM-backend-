@@ -5,6 +5,9 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 
+// server/auth.ts
+import crypto from "crypto";
+
 // lib/prisma.ts
 import dotenv from "dotenv";
 import path from "path";
@@ -22,6 +25,85 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 // server/auth.ts
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+function isValidEmail(email) {
+  const clean = normalizeEmail(email);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean);
+}
+function normalizePhone(phone) {
+  const trimmed = String(phone || "").trim();
+  const hasPlus = trimmed.startsWith("+");
+  const digitsOnly = trimmed.replace(/\D/g, "");
+  return hasPlus ? `+${digitsOnly}` : digitsOnly;
+}
+function isValidPhone(phone) {
+  const clean = normalizePhone(phone);
+  const digits = clean.replace(/\D/g, "");
+  return digits.length >= 7 && digits.length <= 15;
+}
+function validatePassword(password) {
+  if (typeof password !== "string") {
+    return {
+      isValid: false,
+      errors: ["Password must be a valid string."],
+      details: {
+        hasMinLength: false,
+        hasUppercase: false,
+        hasLowercase: false,
+        hasNumber: false,
+        hasSpecialChar: false
+      }
+    };
+  }
+  const hasMinLength = password.length >= 12 && password.toLowerCase() !== "password123!";
+  const hasUppercase = /[A-Z]/.test(password);
+  const hasLowercase = /[a-z]/.test(password);
+  const hasNumber = /\d/.test(password);
+  const hasSpecialChar = /[^A-Za-z0-9]/.test(password);
+  const errors = [];
+  if (!hasMinLength) errors.push("Password must be at least 12 characters in length.");
+  if (!hasUppercase) errors.push("Password must contain at least one uppercase letter (A-Z).");
+  if (!hasLowercase) errors.push("Password must contain at least one lowercase letter (a-z).");
+  if (!hasNumber) errors.push("Password must contain at least one numeric digit (0-9).");
+  if (!hasSpecialChar) errors.push("Password must contain at least one special character.");
+  return {
+    isValid: errors.length === 0,
+    errors,
+    details: {
+      hasMinLength,
+      hasUppercase,
+      hasLowercase,
+      hasNumber,
+      hasSpecialChar
+    }
+  };
+}
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, storedHash) {
+  if (!storedHash) return false;
+  try {
+    const [salt, key] = storedHash.split(":");
+    if (!salt || !key) return false;
+    const keyBuffer = Buffer.from(key, "hex");
+    const derivedKey = crypto.scryptSync(password, salt, 64);
+    return crypto.timingSafeEqual(keyBuffer, derivedKey);
+  } catch {
+    return false;
+  }
+}
+function parseIdentifier(identifier) {
+  const raw = String(identifier || "").trim();
+  if (raw.includes("@")) {
+    return { type: "email", value: normalizeEmail(raw) };
+  }
+  return { type: "phone", value: normalizePhone(raw) };
+}
 async function authenticate(req, res, next) {
   let userId;
   const authHeader = req.headers.authorization;
@@ -51,9 +133,11 @@ async function authenticate(req, res, next) {
         id: user.id,
         name: user.name,
         email: user.email,
+        phone: user.phone || null,
         role: user.role,
         department: user.department,
-        avatarUrl: user.avatarUrl
+        avatarUrl: user.avatarUrl,
+        isSignupCompleted: user.isSignupCompleted ?? true
       };
     }
     next();
@@ -68,17 +152,18 @@ function requireAuth(req, res, next) {
   }
   next();
 }
-function requireOwnerOrCEO(req, res, next) {
+function requireCTOOrCEO(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: "Unauthorized: Authentication required." });
   }
-  if (req.user.role !== "CEO" && req.user.role !== "ProjectOwner") {
+  if (req.user.role !== "CEO" && req.user.role !== "CTO") {
     return res.status(403).json({
-      error: "Forbidden: Only Project Owners or CEO have permission to perform this action."
+      error: "Forbidden: Only CTO or CEO have permission to perform this action."
     });
   }
   next();
 }
+var requireOwnerOrCEO = requireCTOOrCEO;
 function requireCEO(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: "Unauthorized: Authentication required." });
@@ -474,14 +559,418 @@ function emitToProject(projectId, event, data) {
 
 // server/routes/auth.ts
 import { Router as Router2 } from "express";
+
+// server/services/otpService.ts
+import crypto2 from "crypto";
+var OTP_EXPIRATION_MINUTES = 5;
+var OTP_EXPIRATION_MS = OTP_EXPIRATION_MINUTES * 60 * 1e3;
+var RESEND_COOLDOWN_SECONDS = 60;
+var RESEND_COOLDOWN_MS = RESEND_COOLDOWN_SECONDS * 1e3;
+var MAX_VERIFICATION_ATTEMPTS = 5;
+var MAX_RESEND_COUNT = 5;
+function generateOtp() {
+  return crypto2.randomInt(1e5, 1e6).toString();
+}
+function getOtpExpiration() {
+  return new Date(Date.now() + OTP_EXPIRATION_MS);
+}
+function hashOtp(otp, userId, purpose) {
+  const salt = crypto2.randomBytes(16).toString("hex");
+  const payload = `${userId}:${purpose}:${otp.trim()}`;
+  const hash = crypto2.createHmac("sha256", salt).update(payload).digest("hex");
+  return `${salt}:${hash}`;
+}
+function verifyOtp(submittedOtp, storedHash, userId, purpose) {
+  if (!storedHash || !submittedOtp) return false;
+  try {
+    const [salt, expectedHash] = storedHash.split(":");
+    if (!salt || !expectedHash) return false;
+    const payload = `${userId}:${purpose}:${submittedOtp.trim()}`;
+    const actualHash = crypto2.createHmac("sha256", salt).update(payload).digest("hex");
+    const expectedBuffer = Buffer.from(expectedHash, "hex");
+    const actualBuffer = Buffer.from(actualHash, "hex");
+    if (expectedBuffer.length !== actualBuffer.length) return false;
+    return crypto2.timingSafeEqual(expectedBuffer, actualBuffer);
+  } catch {
+    return false;
+  }
+}
+function parseVerificationChallenge(stored) {
+  if (!stored) return null;
+  if (stored.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(stored);
+      return {
+        codeHash: typeof parsed.codeHash === "string" ? parsed.codeHash : null,
+        purpose: parsed.purpose === "PASSWORD_RESET" ? "PASSWORD_RESET" : "ACCOUNT_VERIFICATION",
+        attempts: typeof parsed.attempts === "number" ? parsed.attempts : 0,
+        maxAttempts: typeof parsed.maxAttempts === "number" ? parsed.maxAttempts : MAX_VERIFICATION_ATTEMPTS,
+        resendCount: typeof parsed.resendCount === "number" ? parsed.resendCount : 1,
+        maxResends: typeof parsed.maxResends === "number" ? parsed.maxResends : MAX_RESEND_COUNT,
+        lastSentAt: typeof parsed.lastSentAt === "string" ? parsed.lastSentAt : null,
+        isEmailVerified: Boolean(parsed.isEmailVerified),
+        verifiedAt: typeof parsed.verifiedAt === "string" ? parsed.verifiedAt : null
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (stored.includes(":")) {
+    return {
+      codeHash: stored,
+      purpose: "ACCOUNT_VERIFICATION",
+      attempts: 0,
+      maxAttempts: MAX_VERIFICATION_ATTEMPTS,
+      resendCount: 1,
+      maxResends: MAX_RESEND_COUNT,
+      lastSentAt: null,
+      isEmailVerified: false,
+      verifiedAt: null
+    };
+  }
+  return null;
+}
+function serializeVerificationChallenge(data) {
+  return JSON.stringify(data);
+}
+function createVerificationChallenge(params) {
+  const { code, userId, purpose, previous } = params;
+  const expiry = getOtpExpiration();
+  const codeHash = hashOtp(code, userId, purpose);
+  const challenge = {
+    codeHash,
+    purpose,
+    attempts: 0,
+    maxAttempts: MAX_VERIFICATION_ATTEMPTS,
+    resendCount: (previous?.resendCount || 0) + 1,
+    maxResends: MAX_RESEND_COUNT,
+    lastSentAt: (/* @__PURE__ */ new Date()).toISOString(),
+    isEmailVerified: false,
+    verifiedAt: null
+  };
+  return {
+    challenge,
+    serialized: serializeVerificationChallenge(challenge),
+    expiry
+  };
+}
+function consumeVerificationChallenge(challenge) {
+  const consumed = {
+    ...challenge,
+    codeHash: null,
+    // Consumed: cannot be replayed or reused
+    attempts: 0,
+    isEmailVerified: true,
+    verifiedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  return {
+    challenge: consumed,
+    serialized: serializeVerificationChallenge(consumed)
+  };
+}
+function recordFailedAttempt(challenge) {
+  const newAttempts = challenge.attempts + 1;
+  const isLocked = newAttempts >= challenge.maxAttempts;
+  const remainingAttempts = Math.max(0, challenge.maxAttempts - newAttempts);
+  const updated = {
+    ...challenge,
+    attempts: newAttempts,
+    // If locked, invalidate code immediately
+    codeHash: isLocked ? null : challenge.codeHash
+  };
+  return {
+    challenge: updated,
+    serialized: serializeVerificationChallenge(updated),
+    isLocked,
+    remainingAttempts
+  };
+}
+function checkResendCooldown(challenge) {
+  if (!challenge?.lastSentAt) {
+    return { allowed: true, remainingSeconds: 0 };
+  }
+  const elapsedMs = Date.now() - new Date(challenge.lastSentAt).getTime();
+  if (elapsedMs < RESEND_COOLDOWN_MS) {
+    const remainingSeconds = Math.ceil((RESEND_COOLDOWN_MS - elapsedMs) / 1e3);
+    return { allowed: false, remainingSeconds };
+  }
+  return { allowed: true, remainingSeconds: 0 };
+}
+
+// server/services/emailService.ts
+import nodemailer from "nodemailer";
+function getTransporter() {
+  const host = process.env.SMTP_HOST?.trim();
+  if (!host) {
+    return null;
+  }
+  const port = parseInt(process.env.SMTP_PORT?.trim() || "587", 10);
+  const secure = process.env.SMTP_SECURE === "true" || process.env.SMTP_SECURE === "1" || port === 465;
+  const user = process.env.SMTP_USER?.trim();
+  const pass = process.env.SMTP_PASS?.trim();
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: user ? { user, pass } : void 0
+  });
+}
+function getFromAddress() {
+  return process.env.EMAIL_FROM?.trim() || "PugArch Security <no-reply@pugarch.internal>";
+}
+async function sendVerificationOtpEmail(params) {
+  const { to, name, otp } = params;
+  const from = getFromAddress();
+  const transporter = getTransporter();
+  const subject = `${otp} is your PugArch account verification code`;
+  const text = `
+Hello ${name || "Team Member"},
+
+Your 6-digit identity verification code is: ${otp}
+
+This code will expire in 5 minutes.
+
+To complete your account registration, enter this verification code on the PugArch activation screen.
+
+If you did not request this verification code, please ignore this email or notify your system administrator.
+
+\u2014
+PugArch Projects Cloud
+Enterprise Architecture & Access Control
+`.trim();
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Account Verification Code</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #FBF9F4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #FBF9F4; padding: 40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 540px; background-color: #FFFFFF; border: 1px solid #E8E2D5; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 20px rgba(35, 30, 27, 0.05);">
+          <!-- Brand Header -->
+          <tr>
+            <td style="background-color: #231E1B; padding: 28px 32px; text-align: left;">
+              <span style="font-family: Georgia, serif; font-size: 20px; font-weight: bold; color: #FFFFFF; letter-spacing: 0.5px;">
+                PugArch &mdash; <span style="color: #E28C68;">Projects</span>
+              </span>
+              <div style="font-size: 11px; color: #A49C90; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px;">
+                Enterprise Identity Verification
+              </div>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 36px 32px;">
+              <h1 style="font-size: 18px; font-weight: 700; color: #231E1B; margin: 0 0 16px 0; letter-spacing: -0.2px;">
+                Verify Your Pre-Registered Account
+              </h1>
+              <p style="font-size: 14px; line-height: 22px; color: #5A524A; margin: 0 0 24px 0;">
+                Hello <strong>${name || "Team Member"}</strong>,<br>
+                Your organization has pre-registered your work account. Use the one-time verification code below to verify your identity and set up your workspace password.
+              </p>
+
+              <!-- OTP Callout Box -->
+              <div style="background-color: #FAF7F0; border: 1px solid #DDD6C8; border-radius: 14px; padding: 20px 24px; text-align: center; margin: 24px 0;">
+                <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: #70685F; letter-spacing: 1.5px; margin-bottom: 8px;">
+                  Your 6-Digit Verification Code
+                </div>
+                <div style="font-family: 'Courier New', Courier, monospace; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #C85A32; line-height: 1.2;">
+                  ${otp}
+                </div>
+                <div style="font-size: 11px; color: #8F867A; margin-top: 8px;">
+                  &bull; Valid for <strong>5 minutes</strong> &bull;
+                </div>
+              </div>
+
+              <!-- Security Information -->
+              <p style="font-size: 12px; line-height: 18px; color: #70685F; margin: 0 0 16px 0;">
+                Enter this code on the activation screen to complete verification. For security purposes, this code is strictly single-use and will expire in 5 minutes.
+              </p>
+              <p style="font-size: 11px; line-height: 16px; color: #A49C90; margin: 0;">
+                If you did not request this verification code, please ignore this email or alert your system administrator immediately.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #F8F5EE; padding: 20px 32px; border-top: 1px solid #EDE7DC; text-align: center;">
+              <p style="font-size: 11px; color: #8F867A; margin: 0;">
+                End-to-End Enterprise Access Control &bull; PugArch Cloud
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`.trim();
+  if (transporter) {
+    try {
+      await transporter.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html
+      });
+      return { delivered: true };
+    } catch (err) {
+      console.error(`[EmailService] Failed to deliver verification email to ${to}:`, err.message || err);
+      throw new Error(`Email delivery failed: ${err.message || "SMTP transport error"}`);
+    }
+  }
+  const isDev = process.env.NODE_ENV !== "production";
+  if (isDev) {
+    console.log(`
+======================================================`);
+    console.log(`[EmailService DEV] Simulated verification email to: ${to}`);
+    console.log(`[EmailService DEV] OTP Code: ${otp} (Expires in 5 minutes)`);
+    console.log(`======================================================
+`);
+    return { delivered: true, mockLogged: true };
+  }
+  throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+}
+async function sendPasswordResetOtpEmail(params) {
+  const { to, name, otp } = params;
+  const from = getFromAddress();
+  const transporter = getTransporter();
+  const subject = `${otp} is your PugArch password recovery code`;
+  const text = `
+Hello ${name || "Team Member"},
+
+Your 6-digit password recovery code is: ${otp}
+
+This code will expire in 5 minutes.
+
+Use this code on the password reset screen to securely create a new password.
+
+If you did not request a password recovery code, please notify your administrator immediately.
+
+\u2014
+PugArch Projects Cloud
+Enterprise Architecture & Access Control
+`.trim();
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Password Recovery Code</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #FBF9F4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #FBF9F4; padding: 40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 540px; background-color: #FFFFFF; border: 1px solid #E8E2D5; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 20px rgba(35, 30, 27, 0.05);">
+          <!-- Brand Header -->
+          <tr>
+            <td style="background-color: #231E1B; padding: 28px 32px; text-align: left;">
+              <span style="font-family: Georgia, serif; font-size: 20px; font-weight: bold; color: #FFFFFF; letter-spacing: 0.5px;">
+                PugArch &mdash; <span style="color: #E28C68;">Projects</span>
+              </span>
+              <div style="font-size: 11px; color: #A49C90; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px;">
+                Password Recovery Authorization
+              </div>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 36px 32px;">
+              <h1 style="font-size: 18px; font-weight: 700; color: #231E1B; margin: 0 0 16px 0; letter-spacing: -0.2px;">
+                Reset Your Workspace Password
+              </h1>
+              <p style="font-size: 14px; line-height: 22px; color: #5A524A; margin: 0 0 24px 0;">
+                Hello <strong>${name || "Team Member"}</strong>,<br>
+                We received a request to reset your password. Use the 6-digit recovery code below to proceed.
+              </p>
+
+              <!-- OTP Callout Box -->
+              <div style="background-color: #FAF7F0; border: 1px solid #DDD6C8; border-radius: 14px; padding: 20px 24px; text-align: center; margin: 24px 0;">
+                <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: #70685F; letter-spacing: 1.5px; margin-bottom: 8px;">
+                  Your 6-Digit Recovery Code
+                </div>
+                <div style="font-family: 'Courier New', Courier, monospace; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #C85A32; line-height: 1.2;">
+                  ${otp}
+                </div>
+                <div style="font-size: 11px; color: #8F867A; margin-top: 8px;">
+                  &bull; Valid for <strong>5 minutes</strong> &bull;
+                </div>
+              </div>
+
+              <p style="font-size: 12px; line-height: 18px; color: #70685F; margin: 0 0 16px 0;">
+                For your security, this recovery code is strictly single-use and will expire in 5 minutes.
+              </p>
+              <p style="font-size: 11px; line-height: 16px; color: #A49C90; margin: 0;">
+                If you did not request this recovery code, someone may have entered your identifier by mistake. No changes have been made to your account.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #F8F5EE; padding: 20px 32px; border-top: 1px solid #EDE7DC; text-align: center;">
+              <p style="font-size: 11px; color: #8F867A; margin: 0;">
+                End-to-End Enterprise Access Control &bull; PugArch Cloud
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`.trim();
+  if (transporter) {
+    try {
+      await transporter.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html
+      });
+      return { delivered: true };
+    } catch (err) {
+      console.error(`[EmailService] Failed to deliver recovery email to ${to}:`, err.message || err);
+      throw new Error(`Email delivery failed: ${err.message || "SMTP transport error"}`);
+    }
+  }
+  const isDev = process.env.NODE_ENV !== "production";
+  if (isDev) {
+    console.log(`
+======================================================`);
+    console.log(`[EmailService DEV] Simulated password recovery email to: ${to}`);
+    console.log(`[EmailService DEV] Recovery Code: ${otp} (Expires in 5 minutes)`);
+    console.log(`======================================================
+`);
+    return { delivered: true, mockLogged: true };
+  }
+  throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+}
+
+// server/routes/auth.ts
 var router2 = Router2();
 router2.get("/me", async (req, res) => {
   try {
     const allUsers = await prisma.user.findMany({
+      where: { isSignupCompleted: true },
       select: {
         id: true,
         name: true,
         email: true,
+        phone: true,
         role: true,
         department: true,
         avatarUrl: true
@@ -500,15 +989,49 @@ router2.get("/me", async (req, res) => {
 });
 router2.post("/login", async (req, res) => {
   try {
-    const { userId, email } = req.body;
+    const { identifier, email, phone, userId, password } = req.body;
     let user = null;
-    if (userId) {
-      user = await prisma.user.findUnique({ where: { id: userId } });
+    if (identifier && typeof identifier === "string") {
+      const parsed = parseIdentifier(identifier);
+      if (parsed.type === "email") {
+        user = await prisma.user.findUnique({ where: { email: parsed.value } });
+      } else {
+        user = await prisma.user.findUnique({ where: { phone: parsed.value } });
+      }
     } else if (email) {
-      user = await prisma.user.findUnique({ where: { email: String(email).trim().toLowerCase() } });
+      user = await prisma.user.findUnique({ where: { email: normalizeEmail(String(email)) } });
+    } else if (phone) {
+      user = await prisma.user.findUnique({ where: { phone: normalizePhone(String(phone)) } });
+    } else if (userId) {
+      user = await prisma.user.findUnique({ where: { id: userId } });
     }
     if (!user) {
       return res.status(401).json({ error: "Invalid credentials. User not found." });
+    }
+    if (!user.isSignupCompleted) {
+      return res.status(403).json({
+        error: "Your account registration has not been completed. Please complete signup first before signing in."
+      });
+    }
+    const submittedPassword = typeof password === "string" ? password.trim() : "";
+    const storedHash = user.password;
+    if (storedHash) {
+      const isValid = verifyPassword(submittedPassword, storedHash);
+      if (!isValid) {
+        return res.status(401).json({ error: "Invalid credentials. Password is incorrect. Please check your password and try again." });
+      }
+    } else if (password !== void 0) {
+      const isDefault = submittedPassword === "PugArch@2026" || submittedPassword === "Password123!";
+      if (!isDefault) {
+        return res.status(401).json({
+          error: "Invalid credentials. Password is incorrect. Please check your password and try again."
+        });
+      }
+      const newHash = hashPassword(submittedPassword);
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { password: newHash }
+      });
     }
     const isProd = process.env.NODE_ENV === "production" || !!process.env.VERCEL;
     const sameSite = isProd ? "None" : "Lax";
@@ -522,6 +1045,7 @@ router2.post("/login", async (req, res) => {
         id: user.id,
         name: user.name,
         email: user.email,
+        phone: user.phone,
         role: user.role,
         department: user.department,
         avatarUrl: user.avatarUrl
@@ -532,59 +1056,591 @@ router2.post("/login", async (req, res) => {
     res.status(500).json({ error: "Authentication failed" });
   }
 });
+async function resolvePreRegisteredCandidate(reqBody) {
+  const { email, phone, identifier } = reqBody || {};
+  let candidateEmail = "";
+  let candidatePhone = phone && typeof phone === "string" ? normalizePhone(phone) : null;
+  if (email && typeof email === "string" && isValidEmail(email)) {
+    candidateEmail = normalizeEmail(email);
+  } else if (identifier && typeof identifier === "string") {
+    const parsed = parseIdentifier(identifier);
+    if (parsed.type === "email") {
+      candidateEmail = normalizeEmail(parsed.value);
+    } else {
+      candidatePhone = normalizePhone(parsed.value);
+    }
+  }
+  if (!candidateEmail && !candidatePhone) {
+    return {
+      errorStatus: 400,
+      errorMessage: "A valid email address or registered mobile number is required.",
+      user: null
+    };
+  }
+  let user = null;
+  if (candidateEmail) {
+    user = await prisma.user.findUnique({
+      where: { email: candidateEmail }
+    });
+  } else if (candidatePhone) {
+    user = await prisma.user.findUnique({
+      where: { phone: candidatePhone }
+    });
+  }
+  if (!user) {
+    return {
+      errorStatus: 403,
+      errorMessage: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account.",
+      user: null
+    };
+  }
+  if (candidatePhone) {
+    const prePhone = user.phone ? normalizePhone(user.phone) : null;
+    if (prePhone && prePhone !== candidatePhone) {
+      return {
+        errorStatus: 403,
+        errorMessage: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account.",
+        user: null
+      };
+    }
+  }
+  if (user.isSignupCompleted) {
+    return {
+      errorStatus: 400,
+      errorMessage: "An account with this email address has already completed registration. Please sign in instead.",
+      user: null
+    };
+  }
+  return { errorStatus: null, errorMessage: null, user };
+}
+var handleSendOrResendVerificationOtp = async (req, res, options = {}) => {
+  try {
+    const { errorStatus, errorMessage, user } = await resolvePreRegisteredCandidate(req.body);
+    if (!user || errorStatus) {
+      return res.status(errorStatus || 403).json({ error: errorMessage });
+    }
+    const previousChallenge = parseVerificationChallenge(user.verificationCode);
+    if (previousChallenge?.isEmailVerified) {
+      return res.status(400).json({
+        error: "This email address has already been verified. Please proceed to complete your registration.",
+        isEmailVerified: true
+      });
+    }
+    const cooldown = checkResendCooldown(previousChallenge);
+    if (!cooldown.allowed) {
+      return res.status(429).json({
+        error: `Please wait ${cooldown.remainingSeconds} second${cooldown.remainingSeconds === 1 ? "" : "s"} before requesting a new verification code.`,
+        remainingSeconds: cooldown.remainingSeconds
+      });
+    }
+    if (previousChallenge && previousChallenge.resendCount >= MAX_RESEND_COUNT) {
+      return res.status(429).json({
+        error: "Maximum verification code requests exceeded. Please contact HR/CEO administration or try again later."
+      });
+    }
+    const code = generateOtp();
+    const { serialized, expiry } = createVerificationChallenge({
+      code,
+      userId: user.id,
+      purpose: "ACCOUNT_VERIFICATION",
+      previous: previousChallenge
+    });
+    await prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          verificationCode: serialized,
+          verificationExpiry: expiry
+        }
+      });
+    });
+    try {
+      await sendVerificationOtpEmail({
+        to: user.email,
+        // Trusted server-side record
+        name: user.name,
+        otp: code
+      });
+    } catch (deliveryError) {
+      console.error("Email delivery error in send-code:", deliveryError);
+      await prisma.$transaction(async (tx) => {
+        await tx.user.update({
+          where: { id: user.id },
+          data: {
+            verificationCode: user.verificationCode || null,
+            verificationExpiry: user.verificationExpiry || null
+          }
+        });
+      });
+      return res.status(502).json({
+        error: "Failed to deliver verification email. Please check your email configuration or contact your administrator."
+      });
+    }
+    const isDev = process.env.NODE_ENV !== "production";
+    return res.status(200).json({
+      success: true,
+      message: options.isResend ? "A new 6-digit verification code has been dispatched to your registered email address." : "A 6-digit verification code has been dispatched to your registered email address.",
+      cooldownSeconds: RESEND_COOLDOWN_SECONDS,
+      ...isDev ? { devCode: code } : {}
+    });
+  } catch (error) {
+    console.error("Error generating verification code:", error);
+    return res.status(500).json({ error: "Failed to process verification code request" });
+  }
+};
+var handleVerifyOtp = async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code || typeof code !== "string") {
+      return res.status(400).json({ error: "A 6-digit verification code is required." });
+    }
+    const cleanCode = code.trim();
+    if (!/^\d{6}$/.test(cleanCode)) {
+      return res.status(400).json({ error: "Verification code must be exactly 6 digits." });
+    }
+    const { errorStatus, errorMessage, user } = await resolvePreRegisteredCandidate(req.body);
+    if (!user || errorStatus) {
+      return res.status(errorStatus || 403).json({ error: errorMessage });
+    }
+    const outcome = await prisma.$transaction(async (tx) => {
+      const freshUser = await tx.user.findUnique({
+        where: { id: user.id },
+        select: {
+          id: true,
+          email: true,
+          verificationCode: true,
+          verificationExpiry: true,
+          isSignupCompleted: true
+        }
+      });
+      if (!freshUser) {
+        return { status: 404, data: { error: "User record not found." } };
+      }
+      if (freshUser.isSignupCompleted) {
+        return {
+          status: 400,
+          data: {
+            error: "An account with this email address has already completed registration. Please sign in instead."
+          }
+        };
+      }
+      const challenge = parseVerificationChallenge(freshUser.verificationCode);
+      if (challenge?.isEmailVerified) {
+        return {
+          status: 200,
+          data: {
+            success: true,
+            message: "Email address has already been verified.",
+            isEmailVerified: true
+          }
+        };
+      }
+      if (!challenge || !challenge.codeHash) {
+        return {
+          status: 400,
+          data: {
+            error: "No active verification code found. Please request a new verification code."
+          }
+        };
+      }
+      if (freshUser.verificationExpiry && /* @__PURE__ */ new Date() > new Date(freshUser.verificationExpiry)) {
+        return {
+          status: 400,
+          data: {
+            error: "Verification code has expired. Please request a new code."
+          }
+        };
+      }
+      if (challenge.attempts >= challenge.maxAttempts) {
+        return {
+          status: 429,
+          data: {
+            error: "Maximum verification attempts exceeded. Please request a new verification code.",
+            isLocked: true
+          }
+        };
+      }
+      const isValid = verifyOtp(
+        cleanCode,
+        challenge.codeHash,
+        freshUser.id,
+        "ACCOUNT_VERIFICATION"
+      );
+      if (!isValid) {
+        const { serialized, isLocked, remainingAttempts } = recordFailedAttempt(challenge);
+        await tx.user.update({
+          where: { id: freshUser.id },
+          data: {
+            verificationCode: serialized,
+            verificationExpiry: isLocked ? /* @__PURE__ */ new Date(0) : freshUser.verificationExpiry
+          }
+        });
+        return {
+          status: 400,
+          data: {
+            error: isLocked ? "Maximum verification attempts exceeded. Please request a new verification code." : `Invalid verification code. ${remainingAttempts} attempt${remainingAttempts === 1 ? "" : "s"} remaining.`,
+            remainingAttempts,
+            isLocked
+          }
+        };
+      }
+      const { serialized: consumedSerialized } = consumeVerificationChallenge(challenge);
+      await tx.user.update({
+        where: { id: freshUser.id },
+        data: {
+          verificationCode: consumedSerialized,
+          verificationExpiry: null
+        }
+      });
+      return {
+        status: 200,
+        data: {
+          success: true,
+          message: "Email address verified successfully.",
+          isEmailVerified: true
+        }
+      };
+    });
+    return res.status(outcome.status).json(outcome.data);
+  } catch (error) {
+    console.error("Error verifying OTP code:", error);
+    return res.status(500).json({ error: "Failed to verify code" });
+  }
+};
 var handleRegister = async (req, res) => {
   try {
-    const { name, email, department, role } = req.body;
-    if (!name || typeof name !== "string" || name.trim().length < 2) {
-      return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
-    }
-    if (!email || typeof email !== "string" || !email.includes("@")) {
+    const { name, email, phone, password, confirmPassword, code } = req.body;
+    if (!email || typeof email !== "string" || !isValidEmail(email)) {
       return res.status(400).json({ error: "A valid email address is required." });
     }
-    const cleanEmail = email.trim().toLowerCase();
-    const existing = await prisma.user.findUnique({
+    if (!phone || typeof phone !== "string" || !isValidPhone(phone)) {
+      return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
+    }
+    if (confirmPassword !== void 0 && confirmPassword !== password) {
+      return res.status(400).json({ error: "Passwords do not match. Please ensure both fields are identical." });
+    }
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.isValid) {
+      return res.status(400).json({
+        error: passwordValidation.errors[0] || "Password does not meet the security requirements.",
+        errors: passwordValidation.errors
+      });
+    }
+    const cleanEmail = normalizeEmail(email);
+    const cleanPhone = normalizePhone(phone);
+    const preRegisteredUser = await prisma.user.findUnique({
       where: { email: cleanEmail }
     });
-    if (existing) {
-      return res.status(400).json({ error: "An account with this email address already exists." });
+    if (!preRegisteredUser) {
+      return res.status(403).json({
+        error: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account."
+      });
     }
-    let assignedRole = "Employee";
-    if (role === "ProjectOwner") {
-      assignedRole = "ProjectOwner";
+    const prePhone = preRegisteredUser.phone ? normalizePhone(preRegisteredUser.phone) : null;
+    if (!prePhone || prePhone !== cleanPhone) {
+      return res.status(403).json({
+        error: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account."
+      });
     }
-    const newUser = await prisma.user.create({
-      data: {
-        name: name.trim(),
-        email: cleanEmail,
-        role: assignedRole,
-        department: department ? String(department).trim() : "Operations",
-        avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`
+    if (preRegisteredUser.isSignupCompleted) {
+      return res.status(400).json({
+        error: "An account with this email address has already completed registration. Please sign in instead."
+      });
+    }
+    const challenge = parseVerificationChallenge(preRegisteredUser.verificationCode);
+    const isAlreadyVerified = challenge?.isEmailVerified === true;
+    if (!isAlreadyVerified) {
+      if (!code || typeof code !== "string") {
+        return res.status(400).json({
+          error: "Email verification is required. Please enter your 6-digit verification code."
+        });
       }
+      const cleanCode = code.trim();
+      if (!/^\d{6}$/.test(cleanCode)) {
+        return res.status(400).json({ error: "Verification code must be exactly 6 digits." });
+      }
+      if (!challenge || !challenge.codeHash) {
+        return res.status(400).json({
+          error: "No active verification code found. Please request a new verification code."
+        });
+      }
+      const expiry = preRegisteredUser.verificationExpiry;
+      if (expiry && /* @__PURE__ */ new Date() > new Date(expiry)) {
+        return res.status(400).json({ error: "Verification code has expired. Please request a new code." });
+      }
+      if (challenge.attempts >= challenge.maxAttempts) {
+        return res.status(429).json({
+          error: "Maximum verification attempts exceeded. Please request a new verification code."
+        });
+      }
+      const isValidCode = verifyOtp(
+        cleanCode,
+        challenge.codeHash,
+        preRegisteredUser.id,
+        "ACCOUNT_VERIFICATION"
+      );
+      if (!isValidCode) {
+        const { serialized, isLocked, remainingAttempts } = recordFailedAttempt(challenge);
+        await prisma.user.update({
+          where: { id: preRegisteredUser.id },
+          data: {
+            verificationCode: serialized,
+            verificationExpiry: isLocked ? /* @__PURE__ */ new Date(0) : preRegisteredUser.verificationExpiry
+          }
+        });
+        return res.status(400).json({
+          error: isLocked ? "Maximum verification attempts exceeded. Please request a new verification code." : `Invalid verification code. ${remainingAttempts} attempt${remainingAttempts === 1 ? "" : "s"} remaining.`,
+          remainingAttempts
+        });
+      }
+    }
+    const passwordHash = hashPassword(password);
+    const updatedUser = await prisma.$transaction(async (tx) => {
+      return await tx.user.update({
+        where: { id: preRegisteredUser.id },
+        data: {
+          password: passwordHash,
+          isSignupCompleted: true,
+          verificationCode: null,
+          verificationExpiry: null,
+          name: name && typeof name === "string" && name.trim().length >= 2 ? name.trim() : preRegisteredUser.name,
+          avatarUrl: preRegisteredUser.avatarUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(preRegisteredUser.name)}`
+        }
+      });
     });
     const isProd = process.env.NODE_ENV === "production" || !!process.env.VERCEL;
     const sameSite = isProd ? "None" : "Lax";
     const secureFlag = isProd ? " Secure;" : "";
     res.setHeader(
       "Set-Cookie",
-      `ff_user_id=${encodeURIComponent(newUser.id)}; Path=/; HttpOnly; SameSite=${sameSite};${secureFlag} Max-Age=2592000`
+      `ff_user_id=${encodeURIComponent(updatedUser.id)}; Path=/; HttpOnly; SameSite=${sameSite};${secureFlag} Max-Age=2592000`
     );
-    res.status(201).json({
+    return res.status(200).json({
+      message: "Account signup completed successfully.",
       user: {
-        id: newUser.id,
-        name: newUser.name,
-        email: newUser.email,
-        role: newUser.role,
-        department: newUser.department,
-        avatarUrl: newUser.avatarUrl
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        phone: updatedUser.phone,
+        role: updatedUser.role,
+        department: updatedUser.department,
+        avatarUrl: updatedUser.avatarUrl,
+        isSignupCompleted: true
       }
     });
   } catch (error) {
-    console.error("Registration error:", error);
-    res.status(500).json({ error: "Failed to create account" });
+    console.error("Registration completion error:", error);
+    return res.status(500).json({ error: "Failed to complete registration" });
   }
 };
+router2.post("/register/send-code", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: false }));
+router2.post("/otp/send", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: false }));
+router2.post("/register/resend-code", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: true }));
+router2.post("/otp/resend", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: true }));
+router2.post("/register/verify-code", handleVerifyOtp);
+router2.post("/otp/verify", handleVerifyOtp);
+router2.post("/otp/status", async (req, res) => {
+  try {
+    const { errorStatus, errorMessage, user } = await resolvePreRegisteredCandidate(req.body);
+    if (!user || errorStatus) {
+      return res.status(errorStatus || 403).json({ error: errorMessage });
+    }
+    const challenge = parseVerificationChallenge(user.verificationCode);
+    const cooldown = checkResendCooldown(challenge);
+    return res.json({
+      isEmailVerified: Boolean(challenge?.isEmailVerified),
+      verifiedAt: challenge?.verifiedAt || null,
+      canResend: cooldown.allowed,
+      cooldownRemainingSeconds: cooldown.remainingSeconds
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to retrieve OTP status" });
+  }
+});
 router2.post("/register", handleRegister);
 router2.post("/signup", handleRegister);
+router2.post("/forgot-password", async (req, res) => {
+  try {
+    const { identifier } = req.body;
+    if (!identifier || typeof identifier !== "string") {
+      return res.status(400).json({ error: "Email address or mobile phone number is required." });
+    }
+    const parsed = parseIdentifier(identifier);
+    let user = null;
+    if (parsed.type === "email") {
+      user = await prisma.user.findUnique({ where: { email: parsed.value } });
+    } else {
+      user = await prisma.user.findUnique({ where: { phone: parsed.value } });
+    }
+    if (!user || !user.isSignupCompleted) {
+      return res.json({
+        success: true,
+        message: "If an account matches your details, a 6-digit recovery code has been sent."
+      });
+    }
+    const code = generateOtp();
+    const expiry = getOtpExpiration();
+    const codeHash = hashOtp(code, user.id, "PASSWORD_RESET");
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        resetToken: codeHash,
+        resetTokenExpiry: expiry
+      }
+    });
+    try {
+      await sendPasswordResetOtpEmail({
+        to: user.email,
+        name: user.name,
+        otp: code
+      });
+    } catch (deliveryError) {
+      console.error("Password reset email delivery error:", deliveryError);
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          resetToken: null,
+          resetTokenExpiry: null
+        }
+      });
+      return res.status(502).json({
+        error: "Failed to deliver password recovery email. Please check your email configuration and try again."
+      });
+    }
+    const isDev = process.env.NODE_ENV !== "production";
+    res.json({
+      success: true,
+      message: "If an account matches your details, a 6-digit recovery code has been sent.",
+      ...isDev ? { devCode: code } : {}
+    });
+  } catch (error) {
+    console.error("Forgot password error:", error);
+    res.status(500).json({ error: "Failed to process password recovery request" });
+  }
+});
+router2.post("/reset-password", async (req, res) => {
+  try {
+    const { identifier, code, newPassword, confirmPassword } = req.body;
+    if (!identifier || typeof identifier !== "string") {
+      return res.status(400).json({ error: "Email address or mobile phone number is required." });
+    }
+    if (!code || typeof code !== "string") {
+      return res.status(400).json({ error: "6-digit recovery code is required." });
+    }
+    if (confirmPassword !== void 0 && confirmPassword !== newPassword) {
+      return res.status(400).json({ error: "Passwords do not match. Please ensure both fields are identical." });
+    }
+    const passwordValidation = validatePassword(newPassword);
+    if (!passwordValidation.isValid) {
+      return res.status(400).json({
+        error: passwordValidation.errors[0] || "Password does not meet the security requirements.",
+        errors: passwordValidation.errors
+      });
+    }
+    const parsed = parseIdentifier(identifier);
+    let user = null;
+    if (parsed.type === "email") {
+      user = await prisma.user.findUnique({ where: { email: parsed.value } });
+    } else {
+      user = await prisma.user.findUnique({ where: { phone: parsed.value } });
+    }
+    if (!user) {
+      return res.status(400).json({ error: "Invalid recovery code or account details." });
+    }
+    const storedToken = user.resetToken;
+    const tokenExpiry = user.resetTokenExpiry;
+    if (!storedToken) {
+      return res.status(400).json({ error: "Invalid recovery code or account details." });
+    }
+    if (tokenExpiry && /* @__PURE__ */ new Date() > new Date(tokenExpiry)) {
+      return res.status(400).json({ error: "Recovery code has expired. Please request a new code." });
+    }
+    const isValidToken = verifyOtp(
+      String(code).trim(),
+      storedToken,
+      user.id,
+      "PASSWORD_RESET"
+    );
+    if (!isValidToken) {
+      return res.status(400).json({ error: "Invalid recovery code. Please check and try again." });
+    }
+    const passwordHash = hashPassword(newPassword);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: passwordHash,
+        resetToken: null,
+        resetTokenExpiry: null
+      }
+    });
+    res.json({
+      success: true,
+      message: "Your password has been reset successfully. You can now sign in with your new password."
+    });
+  } catch (error) {
+    console.error("Reset password error:", error);
+    res.status(500).json({ error: "Failed to reset password" });
+  }
+});
+router2.post("/pre-register", requireCEO, async (req, res) => {
+  try {
+    const { name, email, phone, role, department } = req.body;
+    if (!name || typeof name !== "string" || name.trim().length < 2) {
+      return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
+    }
+    if (!email || typeof email !== "string" || !isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email address is required." });
+    }
+    if (!phone || typeof phone !== "string" || !isValidPhone(phone)) {
+      return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
+    }
+    const cleanEmail = normalizeEmail(email);
+    const cleanPhone = normalizePhone(phone);
+    const existingEmail = await prisma.user.findUnique({
+      where: { email: cleanEmail }
+    });
+    if (existingEmail) {
+      return res.status(400).json({ error: "An account with this email address already exists." });
+    }
+    const existingPhone = await prisma.user.findUnique({
+      where: { phone: cleanPhone }
+    });
+    if (existingPhone) {
+      return res.status(400).json({ error: "An account with this phone number already exists." });
+    }
+    let assignedRole = "Employee";
+    if (role === "CTO") {
+      assignedRole = "CTO";
+    }
+    const preRegistered = await prisma.user.create({
+      data: {
+        name: name.trim(),
+        email: cleanEmail,
+        phone: cleanPhone,
+        role: assignedRole,
+        department: department ? String(department).trim() : "Operations",
+        avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
+        isSignupCompleted: false
+      }
+    });
+    res.status(201).json({
+      message: "User successfully pre-registered. They can now complete account creation using their email and phone.",
+      user: {
+        id: preRegistered.id,
+        name: preRegistered.name,
+        email: preRegistered.email,
+        phone: preRegistered.phone,
+        role: preRegistered.role,
+        department: preRegistered.department,
+        isSignupCompleted: false,
+        createdAt: preRegistered.createdAt
+      }
+    });
+  } catch (error) {
+    console.error("Pre-registration error:", error);
+    res.status(500).json({ error: "Failed to pre-register user" });
+  }
+});
 router2.post("/logout", (req, res) => {
   const isProd = process.env.NODE_ENV === "production" || !!process.env.VERCEL;
   const sameSite = isProd ? "None" : "Lax";
@@ -962,7 +2018,7 @@ router3.get("/", async (req, res) => {
     let whereClause = {};
     if (user.role === "CEO") {
       whereClause = {};
-    } else if (user.role === "ProjectOwner") {
+    } else if (user.role === "CTO") {
       whereClause = {
         OR: [
           { ownerId: user.id },
@@ -1168,7 +2224,7 @@ router3.get("/:id", async (req, res) => {
       if (!isMember && !hasAssignedTask) {
         return res.status(403).json({ error: "Forbidden: You are not a member of this project" });
       }
-    } else if (user.role === "ProjectOwner") {
+    } else if (user.role === "CTO") {
       const isOwnerOrMember = project.ownerId === user.id || project.memberships.some((m) => m.userId === user.id);
       if (!isOwnerOrMember) {
         return res.status(403).json({ error: "Forbidden: You do not have access to this project" });
@@ -1746,7 +2802,7 @@ router5.patch("/:id", async (req, res) => {
         error: "Forbidden: Employees can only update their own assigned tasks."
       });
     }
-    if (user.role === "ProjectOwner" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
+    if (user.role === "CTO" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
       return res.status(403).json({
         error: "Forbidden: You can only update tasks on projects you own or tasks assigned to you."
       });
@@ -1845,7 +2901,7 @@ router5.post("/:id/state", async (req, res) => {
     if (user.role === "Employee" && task.assigneeId !== user.id) {
       return res.status(403).json({ error: "Employees can only update their own assigned tasks." });
     }
-    if (user.role === "ProjectOwner" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
+    if (user.role === "CTO" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
       return res.status(403).json({ error: "You can only update tasks on projects you own or tasks assigned to you." });
     }
     if (state === "Completed") {
@@ -1993,7 +3049,7 @@ router5.post("/:id/quality-checks", async (req, res) => {
         error: "Forbidden: Employees can only add quality checks on their own tasks."
       });
     }
-    if (user.role === "ProjectOwner" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
+    if (user.role === "CTO" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
       return res.status(403).json({
         error: "Forbidden: You can only add quality checks on projects you own or tasks assigned to you."
       });
@@ -2032,7 +3088,7 @@ router5.post("/quality-checks/:id/toggle", async (req, res) => {
         error: "Forbidden: You can only check off quality requirements on your assigned tasks."
       });
     }
-    if (user.role === "ProjectOwner" && check.task.phase.project.ownerId !== user.id && check.task.assigneeId !== user.id) {
+    if (user.role === "CTO" && check.task.phase.project.ownerId !== user.id && check.task.assigneeId !== user.id) {
       return res.status(403).json({
         error: "Forbidden: You can only check off quality requirements on projects you own or tasks assigned to you."
       });
@@ -2278,8 +3334,8 @@ router6.patch("/:id", requireAuth, async (req, res) => {
     if (user.role === "Employee" && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
       return res.status(403).json({ error: "Forbidden: Employees can only update their own issues." });
     }
-    if (user.role === "ProjectOwner" && issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: Project Owners can only update issues on their own projects or issues they raised." });
+    if (user.role === "CTO" && issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
+      return res.status(403).json({ error: "Forbidden: CTO can only update issues on their own projects or issues they raised." });
     }
     const validation = IssueUpdateSchema.safeParse(req.body);
     if (!validation.success) {
@@ -2315,10 +3371,10 @@ router6.post("/:id/close", requireAuth, async (req, res) => {
           error: "Forbidden: Employees can only close issues they raised or own."
         });
       }
-    } else if (user.role === "ProjectOwner") {
+    } else if (user.role === "CTO") {
       if (issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
         return res.status(403).json({
-          error: "Forbidden: Project Owners can only close issues on their own projects."
+          error: "Forbidden: CTO can only close issues on their own projects."
         });
       }
     }
@@ -2356,10 +3412,10 @@ router6.post("/:id/reopen", requireAuth, async (req, res) => {
           error: "Forbidden: Employees can only reopen issues they raised or own."
         });
       }
-    } else if (user.role === "ProjectOwner") {
+    } else if (user.role === "CTO") {
       if (issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
         return res.status(403).json({
-          error: "Forbidden: Project Owners can only reopen issues on their own projects or issues they raised."
+          error: "Forbidden: CTO can only reopen issues on their own projects or issues they raised."
         });
       }
     }
@@ -2724,7 +3780,7 @@ router9.get("/", async (req, res) => {
     let projectFilter = {};
     if (user.role === "CEO") {
       projectFilter = {};
-    } else if (user.role === "ProjectOwner") {
+    } else if (user.role === "CTO") {
       projectFilter = {
         OR: [
           { ownerId: user.id },
@@ -3149,7 +4205,7 @@ router12.get("/", requireAuth, async (req, res) => {
       whereClause = { requestedBy: user.id };
     } else if (user.role === "CEO") {
       whereClause = {};
-    } else if (user.role === "ProjectOwner") {
+    } else if (user.role === "CTO") {
       whereClause = {
         OR: [
           { approverId: user.id },
@@ -4378,7 +5434,7 @@ async function getCalendarEvents(user, startDate, endDate) {
   let projectFilter = {};
   if (user.role === "CEO") {
     projectFilter = {};
-  } else if (user.role === "ProjectOwner") {
+  } else if (user.role === "CTO") {
     projectFilter = {
       OR: [
         { ownerId: user.id },
@@ -4741,6 +5797,7 @@ var router19 = Router19();
 router19.get("/", requireAuth, async (req, res) => {
   try {
     const users = await prisma.user.findMany({
+      where: { isSignupCompleted: true },
       select: {
         id: true,
         name: true,
@@ -4755,6 +5812,87 @@ router19.get("/", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Failed to fetch users:", error);
     res.status(500).json({ error: "Failed to retrieve users" });
+  }
+});
+router19.get("/management", requireCEO, async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        role: true,
+        department: true,
+        avatarUrl: true,
+        isSignupCompleted: true,
+        createdAt: true
+      },
+      orderBy: [{ isSignupCompleted: "asc" }, { name: "asc" }]
+    });
+    res.json(users);
+  } catch (error) {
+    console.error("Failed to fetch user directory for management:", error);
+    res.status(500).json({ error: "Failed to retrieve user directory" });
+  }
+});
+router19.post("/pre-register", requireCEO, async (req, res) => {
+  try {
+    const { name, email, phone, role, department } = req.body;
+    if (!name || typeof name !== "string" || name.trim().length < 2) {
+      return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
+    }
+    if (!email || typeof email !== "string" || !isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email address is required." });
+    }
+    if (!phone || typeof phone !== "string" || !isValidPhone(phone)) {
+      return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
+    }
+    const cleanEmail = normalizeEmail(email);
+    const cleanPhone = normalizePhone(phone);
+    const existingEmail = await prisma.user.findUnique({
+      where: { email: cleanEmail }
+    });
+    if (existingEmail) {
+      return res.status(400).json({ error: "An account with this email address already exists." });
+    }
+    const existingPhone = await prisma.user.findUnique({
+      where: { phone: cleanPhone }
+    });
+    if (existingPhone) {
+      return res.status(400).json({ error: "An account with this phone number already exists." });
+    }
+    let assignedRole = "Employee";
+    if (role === "CTO") {
+      assignedRole = "CTO";
+    }
+    const preRegistered = await prisma.user.create({
+      data: {
+        name: name.trim(),
+        email: cleanEmail,
+        phone: cleanPhone,
+        role: assignedRole,
+        department: department ? String(department).trim() : "Operations",
+        avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
+        isSignupCompleted: false
+      }
+    });
+    res.status(201).json({
+      message: "User successfully pre-registered. They can now complete account creation using their email and phone.",
+      user: {
+        id: preRegistered.id,
+        name: preRegistered.name,
+        email: preRegistered.email,
+        phone: preRegistered.phone,
+        role: preRegistered.role,
+        department: preRegistered.department,
+        isSignupCompleted: false,
+        createdAt: preRegistered.createdAt
+      }
+    });
+  } catch (error) {
+    console.error("Pre-registration error:", error);
+    res.status(500).json({ error: "Failed to pre-register user" });
   }
 });
 var users_default = router19;
