@@ -1,30 +1,432 @@
-// server.ts
-import dotenv2 from "dotenv";
-import path3 from "path";
-import express from "express";
-import http from "http";
-import cors from "cors";
-
-// server/auth.ts
-import crypto from "crypto";
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 
 // lib/prisma.ts
 import dotenv from "dotenv";
 import path from "path";
 import { PrismaClient } from "@prisma/client";
-if (!process.env.DATABASE_URL) {
-  dotenv.config({ path: path.join(process.cwd(), "backend", ".env") });
-  dotenv.config({ path: path.join(process.cwd(), ".env") });
-}
-dotenv.config();
-var prisma = global.prisma || new PrismaClient({
-  log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"]
+var prisma;
+var init_prisma = __esm({
+  "lib/prisma.ts"() {
+    if (!process.env.DATABASE_URL) {
+      dotenv.config({ path: path.join(process.cwd(), "backend", ".env") });
+      dotenv.config({ path: path.join(process.cwd(), ".env") });
+    }
+    dotenv.config();
+    prisma = global.prisma || new PrismaClient({
+      log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"]
+    });
+    if (process.env.NODE_ENV !== "production") {
+      global.prisma = prisma;
+    }
+  }
 });
-if (process.env.NODE_ENV !== "production") {
-  global.prisma = prisma;
+
+// server/services/authorizationService.ts
+var authorizationService_exports = {};
+__export(authorizationService_exports, {
+  canDecideLeaveRequest: () => canDecideLeaveRequest,
+  canDeleteTask: () => canDeleteTask,
+  canManageIssue: () => canManageIssue,
+  canManageProject: () => canManageProject,
+  canTransferProjectOwnership: () => canTransferProjectOwnership,
+  canUpdateTask: () => canUpdateTask,
+  canViewLeaveRequest: () => canViewLeaveRequest,
+  canViewProject: () => canViewProject,
+  canViewTask: () => canViewTask,
+  canWithdrawLeaveRequest: () => canWithdrawLeaveRequest,
+  getLeaveApprover: () => getLeaveApprover,
+  getSharedProjectUserIds: () => getSharedProjectUserIds,
+  getUserHierarchyContext: () => getUserHierarchyContext,
+  getVisibleDirectoryUserIds: () => getVisibleDirectoryUserIds,
+  getVisibleLeaveUserIds: () => getVisibleLeaveUserIds,
+  getVisibleWorkloadUserIds: () => getVisibleWorkloadUserIds,
+  resolveLeaveNotificationRecipients: () => resolveLeaveNotificationRecipients
+});
+async function getUserHierarchyContext(userId) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      roleDefinition: true,
+      memberships: { select: { projectId: true } }
+    }
+  });
+  if (!user) {
+    throw new Error(`User not found: ${userId}`);
+  }
+  let roleName = user.role;
+  let roleRank = 999;
+  let isExecutive = false;
+  let canManageUsers = false;
+  if (user.roleDefinition && user.roleDefinition.isActive) {
+    roleName = user.roleDefinition.name;
+    roleRank = user.roleDefinition.rank;
+    isExecutive = user.roleDefinition.isExecutive;
+    canManageUsers = user.roleDefinition.canManageUsers;
+  } else {
+    const matchedRole = await prisma.role.findFirst({
+      where: { name: user.role, isActive: true }
+    });
+    if (matchedRole) {
+      roleName = matchedRole.name;
+      roleRank = matchedRole.rank;
+      isExecutive = matchedRole.isExecutive;
+      canManageUsers = matchedRole.canManageUsers;
+    } else if (user.role === "CEO") {
+      roleRank = 1;
+      isExecutive = true;
+      canManageUsers = true;
+    } else if (user.role === "CTO" || user.role === "ProjectOwner") {
+      roleRank = 2;
+    } else {
+      roleRank = 3;
+    }
+  }
+  const directSubordinates = await prisma.user.findMany({
+    where: { managerId: user.id },
+    include: { roleDefinition: true }
+  });
+  const directSubordinateIds = [];
+  const allSubordinateIds = [];
+  const visited = /* @__PURE__ */ new Set([user.id]);
+  const queue = [];
+  for (const sub of directSubordinates) {
+    const subRank = sub.roleDefinition?.rank ?? (sub.role === "Intern" ? 4 : sub.role === "Employee" ? 3 : 2);
+    if (isExecutive || subRank > roleRank) {
+      directSubordinateIds.push(sub.id);
+      allSubordinateIds.push(sub.id);
+      visited.add(sub.id);
+      queue.push({ id: sub.id, roleRank: subRank });
+    }
+  }
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const nextLevel = await prisma.user.findMany({
+      where: { managerId: current.id },
+      include: { roleDefinition: true }
+    });
+    for (const sub of nextLevel) {
+      if (!visited.has(sub.id)) {
+        visited.add(sub.id);
+        const subRank = sub.roleDefinition?.rank ?? (sub.role === "Intern" ? 4 : 3);
+        if (isExecutive || subRank > roleRank) {
+          allSubordinateIds.push(sub.id);
+          queue.push({ id: sub.id, roleRank: subRank });
+        }
+      }
+    }
+  }
+  let authorizedProjectIds = [];
+  if (isExecutive) {
+    const allProjects = await prisma.project.findMany({ select: { id: true } });
+    authorizedProjectIds = allProjects.map((p) => p.id);
+  } else {
+    const ownedProjects = await prisma.project.findMany({
+      where: { ownerId: user.id },
+      select: { id: true }
+    });
+    const membershipProjects = user.memberships.map((m) => m.projectId);
+    const taskProjects = await prisma.task.findMany({
+      where: { assigneeId: user.id },
+      select: { phase: { select: { projectId: true } } }
+    });
+    const projectSet = /* @__PURE__ */ new Set();
+    ownedProjects.forEach((p) => projectSet.add(p.id));
+    membershipProjects.forEach((id) => projectSet.add(id));
+    taskProjects.forEach((t) => {
+      if (t.phase?.projectId) projectSet.add(t.phase.projectId);
+    });
+    authorizedProjectIds = Array.from(projectSet);
+  }
+  return {
+    userId: user.id,
+    name: user.name,
+    email: user.email,
+    roleName,
+    roleRank,
+    isExecutive,
+    canManageUsers,
+    managerId: user.managerId,
+    directSubordinateIds,
+    allSubordinateIds,
+    authorizedProjectIds
+  };
 }
+function canViewProject(ctx, projectId) {
+  if (ctx.isExecutive) return true;
+  return ctx.authorizedProjectIds.includes(projectId);
+}
+function canManageProject(ctx, project) {
+  if (ctx.isExecutive) return true;
+  return project.ownerId === ctx.userId;
+}
+function canTransferProjectOwnership(ctx) {
+  return ctx.isExecutive;
+}
+function canViewTask(ctx, task) {
+  if (ctx.isExecutive) return true;
+  const projectId = task.phase?.projectId;
+  if (!projectId || !ctx.authorizedProjectIds.includes(projectId)) {
+    return false;
+  }
+  if (task.phase?.project?.ownerId === ctx.userId) return true;
+  if (task.assigneeId === ctx.userId) return true;
+  if (task.assigneeId && ctx.allSubordinateIds.includes(task.assigneeId)) return true;
+  return true;
+}
+function canUpdateTask(ctx, task) {
+  if (ctx.isExecutive) return true;
+  if (task.assigneeId === ctx.userId) return true;
+  if (task.phase?.project?.ownerId === ctx.userId) return true;
+  if (task.assigneeId && ctx.allSubordinateIds.includes(task.assigneeId) && task.phase?.projectId && ctx.authorizedProjectIds.includes(task.phase.projectId)) {
+    return true;
+  }
+  return false;
+}
+function canDeleteTask(ctx, task) {
+  if (ctx.isExecutive) return true;
+  return task.phase?.project?.ownerId === ctx.userId;
+}
+function canManageIssue(ctx, issue) {
+  if (ctx.isExecutive) return true;
+  if (issue.project && issue.project.ownerId === ctx.userId) return true;
+  if (issue.raisedBy === ctx.userId || issue.ownerId === ctx.userId) return true;
+  if (ctx.authorizedProjectIds.includes(issue.projectId)) {
+    if (ctx.allSubordinateIds.includes(issue.raisedBy) || issue.ownerId && ctx.allSubordinateIds.includes(issue.ownerId)) {
+      return true;
+    }
+  }
+  return false;
+}
+async function getVisibleWorkloadUserIds(ctx) {
+  if (ctx.isExecutive) {
+    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    return allUsers.map((u) => u.id);
+  }
+  if ((ctx.roleRank < 3 || ctx.canManageUsers) && ctx.allSubordinateIds.length > 0) {
+    return [ctx.userId, ...ctx.allSubordinateIds];
+  }
+  return [ctx.userId];
+}
+async function getVisibleDirectoryUserIds(ctx) {
+  if (ctx.isExecutive || ctx.canManageUsers) {
+    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    return allUsers.map((u) => u.id);
+  }
+  const visibleIds = /* @__PURE__ */ new Set([ctx.userId]);
+  ctx.allSubordinateIds.forEach((id) => visibleIds.add(id));
+  const sharedMembers = await prisma.projectMembership.findMany({
+    where: { projectId: { in: ctx.authorizedProjectIds } },
+    select: { userId: true }
+  });
+  sharedMembers.forEach((m) => visibleIds.add(m.userId));
+  const taskAssignees = await prisma.task.findMany({
+    where: {
+      phase: { projectId: { in: ctx.authorizedProjectIds } },
+      assigneeId: { not: null }
+    },
+    select: { assigneeId: true }
+  });
+  taskAssignees.forEach((t) => {
+    if (t.assigneeId) visibleIds.add(t.assigneeId);
+  });
+  return Array.from(visibleIds);
+}
+async function getLeaveApprover(userId) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, managerId: true }
+  });
+  if (!user || !user.managerId) {
+    const executive = await prisma.user.findFirst({
+      where: {
+        id: { not: userId },
+        OR: [
+          { roleDefinition: { isExecutive: true, isActive: true } },
+          { role: "CEO" }
+        ]
+      },
+      select: { id: true, name: true, email: true, role: true },
+      orderBy: { createdAt: "asc" }
+    });
+    return executive;
+  }
+  const manager = await prisma.user.findUnique({
+    where: { id: user.managerId },
+    select: { id: true, name: true, email: true, role: true }
+  });
+  return manager;
+}
+async function resolveLeaveNotificationRecipients(requesterId) {
+  const requester = await prisma.user.findUnique({
+    where: { id: requesterId },
+    include: {
+      roleDefinition: true,
+      manager: {
+        include: { roleDefinition: true }
+      }
+    }
+  });
+  if (!requester) {
+    return [];
+  }
+  const requesterRank = requester.roleDefinition?.rank ?? (requester.role === "CEO" ? 1 : requester.role === "CTO" ? 2 : requester.role === "Intern" ? 4 : 3);
+  const requesterRoleName = (requester.roleDefinition?.name || requester.role || "").toUpperCase();
+  const isExecutive = requester.roleDefinition?.isExecutive || requesterRank === 1 || requesterRoleName === "CEO";
+  const isCTO = !isExecutive && (requesterRank === 2 || requesterRoleName === "CTO" || requesterRoleName === "PROJECTOWNER");
+  const candidates = [];
+  if (isExecutive) {
+    const approver = await getLeaveApprover(requester.id);
+    if (approver && approver.id !== requester.id) {
+      candidates.push(approver);
+    }
+  } else if (isCTO) {
+    const ceoUsers = await prisma.user.findMany({
+      where: {
+        id: { not: requester.id },
+        isSignupCompleted: true,
+        OR: [
+          { roleDefinition: { isExecutive: true, isActive: true } },
+          { roleDefinition: { rank: 1, isActive: true } },
+          { role: "CEO" }
+        ]
+      },
+      include: { roleDefinition: true }
+    });
+    candidates.push(...ceoUsers);
+  } else {
+    const ctoUsers = await prisma.user.findMany({
+      where: {
+        id: { not: requester.id },
+        isSignupCompleted: true,
+        OR: [
+          { roleDefinition: { rank: 2, isActive: true } },
+          { roleDefinition: { name: { equals: "CTO", mode: "insensitive" }, isActive: true } },
+          { role: "CTO" },
+          { role: "ProjectOwner" }
+        ]
+      },
+      include: { roleDefinition: true }
+    });
+    const ceoUsers = await prisma.user.findMany({
+      where: {
+        id: { not: requester.id },
+        isSignupCompleted: true,
+        OR: [
+          { roleDefinition: { isExecutive: true, isActive: true } },
+          { roleDefinition: { rank: 1, isActive: true } },
+          { role: "CEO" }
+        ]
+      },
+      include: { roleDefinition: true }
+    });
+    candidates.push(...ctoUsers, ...ceoUsers);
+  }
+  const recipientMap = /* @__PURE__ */ new Map();
+  for (const c of candidates) {
+    if (!c.id || c.id === requester.id) continue;
+    const email = c.email?.trim();
+    if (!email || !email.includes("@") || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      continue;
+    }
+    if (email.toLowerCase() === requester.email.trim().toLowerCase()) {
+      continue;
+    }
+    const emailLower = email.toLowerCase();
+    const alreadyPresent = Array.from(recipientMap.values()).some(
+      (r) => r.id === c.id || r.email.toLowerCase() === emailLower
+    );
+    if (!alreadyPresent) {
+      recipientMap.set(c.id, {
+        id: c.id,
+        name: c.name,
+        email,
+        role: c.roleDefinition?.name || c.role
+      });
+    }
+  }
+  return Array.from(recipientMap.values());
+}
+function canViewLeaveRequest(ctx, leave) {
+  if (leave.requestedBy === ctx.userId) return true;
+  if (ctx.isExecutive) return true;
+  if (ctx.allSubordinateIds.includes(leave.requestedBy)) return true;
+  return false;
+}
+function canDecideLeaveRequest(ctx, leave) {
+  if (leave.requestedBy === ctx.userId) {
+    return { allowed: false, reason: "You cannot approve or reject your own leave request." };
+  }
+  if (leave.status !== "Pending") {
+    return { allowed: false, reason: `Leave request is already '${leave.status}'.` };
+  }
+  if (ctx.isExecutive) {
+    return { allowed: true };
+  }
+  if (ctx.allSubordinateIds.includes(leave.requestedBy)) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    reason: "Forbidden: You do not have approval authority over this employee in the organizational hierarchy."
+  };
+}
+function canWithdrawLeaveRequest(ctx, leave) {
+  return leave.requestedBy === ctx.userId && leave.status === "Pending";
+}
+async function getVisibleLeaveUserIds(ctx) {
+  if (ctx.isExecutive) {
+    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    return allUsers.map((u) => u.id);
+  }
+  if (ctx.allSubordinateIds.length > 0) {
+    return [ctx.userId, ...ctx.allSubordinateIds];
+  }
+  return [ctx.userId];
+}
+async function getSharedProjectUserIds(ctx) {
+  if (ctx.authorizedProjectIds.length === 0) return [ctx.userId];
+  const members = await prisma.projectMembership.findMany({
+    where: { projectId: { in: ctx.authorizedProjectIds } },
+    select: { userId: true }
+  });
+  const taskUsers = await prisma.task.findMany({
+    where: {
+      phase: { projectId: { in: ctx.authorizedProjectIds } },
+      assigneeId: { not: null }
+    },
+    select: { assigneeId: true }
+  });
+  const set = /* @__PURE__ */ new Set([ctx.userId]);
+  members.forEach((m) => set.add(m.userId));
+  taskUsers.forEach((t) => {
+    if (t.assigneeId) set.add(t.assigneeId);
+  });
+  return Array.from(set);
+}
+var init_authorizationService = __esm({
+  "server/services/authorizationService.ts"() {
+    init_prisma();
+  }
+});
+
+// server.ts
+import dotenv2 from "dotenv";
+import path4 from "path";
+import express from "express";
+import http from "http";
+import cors from "cors";
 
 // server/auth.ts
+init_prisma();
+import crypto from "crypto";
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
@@ -125,19 +527,32 @@ async function authenticate(req, res, next) {
     let user = null;
     if (userId) {
       user = await prisma.user.findUnique({
-        where: { id: userId }
+        where: { id: userId },
+        include: { roleDefinition: true }
       });
     }
     if (user) {
+      const roleDef = user.roleDefinition;
+      const roleName = roleDef?.name || user.role;
+      const roleRank = roleDef?.rank ?? (user.role === "CEO" ? 1 : user.role === "CTO" || user.role === "ProjectOwner" ? 2 : user.role === "Intern" ? 4 : 3);
+      const isExecutive = roleDef?.isExecutive ?? user.role === "CEO";
+      const canManageUsers = roleDef?.canManageUsers ?? user.role === "CEO";
       req.user = {
         id: user.id,
         name: user.name,
         email: user.email,
         phone: user.phone || null,
-        role: user.role,
+        role: roleName,
+        roleId: user.roleId || roleDef?.id || null,
+        roleRank,
+        isExecutive,
+        canManageUsers,
+        managerId: user.managerId || null,
         department: user.department,
         avatarUrl: user.avatarUrl,
-        isSignupCompleted: user.isSignupCompleted ?? true
+        isSignupCompleted: user.isSignupCompleted ?? true,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt
       };
     }
     next();
@@ -156,33 +571,48 @@ function requireCTOOrCEO(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: "Unauthorized: Authentication required." });
   }
-  if (req.user.role !== "CEO" && req.user.role !== "CTO") {
+  if (!req.user.isExecutive && req.user.roleRank > 2 && req.user.role !== "CEO" && req.user.role !== "CTO" && req.user.role !== "ProjectOwner") {
     return res.status(403).json({
-      error: "Forbidden: Only CTO or CEO have permission to perform this action."
+      error: "Forbidden: This action requires manager or executive hierarchy authorization."
     });
   }
   next();
 }
 var requireOwnerOrCEO = requireCTOOrCEO;
-function requireCEO(req, res, next) {
+function requireExecutive(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: "Unauthorized: Authentication required." });
   }
-  if (req.user.role !== "CEO") {
+  if (!req.user.isExecutive && req.user.roleRank !== 1 && req.user.role !== "CEO") {
     return res.status(403).json({
-      error: "Forbidden: This action requires CEO administrative authority."
+      error: "Forbidden: This action requires executive administrative authority."
+    });
+  }
+  next();
+}
+var requireCEO = requireExecutive;
+function requireCanManageUsers(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: "Unauthorized: Authentication required." });
+  }
+  if (!req.user.canManageUsers && !req.user.isExecutive && req.user.role !== "CEO") {
+    return res.status(403).json({
+      error: "Forbidden: You do not have permission to manage users or organizational roles."
     });
   }
   next();
 }
 
 // server/socket.ts
+init_prisma();
 import { Server as SocketIOServer } from "socket.io";
 
 // server/routes/chat.ts
+init_prisma();
 import { Router } from "express";
 
 // server/services/notificationService.ts
+init_prisma();
 var PUSH_NOTIFICATION_TYPES = /* @__PURE__ */ new Set([
   "chat_mention",
   "task_assignment",
@@ -213,25 +643,11 @@ async function createNotification(params) {
 }
 
 // server/routes/chat.ts
+init_authorizationService();
 var router = Router();
-async function canAccessProjectChat(userId, userRole, projectId) {
-  if (userRole === "CEO") return true;
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { ownerId: true }
-  });
-  if (!project) return false;
-  if (project.ownerId === userId) return true;
-  const membership = await prisma.projectMembership.findUnique({
-    where: {
-      projectId_userId: { projectId, userId }
-    }
-  });
-  if (membership) return true;
-  const hasTask = await prisma.task.findFirst({
-    where: { assigneeId: userId, phase: { projectId } }
-  });
-  return !!hasTask;
+async function canAccessProjectChat(userId, _userRole, projectId) {
+  const ctx = await getUserHierarchyContext(userId);
+  return canViewProject(ctx, projectId);
 }
 router.get("/projects/:id/chat", requireAuth, async (req, res) => {
   try {
@@ -377,13 +793,10 @@ router.post("/projects/:id/chat/read", requireAuth, async (req, res) => {
 router.get("/chat/unread-counts", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const projects = await prisma.project.findMany({
-      where: user.role === "CEO" ? {} : {
-        OR: [
-          { ownerId: user.id },
-          { memberships: { some: { userId: user.id } } },
-          { phases: { some: { tasks: { some: { assigneeId: user.id } } } } }
-        ]
+      where: ctx.isExecutive ? {} : {
+        id: { in: ctx.authorizedProjectIds }
       },
       select: { id: true }
     });
@@ -558,6 +971,7 @@ function emitToProject(projectId, event, data) {
 }
 
 // server/routes/auth.ts
+init_prisma();
 import { Router as Router2 } from "express";
 
 // server/services/otpService.ts
@@ -958,6 +1372,245 @@ Enterprise Architecture & Access Control
     return { delivered: true, mockLogged: true };
   }
   throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+}
+async function sendLeaveRequestEmail(params) {
+  const {
+    to,
+    recipientName,
+    requesterName,
+    requesterRole,
+    leaveType,
+    dayType,
+    startDate,
+    endDate,
+    submissionDate,
+    status,
+    viewLink
+  } = params;
+  const from = getFromAddress();
+  const transporter = getTransporter();
+  const subject = `[PugArch] New Leave Request Submitted: ${requesterName} (${leaveType})`;
+  const text = `
+Hello ${recipientName || "Team Leader"},
+
+A new leave request has been submitted by ${requesterName} (${requesterRole}) and is pending review.
+
+Request Details:
+- Requester: ${requesterName} (${requesterRole})
+- Leave Type: ${leaveType} (${dayType})
+- Dates: ${startDate}${endDate && endDate !== startDate ? ` \u2013 ${endDate}` : ""}
+- Submitted: ${submissionDate}
+- Approval Status: ${status}
+
+Review this request in your dashboard:
+${viewLink}
+
+\u2014
+PugArch Cloud Operations
+Organizational Hierarchy & Leave Management
+`.trim();
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>New Leave Request Submitted</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #FBF9F4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #FBF9F4; padding: 40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 560px; background-color: #FFFFFF; border: 1px solid #E8E2D5; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 20px rgba(35, 30, 27, 0.05);">
+          <!-- Brand Header -->
+          <tr>
+            <td style="background-color: #231E1B; padding: 26px 32px; text-align: left;">
+              <span style="font-family: Georgia, serif; font-size: 20px; font-weight: bold; color: #FFFFFF; letter-spacing: 0.5px;">
+                PugArch &mdash; <span style="color: #E28C68;">Operations</span>
+              </span>
+              <div style="font-size: 11px; color: #A49C90; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px;">
+                Leave Management Notification
+              </div>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 32px 32px 24px 32px;">
+              <h1 style="font-size: 18px; font-weight: 700; color: #231E1B; margin: 0 0 12px 0; letter-spacing: -0.2px;">
+                New Leave Request Pending Review
+              </h1>
+              <p style="font-size: 14px; line-height: 22px; color: #5A524A; margin: 0 0 20px 0;">
+                Hello <strong>${recipientName || "Team Leader"}</strong>,<br>
+                A new leave request has been submitted by <strong>${requesterName}</strong> (${requesterRole}) and is awaiting review in accordance with organizational hierarchy rules.
+              </p>
+
+              <!-- Leave Details Box -->
+              <table role="presentation" width="100%" style="background-color: #FAF7F0; border: 1px solid #DDD6C8; border-radius: 14px; margin: 20px 0; border-collapse: separate; border-spacing: 0;">
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 12px; color: #70685F; width: 36%; font-weight: 600;">
+                    Requester:
+                  </td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 13px; color: #231E1B; font-weight: bold;">
+                    ${requesterName} <span style="font-size: 11px; color: #70685F; font-weight: normal;">(${requesterRole})</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 12px; color: #70685F; font-weight: 600;">
+                    Leave Type:
+                  </td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 13px; color: #231E1B; font-weight: 600;">
+                    ${leaveType} <span style="font-size: 11px; color: #70685F; font-weight: normal;">&bull; ${dayType}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 12px; color: #70685F; font-weight: 600;">
+                    Requested Dates:
+                  </td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 13px; color: #231E1B;">
+                    <strong>${startDate}</strong>${endDate && endDate !== startDate ? ` &ndash; <strong>${endDate}</strong>` : ""}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 12px; color: #70685F; font-weight: 600;">
+                    Submitted:
+                  </td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #E8E2D5; font-size: 12px; color: #5A524A;">
+                    ${submissionDate}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; font-size: 12px; color: #70685F; font-weight: 600;">
+                    Approval Status:
+                  </td>
+                  <td style="padding: 12px 16px; font-size: 12px;">
+                    <span style="display: inline-block; padding: 3px 10px; border-radius: 12px; font-weight: 700; font-size: 11px; background-color: #F2EDE2; color: #70685F; border: 1px solid #DDD6C8;">
+                      ${status}
+                    </span>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Call to Action Button -->
+              <div style="text-align: center; margin: 26px 0 16px 0;">
+                <a href="${viewLink}" style="display: inline-block; background-color: #C85A32; color: #FFFFFF; text-decoration: none; font-size: 13px; font-weight: 600; padding: 12px 28px; border-radius: 9999px; box-shadow: 0 2px 6px rgba(200, 90, 50, 0.25);">
+                  Review Request in Dashboard &rarr;
+                </a>
+              </div>
+
+              <!-- Privacy Notice -->
+              <p style="font-size: 11px; line-height: 16px; color: #8F867A; margin: 20px 0 0 0; text-align: center;">
+                Confidential employee details and private notes are safeguarded in accordance with organization privacy rules and can only be accessed through the secure portal by authorized personnel.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #F8F5EE; padding: 18px 32px; border-top: 1px solid #EDE7DC; text-align: center;">
+              <p style="font-size: 11px; color: #8F867A; margin: 0;">
+                Organizational Hierarchy &amp; Leave Management &bull; PugArch Cloud
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`.trim();
+  if (transporter) {
+    try {
+      await transporter.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html
+      });
+      return { delivered: true };
+    } catch (err) {
+      console.error(`[EmailService] Failed to deliver leave request email to ${to}:`, err.message || err);
+      throw new Error(`Email delivery failed: ${err.message || "SMTP transport error"}`);
+    }
+  }
+  const isDev = process.env.NODE_ENV !== "production";
+  if (isDev) {
+    console.log(`
+======================================================`);
+    console.log(`[EmailService DEV] Simulated leave request email to: ${to} (${recipientName})`);
+    console.log(`[EmailService DEV] Requester: ${requesterName} (${requesterRole})`);
+    console.log(`[EmailService DEV] Dates: ${startDate} to ${endDate} | Type: ${leaveType} (${dayType})`);
+    console.log(`======================================================
+`);
+    return { delivered: true, mockLogged: true };
+  }
+  throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+}
+async function dispatchLeaveSubmissionEmails(params) {
+  const {
+    requesterId,
+    requesterName,
+    requesterRole,
+    leaveType,
+    dayType,
+    startDate,
+    endDate,
+    submissionDate,
+    status
+  } = params;
+  const { resolveLeaveNotificationRecipients: resolveLeaveNotificationRecipients2 } = await Promise.resolve().then(() => (init_authorizationService(), authorizationService_exports));
+  const recipients = await resolveLeaveNotificationRecipients2(requesterId);
+  const fmtDate = (d) => {
+    const date = typeof d === "string" ? new Date(d) : d;
+    return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+  };
+  const fmtSubmission = (d) => {
+    const date = typeof d === "string" ? new Date(d) : d;
+    return date.toLocaleDateString("en-GB", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+  };
+  const appBaseUrl = (process.env.APP_URL || "http://localhost:3000").trim().replace(/\/+$/, "");
+  const viewLink = `${appBaseUrl}/dashboard`;
+  const startDateStr = fmtDate(startDate);
+  const endDateStr = fmtDate(endDate);
+  const submissionDateStr = fmtSubmission(submissionDate);
+  let delivered = 0;
+  const errors = [];
+  for (const recipient of recipients) {
+    try {
+      await sendLeaveRequestEmail({
+        to: recipient.email,
+        recipientName: recipient.name,
+        recipientRole: recipient.role,
+        requesterName,
+        requesterRole,
+        leaveType,
+        dayType,
+        startDate: startDateStr,
+        endDate: endDateStr,
+        submissionDate: submissionDateStr,
+        status,
+        viewLink
+      });
+      delivered++;
+    } catch (err) {
+      console.error(`[EmailService] Delivery error for recipient ${recipient.email}:`, err.message || err);
+      errors.push(`${recipient.email}: ${err.message || "Delivery error"}`);
+    }
+  }
+  return {
+    attempted: recipients.length,
+    delivered,
+    recipients,
+    errors
+  };
 }
 
 // server/routes/auth.ts
@@ -1584,7 +2237,7 @@ router2.post("/reset-password", async (req, res) => {
 });
 router2.post("/pre-register", requireCEO, async (req, res) => {
   try {
-    const { name, email, phone, role, department } = req.body;
+    const { name, email, phone, role, roleId, managerId, department } = req.body;
     if (!name || typeof name !== "string" || name.trim().length < 2) {
       return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
     }
@@ -1608,9 +2261,34 @@ router2.post("/pre-register", requireCEO, async (req, res) => {
     if (existingPhone) {
       return res.status(400).json({ error: "An account with this phone number already exists." });
     }
+    let finalRoleId = null;
     let assignedRole = "Employee";
-    if (role === "CTO") {
-      assignedRole = "CTO";
+    if (roleId) {
+      const roleDef = await prisma.role.findUnique({ where: { id: roleId } });
+      if (!roleDef || !roleDef.isActive) {
+        return res.status(400).json({ error: "Selected role is invalid or inactive." });
+      }
+      if (roleDef.isExecutive && !req.user.isExecutive) {
+        return res.status(403).json({ error: "Only executive leadership can assign executive roles." });
+      }
+      finalRoleId = roleDef.id;
+      assignedRole = roleDef.name;
+    } else if (role) {
+      const roleDef = await prisma.role.findFirst({
+        where: { name: role, isActive: true }
+      });
+      if (roleDef) {
+        finalRoleId = roleDef.id;
+        assignedRole = roleDef.name;
+      } else {
+        assignedRole = role;
+      }
+    }
+    if (managerId) {
+      const manager = await prisma.user.findUnique({ where: { id: managerId } });
+      if (!manager) {
+        return res.status(400).json({ error: "Specified manager not found." });
+      }
     }
     const preRegistered = await prisma.user.create({
       data: {
@@ -1618,9 +2296,15 @@ router2.post("/pre-register", requireCEO, async (req, res) => {
         email: cleanEmail,
         phone: cleanPhone,
         role: assignedRole,
+        roleId: finalRoleId,
+        managerId: managerId || null,
         department: department ? String(department).trim() : "Operations",
         avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
         isSignupCompleted: false
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } }
       }
     });
     res.status(201).json({
@@ -1648,9 +2332,209 @@ router2.post("/logout", (req, res) => {
   res.setHeader("Set-Cookie", `ff_user_id=; Path=/; HttpOnly; SameSite=${sameSite};${secureFlag} Max-Age=0`);
   res.json({ success: true, message: "Logged out successfully" });
 });
+router2.get("/profile", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required." });
+    }
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        role: true,
+        department: true,
+        avatarUrl: true,
+        isSignupCompleted: true,
+        createdAt: true,
+        updatedAt: true
+      }
+    });
+    if (!user) {
+      return res.status(404).json({ error: "User profile not found." });
+    }
+    res.json({ user });
+  } catch (error) {
+    console.error("Failed to retrieve user profile:", error);
+    res.status(500).json({ error: "Failed to retrieve profile." });
+  }
+});
+router2.patch("/profile", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required." });
+    }
+    const currentUser = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+    if (!currentUser) {
+      return res.status(404).json({ error: "User account not found." });
+    }
+    const { name, department, role, email, phone, password, resetToken, isSignupCompleted } = req.body || {};
+    if (role !== void 0 && role !== currentUser.role) {
+      return res.status(403).json({
+        error: "Forbidden: User role cannot be modified. Roles are managed strictly by executive leadership."
+      });
+    }
+    if (password !== void 0 || resetToken !== void 0 || isSignupCompleted !== void 0) {
+      return res.status(400).json({
+        error: "Modifying security credentials or signup status via profile updates is forbidden."
+      });
+    }
+    let newEmail;
+    if (email !== void 0) {
+      if (typeof email !== "string") {
+        return res.status(400).json({ error: "Email must be a valid text string." });
+      }
+      const cleanEmail = normalizeEmail(email);
+      if (!isValidEmail(cleanEmail)) {
+        return res.status(400).json({ error: "Please enter a valid email address." });
+      }
+      if (cleanEmail !== currentUser.email) {
+        const existingEmail = await prisma.user.findFirst({
+          where: {
+            email: cleanEmail,
+            NOT: { id: userId }
+          }
+        });
+        if (existingEmail) {
+          return res.status(400).json({ error: "An account with this email address already exists." });
+        }
+        newEmail = cleanEmail;
+      }
+    }
+    let newPhone;
+    if (phone !== void 0) {
+      if (typeof phone !== "string") {
+        return res.status(400).json({ error: "Mobile phone must be a valid text string." });
+      }
+      const rawPhone = phone.trim();
+      if (rawPhone) {
+        const cleanPhone = normalizePhone(rawPhone);
+        if (!isValidPhone(cleanPhone)) {
+          return res.status(400).json({ error: "Please enter a valid mobile phone number (7\u201315 digits)." });
+        }
+        const currentPhone = currentUser.phone ? normalizePhone(currentUser.phone) : "";
+        if (cleanPhone !== currentPhone) {
+          const existingPhone = await prisma.user.findFirst({
+            where: {
+              phone: cleanPhone,
+              NOT: { id: userId }
+            }
+          });
+          if (existingPhone) {
+            return res.status(400).json({ error: "An account with this phone number already exists." });
+          }
+          newPhone = cleanPhone;
+        }
+      } else if (currentUser.phone) {
+        newPhone = null;
+      }
+    }
+    let newName;
+    if (name !== void 0) {
+      if (typeof name !== "string") {
+        return res.status(400).json({ error: "Full name must be a valid text string." });
+      }
+      const trimmedName = name.trim();
+      if (trimmedName.length < 2 || trimmedName.length > 100) {
+        return res.status(400).json({ error: "Full name must be between 2 and 100 characters in length." });
+      }
+      if (/[<>{}]/.test(trimmedName)) {
+        return res.status(400).json({ error: "Full name contains invalid characters." });
+      }
+      if (trimmedName !== currentUser.name) {
+        newName = trimmedName;
+      }
+    }
+    let newDept;
+    if (department !== void 0) {
+      if (typeof department !== "string") {
+        return res.status(400).json({ error: "Department must be a valid text string." });
+      }
+      const trimmedDept = department.trim();
+      if (currentUser.isExecutive) {
+        if (trimmedDept.length < 2 || trimmedDept.length > 100) {
+          return res.status(400).json({ error: "Department must be between 2 and 100 characters in length." });
+        }
+        if (/[<>{}]/.test(trimmedDept)) {
+          return res.status(400).json({ error: "Department contains invalid characters." });
+        }
+        if (trimmedDept !== (currentUser.department || "")) {
+          newDept = trimmedDept;
+        }
+      } else {
+        if (trimmedDept !== (currentUser.department || "")) {
+          return res.status(403).json({
+            error: "Forbidden: Department assignments are managed by executive management."
+          });
+        }
+      }
+    }
+    if (newName === void 0 && newEmail === void 0 && newPhone === void 0 && newDept === void 0) {
+      return res.json({
+        message: "No changes were detected in your profile.",
+        user: {
+          id: currentUser.id,
+          name: currentUser.name,
+          email: currentUser.email,
+          phone: currentUser.phone,
+          role: currentUser.role,
+          department: currentUser.department,
+          avatarUrl: currentUser.avatarUrl,
+          isSignupCompleted: currentUser.isSignupCompleted,
+          createdAt: currentUser.createdAt,
+          updatedAt: currentUser.updatedAt
+        }
+      });
+    }
+    const updateData = {};
+    if (newName) {
+      updateData.name = newName;
+      updateData.avatarUrl = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(newName)}`;
+    }
+    if (newEmail) {
+      updateData.email = newEmail;
+    }
+    if (newPhone !== void 0) {
+      updateData.phone = newPhone;
+    }
+    if (newDept !== void 0) {
+      updateData.department = newDept;
+    }
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: updateData,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        role: true,
+        department: true,
+        avatarUrl: true,
+        isSignupCompleted: true,
+        createdAt: true,
+        updatedAt: true
+      }
+    });
+    res.json({
+      message: "Profile updated successfully.",
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error("Failed to update user profile:", error);
+    res.status(500).json({ error: "Failed to update profile." });
+  }
+});
 var auth_default = router2;
 
 // server/routes/projects.ts
+init_prisma();
 import { Router as Router3 } from "express";
 
 // lib/calculations.ts
@@ -1867,16 +2751,18 @@ var PhaseRenameSchema = z.object({
   name: z.string().trim().min(1, "Phase name is required").max(100, "Phase name cannot exceed 100 characters")
 });
 var IssueCreateSchema = z.object({
-  projectId: z.string().min(1, "Project is required"),
+  projectId: z.string({ required_error: "Project is required" }).min(1, "Project is required"),
   taskId: z.string().nullable().optional(),
-  title: z.string().trim().min(1, "Title is required").max(150, "Title cannot exceed 150 characters"),
-  severity: z.enum(["Minor", "Major", "Critical"]),
-  detail: z.string().trim().min(1, "Detail is required")
+  title: z.string({ required_error: "Title is required" }).trim().min(1, "Title is required").max(150, "Title cannot exceed 150 characters"),
+  severity: z.enum(["Minor", "Major", "Critical"], { required_error: "Severity is required" }),
+  detail: z.string({ required_error: "Detailed context is required" }).trim().min(1, "Detailed context is required"),
+  stepsToReproduce: z.string({ required_error: "Steps to reproduce are required" }).trim().min(1, "Steps to reproduce are required")
 });
 var IssueUpdateSchema = z.object({
   title: z.string().trim().min(1).max(150).optional(),
   severity: z.enum(["Minor", "Major", "Critical"]).optional(),
   detail: z.string().trim().min(1).optional(),
+  stepsToReproduce: z.string().trim().min(1).optional(),
   state: z.enum(["Open", "In progress", "Closed"]).optional(),
   reopenComment: z.string().trim().optional()
 });
@@ -1956,6 +2842,7 @@ var StatusOverrideSchema = z.object({
 });
 
 // server/routes/projects.ts
+init_authorizationService();
 var router3 = Router3();
 async function enrichProject(project) {
   const tasks = project.phases?.flatMap((p) => p.tasks || []) || [];
@@ -1992,8 +2879,12 @@ async function enrichProject(project) {
     }
   };
 }
-function sanitizeProjectForRole(project, userRole) {
-  if (userRole === "Employee") {
+function sanitizeProjectForRole(project, userRoleOrRank, isExecutive = false, isOwner = false) {
+  if (isExecutive || isOwner) {
+    return project;
+  }
+  const isRestricted = userRoleOrRank === "Employee" || userRoleOrRank === "Intern" || typeof userRoleOrRank === "number" && userRoleOrRank > 2;
+  if (isRestricted) {
     return {
       ...project,
       plannedBudget: 0,
@@ -2009,30 +2900,11 @@ function sanitizeProjectForRole(project, userRole) {
   }
   return project;
 }
-router3.get("/", async (req, res) => {
+router3.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
-    if (!user) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-    let whereClause = {};
-    if (user.role === "CEO") {
-      whereClause = {};
-    } else if (user.role === "CTO") {
-      whereClause = {
-        OR: [
-          { ownerId: user.id },
-          { memberships: { some: { userId: user.id } } }
-        ]
-      };
-    } else {
-      whereClause = {
-        OR: [
-          { memberships: { some: { userId: user.id } } },
-          { phases: { some: { tasks: { some: { assigneeId: user.id } } } } }
-        ]
-      };
-    }
+    const ctx = await getUserHierarchyContext(user.id);
+    const whereClause = ctx.isExecutive ? {} : { id: { in: ctx.authorizedProjectIds } };
     const projects = await prisma.project.findMany({
       where: whereClause,
       include: {
@@ -2060,23 +2932,29 @@ router3.get("/", async (req, res) => {
       orderBy: { startDate: "asc" }
     });
     const enriched = await Promise.all(projects.map(enrichProject));
-    const sanitized = enriched.map((p) => sanitizeProjectForRole(p, user.role));
+    const sanitized = enriched.map(
+      (p) => sanitizeProjectForRole(p, ctx.roleRank, ctx.isExecutive, p.ownerId === user.id)
+    );
     res.json(sanitized);
   } catch (error) {
     console.error("Failed to fetch projects:", error);
     res.status(500).json({ error: "Failed to retrieve projects" });
   }
 });
-router3.post("/", requireOwnerOrCEO, async (req, res) => {
+router3.post("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({ error: "Forbidden: Insufficient organizational hierarchy permission to charter projects." });
+    }
     const validation = ProjectCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid project input" });
     }
     const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0 } = validation.data;
     let designatedOwnerId = user.id;
-    if (user.role === "CEO" && validation.data.ownerId) {
+    if (ctx.isExecutive && validation.data.ownerId) {
       const targetUser = await prisma.user.findUnique({ where: { id: validation.data.ownerId } });
       if (targetUser) {
         designatedOwnerId = targetUser.id;
@@ -2105,7 +2983,7 @@ router3.post("/", requireOwnerOrCEO, async (req, res) => {
           role: "Owner"
         }
       });
-      if (user.role === "CEO" && designatedOwnerId !== user.id) {
+      if (ctx.isExecutive && designatedOwnerId !== user.id) {
         await tx.projectMembership.create({
           data: {
             projectId: p.id,
@@ -2144,28 +3022,45 @@ router3.post("/", requireOwnerOrCEO, async (req, res) => {
       }
     });
     const enriched = await enrichProject(fullProject);
-    res.status(201).json(sanitizeProjectForRole(enriched, user.role));
+    res.status(201).json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, fullProject?.ownerId === user.id));
   } catch (error) {
     console.error("Failed to create project:", error);
     res.status(500).json({ error: "Failed to create project" });
   }
 });
-router3.get("/:id", async (req, res) => {
+router3.get("/:id", requireAuth, async (req, res) => {
   try {
     const user = req.user;
-    if (!user) {
-      return res.status(401).json({ error: "Unauthorized" });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: "Forbidden: You do not have access to this project" });
     }
     const project = await prisma.project.findUnique({
       where: { id: req.params.id },
       include: {
         owner: {
-          select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true }
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+            department: true,
+            avatarUrl: true
+          }
         },
         memberships: {
           include: {
             user: {
-              select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true }
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                department: true,
+                avatarUrl: true
+              }
             }
           }
         },
@@ -2174,7 +3069,15 @@ router3.get("/:id", async (req, res) => {
           include: {
             tasks: {
               include: {
-                assignee: { select: { id: true, name: true, avatarUrl: true } },
+                assignee: {
+                  select: {
+                    id: true,
+                    name: true,
+                    avatarUrl: true,
+                    role: true,
+                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+                  }
+                },
                 qualityChecks: {
                   include: {
                     checker: { select: { id: true, name: true } }
@@ -2191,7 +3094,17 @@ router3.get("/:id", async (req, res) => {
         issues: {
           include: {
             owner: { select: { id: true, name: true } },
-            raiser: { select: { id: true, name: true } }
+            raiser: { select: { id: true, name: true } },
+            attachments: {
+              select: {
+                id: true,
+                fileName: true,
+                fileSize: true,
+                mimeType: true,
+                fileType: true,
+                createdAt: true
+              }
+            }
           },
           orderBy: { raisedAt: "desc" }
         },
@@ -2218,29 +3131,18 @@ router3.get("/:id", async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role === "Employee") {
-      const isMember = project.memberships.some((m) => m.userId === user.id);
-      const hasAssignedTask = !isMember && project.phases.some((ph) => ph.tasks?.some((t) => t.assigneeId === user.id));
-      if (!isMember && !hasAssignedTask) {
-        return res.status(403).json({ error: "Forbidden: You are not a member of this project" });
-      }
-    } else if (user.role === "CTO") {
-      const isOwnerOrMember = project.ownerId === user.id || project.memberships.some((m) => m.userId === user.id);
-      if (!isOwnerOrMember) {
-        return res.status(403).json({ error: "Forbidden: You do not have access to this project" });
-      }
-    }
     const enriched = await enrichProject(project);
-    const sanitized = sanitizeProjectForRole(enriched, user.role);
+    const sanitized = sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, project.ownerId === user.id);
     res.json(sanitized);
   } catch (error) {
     console.error("Failed to fetch project details:", error);
     res.status(500).json({ error: "Failed to retrieve project details" });
   }
 });
-router3.patch("/:id", requireOwnerOrCEO, async (req, res) => {
+router3.patch("/:id", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const project = await prisma.project.findUnique({
       where: { id: req.params.id },
       include: { owner: true }
@@ -2248,16 +3150,16 @@ router3.patch("/:id", requireOwnerOrCEO, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only edit projects you own." });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: You can only edit projects you own or manage." });
     }
     const validation = ProjectCharterUpdateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
     }
     const data = validation.data;
-    if (data.ownerId && data.ownerId !== project.ownerId && user.role !== "CEO") {
-      return res.status(403).json({ error: "Only the CEO can transfer project ownership to another user." });
+    if (data.ownerId && data.ownerId !== project.ownerId && !canTransferProjectOwnership(ctx)) {
+      return res.status(403).json({ error: "Only executive leadership can transfer project ownership to another user." });
     }
     const newStart = data.startDate ? new Date(data.startDate) : project.startDate;
     const newEnd = data.endDate ? new Date(data.endDate) : project.endDate;
@@ -2375,15 +3277,16 @@ router3.patch("/:id", requireOwnerOrCEO, async (req, res) => {
       return p;
     });
     const enriched = await enrichProject(updated);
-    res.json(sanitizeProjectForRole(enriched, user.role));
+    res.json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, updated.ownerId === user.id));
   } catch (error) {
     console.error("Failed to update project charter:", error);
     res.status(500).json({ error: "Failed to update project charter" });
   }
 });
-router3.post("/:id/status-override", requireOwnerOrCEO, async (req, res) => {
+router3.post("/:id/status-override", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const validation = StatusOverrideSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
@@ -2394,8 +3297,8 @@ router3.post("/:id/status-override", requireOwnerOrCEO, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Only the Project Owner or CEO can override status" });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Only the Project Owner or Executive leadership can override status" });
     }
     const previousStatus = project.statusOverride || "AUTO";
     const newStatus = validation.data.status;
@@ -2430,17 +3333,18 @@ router3.post("/:id/status-override", requireOwnerOrCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to override status" });
   }
 });
-router3.delete("/:id/status-override", requireOwnerOrCEO, async (req, res) => {
+router3.delete("/:id/status-override", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const project = await prisma.project.findUnique({
       where: { id: req.params.id }
     });
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: Only the Project Owner or CEO can remove status override" });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: Only the Project Owner or Executive can remove status override" });
     }
     const updated = await prisma.project.update({
       where: { id: project.id },
@@ -2451,15 +3355,108 @@ router3.delete("/:id/status-override", requireOwnerOrCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to remove status override" });
   }
 });
+router3.get("/:id/members", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: "Forbidden: You do not have access to view this project." });
+    }
+    const memberships = await prisma.projectMembership.findMany({
+      where: { projectId: req.params.id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { rank: true, name: true } }
+          }
+        }
+      },
+      orderBy: { createdAt: "asc" }
+    });
+    res.json(memberships);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch project members" });
+  }
+});
+router3.post("/:id/members", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id }
+    });
+    if (!project) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: Only the Project Owner or Executive can manage project team members." });
+    }
+    const { userId, role = "Member" } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+    const targetUser = await prisma.user.findUnique({ where: { id: userId } });
+    if (!targetUser) {
+      return res.status(404).json({ error: "Target user does not exist" });
+    }
+    const membership = await prisma.projectMembership.upsert({
+      where: { projectId_userId: { projectId: project.id, userId } },
+      create: { projectId: project.id, userId, role },
+      update: { role },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, role: true, avatarUrl: true }
+        }
+      }
+    });
+    res.status(201).json(membership);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to add project member" });
+  }
+});
+router3.delete("/:id/members/:userId", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id }
+    });
+    if (!project) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: Only the Project Owner or Executive can manage project team members." });
+    }
+    const targetUserId = req.params.userId;
+    if (targetUserId === project.ownerId) {
+      return res.status(400).json({ error: "Cannot remove the Project Owner from project membership." });
+    }
+    await prisma.projectMembership.deleteMany({
+      where: { projectId: project.id, userId: targetUserId }
+    });
+    res.json({ success: true, message: "Member removed from project." });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to remove project member" });
+  }
+});
 var projects_default = router3;
 
 // server/routes/phases.ts
+init_prisma();
 import { Router as Router4 } from "express";
+init_authorizationService();
 var router4 = Router4();
-router4.post("/projects/:projectId/phases", requireOwnerOrCEO, async (req, res) => {
+router4.post("/projects/:projectId/phases", requireAuth, async (req, res) => {
   try {
     const { projectId } = req.params;
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const validation = PhaseCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
@@ -2471,8 +3468,8 @@ router4.post("/projects/:projectId/phases", requireOwnerOrCEO, async (req, res) 
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only create phases for projects you own." });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: You can only create phases for projects you own or manage." });
     }
     const existing = await prisma.phase.findUnique({
       where: {
@@ -2513,10 +3510,11 @@ router4.post("/projects/:projectId/phases", requireOwnerOrCEO, async (req, res) 
     res.status(500).json({ error: "Failed to create phase" });
   }
 });
-router4.patch("/phases/:id", requireOwnerOrCEO, async (req, res) => {
+router4.patch("/phases/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const { name, plannedStart, plannedEnd } = req.body;
     const phase = await prisma.phase.findUnique({
       where: { id },
@@ -2525,8 +3523,8 @@ router4.patch("/phases/:id", requireOwnerOrCEO, async (req, res) => {
     if (!phase) {
       return res.status(404).json({ error: "Phase not found" });
     }
-    if (user.role !== "CEO" && phase.project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only update phases on projects you own." });
+    if (!canManageProject(ctx, phase.project)) {
+      return res.status(403).json({ error: "Forbidden: You can only update phases on projects you own or manage." });
     }
     const updateData = {};
     if (name) {
@@ -2563,10 +3561,11 @@ router4.patch("/phases/:id", requireOwnerOrCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to update phase" });
   }
 });
-router4.post("/phases/:id/archive", requireOwnerOrCEO, async (req, res) => {
+router4.post("/phases/:id/archive", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const phase = await prisma.phase.findUnique({
       where: { id },
       include: { project: true }
@@ -2574,8 +3573,8 @@ router4.post("/phases/:id/archive", requireOwnerOrCEO, async (req, res) => {
     if (!phase) {
       return res.status(404).json({ error: "Phase not found" });
     }
-    if (user.role !== "CEO" && phase.project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only archive phases on projects you own." });
+    if (!canManageProject(ctx, phase.project)) {
+      return res.status(403).json({ error: "Forbidden: You can only archive phases on projects you own or manage." });
     }
     const updated = await prisma.phase.update({
       where: { id },
@@ -2586,10 +3585,11 @@ router4.post("/phases/:id/archive", requireOwnerOrCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to archive phase" });
   }
 });
-router4.delete("/phases/:id", requireOwnerOrCEO, async (req, res) => {
+router4.delete("/phases/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const phase = await prisma.phase.findUnique({
       where: { id },
       include: { project: true }
@@ -2597,8 +3597,8 @@ router4.delete("/phases/:id", requireOwnerOrCEO, async (req, res) => {
     if (!phase) {
       return res.status(404).json({ error: "Phase not found" });
     }
-    if (user.role !== "CEO" && phase.project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only delete phases on projects you own." });
+    if (!canManageProject(ctx, phase.project)) {
+      return res.status(403).json({ error: "Forbidden: You can only delete phases on projects you own or manage." });
     }
     const taskCount = await prisma.task.count({
       where: { phaseId: id }
@@ -2617,14 +3617,72 @@ router4.delete("/phases/:id", requireOwnerOrCEO, async (req, res) => {
 var phases_default = router4;
 
 // server/routes/tasks.ts
+init_prisma();
 import { Router as Router5 } from "express";
+init_authorizationService();
 var router5 = Router5();
+router5.get("/", async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId, assigneeId, scope } = req.query;
+    const where = {};
+    if (projectId) {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: "Forbidden: You do not have access to this project." });
+      }
+      where.phase = { projectId: pId };
+    } else if (!ctx.isExecutive) {
+      where.phase = { projectId: { in: ctx.authorizedProjectIds } };
+    }
+    if (scope === "mine") {
+      where.assigneeId = user.id;
+    } else if (scope === "subordinates") {
+      if (ctx.isExecutive) {
+      } else if (ctx.allSubordinateIds.length > 0) {
+        where.assigneeId = { in: ctx.allSubordinateIds };
+      } else {
+        where.assigneeId = "__none__";
+      }
+    } else if (assigneeId) {
+      where.assigneeId = String(assigneeId);
+    }
+    const tasks = await prisma.task.findMany({
+      where,
+      include: {
+        assignee: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatarUrl: true,
+            role: true,
+            roleDefinition: {
+              select: { id: true, name: true, rank: true, isExecutive: true }
+            }
+          }
+        },
+        qualityChecks: true,
+        phase: { select: { id: true, name: true, projectId: true } }
+      },
+      orderBy: { plannedStart: "asc" }
+    });
+    res.json(tasks);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch tasks" });
+  }
+});
 router5.get("/:id", async (req, res) => {
   try {
     const user = req.user;
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: {
@@ -2636,7 +3694,16 @@ router5.get("/:id", async (req, res) => {
           }
         },
         assignee: {
-          select: { id: true, name: true, email: true, avatarUrl: true }
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatarUrl: true,
+            role: true,
+            roleDefinition: {
+              select: { id: true, name: true, rank: true, isExecutive: true }
+            }
+          }
         },
         qualityChecks: {
           include: {
@@ -2650,20 +3717,8 @@ router5.get("/:id", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role !== "CEO") {
-      const isOwner = task.phase.project.ownerId === user.id;
-      const isAssignee = task.assigneeId === user.id;
-      const isMember = !isOwner && !isAssignee && await prisma.projectMembership.findUnique({
-        where: {
-          projectId_userId: {
-            projectId: task.phase.project.id,
-            userId: user.id
-          }
-        }
-      });
-      if (!isOwner && !isAssignee && !isMember) {
-        return res.status(403).json({ error: "Forbidden: You do not have access to this task." });
-      }
+    if (!canViewTask(ctx, task)) {
+      return res.status(403).json({ error: "Forbidden: You do not have access to this task." });
     }
     let blockingTask = null;
     if (task.dependsOn) {
@@ -2683,6 +3738,7 @@ router5.post("/", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const validation = TaskCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
@@ -2694,23 +3750,10 @@ router5.post("/", async (req, res) => {
     if (!phase) {
       return res.status(400).json({ error: "Phase does not exist." });
     }
-    if (user.role !== "CEO") {
-      const isOwner = phase.project.ownerId === user.id;
-      if (!isOwner) {
-        const membership = await prisma.projectMembership.findUnique({
-          where: {
-            projectId_userId: {
-              projectId: phase.projectId,
-              userId: user.id
-            }
-          }
-        });
-        if (!membership) {
-          return res.status(403).json({
-            error: "Forbidden: You must be a member of this project to create tasks."
-          });
-        }
-      }
+    if (!canViewProject(ctx, phase.projectId)) {
+      return res.status(403).json({
+        error: "Forbidden: You must have access to this project to create tasks."
+      });
     }
     const isPostBaseline = !!phase.project.baselineId;
     const task = await prisma.task.create({
@@ -2724,7 +3767,6 @@ router5.post("/", async (req, res) => {
         plannedHours: validation.data.plannedHours,
         dependsOn: validation.data.dependsOn || null,
         isBaselined: !isPostBaseline,
-        // If after baseline, isBaselined = false
         state: "Not started"
       },
       include: {
@@ -2790,6 +3832,7 @@ router5.patch("/:id", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } }
@@ -2797,14 +3840,9 @@ router5.patch("/:id", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role === "Employee" && task.assigneeId !== user.id) {
+    if (!canUpdateTask(ctx, task)) {
       return res.status(403).json({
-        error: "Forbidden: Employees can only update their own assigned tasks."
-      });
-    }
-    if (user.role === "CTO" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
-      return res.status(403).json({
-        error: "Forbidden: You can only update tasks on projects you own or tasks assigned to you."
+        error: "Forbidden: You can only update tasks assigned to you, your subordinates, or on projects you manage."
       });
     }
     const validation = TaskUpdateSchema.safeParse(req.body);
@@ -2887,6 +3925,7 @@ router5.post("/:id/state", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const { state } = req.body;
     if (!["Not started", "In progress", "Blocked", "Completed"].includes(state)) {
       return res.status(400).json({ error: "Invalid task state" });
@@ -2898,11 +3937,10 @@ router5.post("/:id/state", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role === "Employee" && task.assigneeId !== user.id) {
-      return res.status(403).json({ error: "Employees can only update their own assigned tasks." });
-    }
-    if (user.role === "CTO" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
-      return res.status(403).json({ error: "You can only update tasks on projects you own or tasks assigned to you." });
+    if (!canUpdateTask(ctx, task)) {
+      return res.status(403).json({
+        error: "Forbidden: You can only update tasks assigned to you, your subordinates, or on projects you manage."
+      });
     }
     if (state === "Completed") {
       const check = await verifyTaskCompletion(task.id);
@@ -2929,6 +3967,7 @@ router5.post("/:id/risk-flag", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const { reason, severity = "Medium" } = req.body;
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
@@ -2937,14 +3976,8 @@ router5.post("/:id/risk-flag", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role !== "CEO") {
-      const isOwner = task.phase.project.ownerId === user.id;
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId: task.phase.projectId, userId: user.id } }
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: "Forbidden: You do not have access to this project." });
-      }
+    if (!canViewProject(ctx, task.phase.projectId)) {
+      return res.status(403).json({ error: "Forbidden: You do not have access to this project." });
     }
     const flagReason = reason && String(reason).trim() || `Task execution risk flagged on "${task.title}"`;
     const updatedTask = await prisma.task.update({
@@ -2994,6 +4027,7 @@ router5.delete("/:id/risk-flag", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } }
@@ -3001,14 +4035,8 @@ router5.delete("/:id/risk-flag", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role !== "CEO") {
-      const isOwner = task.phase.project.ownerId === user.id;
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId: task.phase.projectId, userId: user.id } }
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: "Forbidden: You do not have access to this project." });
-      }
+    if (!canViewProject(ctx, task.phase.projectId)) {
+      return res.status(403).json({ error: "Forbidden: You do not have access to this project." });
     }
     const updatedTask = await prisma.task.update({
       where: { id: task.id },
@@ -3037,6 +4065,7 @@ router5.post("/:id/quality-checks", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } }
@@ -3044,14 +4073,9 @@ router5.post("/:id/quality-checks", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role === "Employee" && task.assigneeId !== user.id) {
+    if (!canUpdateTask(ctx, task)) {
       return res.status(403).json({
-        error: "Forbidden: Employees can only add quality checks on their own tasks."
-      });
-    }
-    if (user.role === "CTO" && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
-      return res.status(403).json({
-        error: "Forbidden: You can only add quality checks on projects you own or tasks assigned to you."
+        error: "Forbidden: You can only add quality checks on tasks assigned to you, your subordinates, or on projects you manage."
       });
     }
     const { label, mandatory } = req.body;
@@ -3076,6 +4100,7 @@ router5.post("/quality-checks/:id/toggle", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const check = await prisma.qualityCheck.findUnique({
       where: { id: req.params.id },
       include: { task: { include: { phase: { include: { project: true } } } } }
@@ -3083,14 +4108,9 @@ router5.post("/quality-checks/:id/toggle", async (req, res) => {
     if (!check) {
       return res.status(404).json({ error: "Quality check not found" });
     }
-    if (user.role === "Employee" && check.task.assigneeId !== user.id) {
+    if (!canUpdateTask(ctx, check.task)) {
       return res.status(403).json({
-        error: "Forbidden: You can only check off quality requirements on your assigned tasks."
-      });
-    }
-    if (user.role === "CTO" && check.task.phase.project.ownerId !== user.id && check.task.assigneeId !== user.id) {
-      return res.status(403).json({
-        error: "Forbidden: You can only check off quality requirements on projects you own or tasks assigned to you."
+        error: "Forbidden: You can only check off quality requirements on your assigned tasks, subordinate tasks, or projects you manage."
       });
     }
     const isChecked = !!check.checkedAt;
@@ -3115,6 +4135,7 @@ router5.delete("/:id", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } }
@@ -3122,9 +4143,9 @@ router5.delete("/:id", async (req, res) => {
     if (!task) {
       return res.status(404).json({ error: "Task not found" });
     }
-    if (user.role === "Employee" || user.role !== "CEO" && task.phase.project.ownerId !== user.id) {
+    if (!canDeleteTask(ctx, task)) {
       return res.status(403).json({
-        error: "Forbidden: Only the Project Owner or CEO can delete tasks."
+        error: "Forbidden: Only the Project Owner or Executive leadership can delete tasks."
       });
     }
     await prisma.task.updateMany({
@@ -3165,38 +4186,319 @@ router5.delete("/:id", async (req, res) => {
 var tasks_default = router5;
 
 // server/routes/issues.ts
+init_prisma();
 import { Router as Router6 } from "express";
+import multer from "multer";
+init_authorizationService();
+
+// server/services/evidenceService.ts
+import crypto3 from "crypto";
+import path3 from "path";
+
+// server/services/s3Service.ts
+import fs from "fs";
+import path2 from "path";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+var MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
+var ALLOWED_EXTENSIONS = /* @__PURE__ */ new Set(["pdf", "xlsx", "docx", "dwg", "png", "jpg", "jpeg"]);
+var isVercel = !!process.env.VERCEL;
+var LOCAL_S3_DIR = isVercel ? path2.join("/tmp", "storage", "s3") : path2.join(process.cwd(), "storage", "s3");
+try {
+  if (!fs.existsSync(LOCAL_S3_DIR)) {
+    fs.mkdirSync(LOCAL_S3_DIR, { recursive: true });
+  }
+} catch {
+}
+var s3Bucket = process.env.AWS_S3_BUCKET || "fern-foley-documents-vault";
+var hasAwsCredentials = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+var s3Client = hasAwsCredentials ? new S3Client({
+  region: process.env.AWS_REGION || "eu-west-2",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+}) : null;
+function validateFileType(fileName, mimeType) {
+  const parts = fileName.split(".");
+  if (parts.length < 2) {
+    return { valid: false, error: "File must have a valid extension (.pdf, .xlsx, .docx, .dwg, .png, .jpg)", extension: "" };
+  }
+  const ext = parts[parts.length - 1].toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    return {
+      valid: false,
+      error: `File extension .${ext} is not allowed. Allowed types: PDF, XLSX, DOCX, DWG, PNG, JPG.`,
+      extension: ext
+    };
+  }
+  return { valid: true, extension: ext.toUpperCase() };
+}
+async function uploadToS3(params) {
+  if (s3Client && hasAwsCredentials) {
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: s3Bucket,
+        Key: params.key,
+        Body: params.body,
+        ContentType: params.contentType
+      })
+    );
+    return { s3Key: params.key, s3Bucket };
+  }
+  const destPath = path2.join(LOCAL_S3_DIR, params.key);
+  const destDir = path2.dirname(destPath);
+  if (!fs.existsSync(destDir)) {
+    fs.mkdirSync(destDir, { recursive: true });
+  }
+  fs.writeFileSync(destPath, params.body);
+  return { s3Key: params.key, s3Bucket };
+}
+async function getFromS3(key) {
+  if (s3Client && hasAwsCredentials) {
+    const response = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: s3Bucket,
+        Key: key
+      })
+    );
+    const streamToBuffer = (stream) => new Promise((resolve, reject) => {
+      const chunks = [];
+      stream.on("data", (chunk) => chunks.push(chunk));
+      stream.on("error", reject);
+      stream.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+    const buffer2 = await streamToBuffer(response.Body);
+    return { buffer: buffer2, contentType: response.ContentType || "application/octet-stream" };
+  }
+  const filePath = path2.join(LOCAL_S3_DIR, key);
+  if (!fs.existsSync(filePath)) {
+    throw new Error("File not found in storage");
+  }
+  const buffer = fs.readFileSync(filePath);
+  return { buffer, contentType: "application/octet-stream" };
+}
+async function deleteFromS3(key) {
+  try {
+    if (s3Client && hasAwsCredentials) {
+      await s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: s3Bucket,
+          Key: key
+        })
+      );
+      return true;
+    }
+    const filePath = path2.join(LOCAL_S3_DIR, key);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[s3Service] Failed to delete object with key "${key}":`, err);
+    return false;
+  }
+}
+
+// server/services/evidenceService.ts
+var MAX_EVIDENCE_FILE_SIZE_BYTES = 15 * 1024 * 1024;
+var MAX_EVIDENCE_ATTACHMENTS = 10;
+var ALLOWED_IMAGE_EXTENSIONS = /* @__PURE__ */ new Set(["png", "jpg", "jpeg", "webp"]);
+var ALLOWED_DOCUMENT_EXTENSIONS = /* @__PURE__ */ new Set(["pdf", "txt", "doc", "docx", "xls", "xlsx"]);
+var ALLOWED_EXTENSIONS2 = /* @__PURE__ */ new Set([
+  ...ALLOWED_IMAGE_EXTENSIONS,
+  ...ALLOWED_DOCUMENT_EXTENSIONS
+]);
+var MIME_TYPE_MAP = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+};
+var DANGEROUS_EXTENSIONS = /* @__PURE__ */ new Set([
+  "exe",
+  "bat",
+  "cmd",
+  "sh",
+  "php",
+  "js",
+  "mjs",
+  "cjs",
+  "ts",
+  "vbs",
+  "scr",
+  "msi",
+  "jar",
+  "ps1",
+  "py",
+  "pl",
+  "rb",
+  "hta",
+  "cpl",
+  "gadget",
+  "wsf",
+  "com"
+]);
+function verifyMagicBytes(buffer, ext) {
+  if (!buffer || buffer.length === 0) return false;
+  if (buffer.length >= 2 && buffer[0] === 77 && buffer[1] === 90) {
+    return false;
+  }
+  if (buffer.length >= 4 && buffer[0] === 127 && buffer[1] === 69 && buffer[2] === 76 && buffer[3] === 70) {
+    return false;
+  }
+  if (buffer.length >= 2 && buffer[0] === 35 && buffer[1] === 33) {
+    return false;
+  }
+  switch (ext) {
+    case "png":
+      return buffer.length >= 8 && buffer[0] === 137 && buffer[1] === 80 && buffer[2] === 78 && buffer[3] === 71 && buffer[4] === 13 && buffer[5] === 10 && buffer[6] === 26 && buffer[7] === 10;
+    case "jpg":
+    case "jpeg":
+      return buffer.length >= 3 && buffer[0] === 255 && buffer[1] === 216 && buffer[2] === 255;
+    case "webp":
+      return buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP";
+    case "pdf":
+      return buffer.length >= 4 && buffer.toString("ascii", 0, 4) === "%PDF";
+    case "docx":
+    case "xlsx":
+      return buffer.length >= 4 && buffer[0] === 80 && buffer[1] === 75 && (buffer[2] === 3 || buffer[2] === 5 || buffer[2] === 7) && (buffer[3] === 4 || buffer[3] === 6 || buffer[3] === 8);
+    case "doc":
+    case "xls":
+      return buffer.length >= 8 && buffer[0] === 208 && buffer[1] === 207 && buffer[2] === 17 && buffer[3] === 224 && buffer[4] === 161 && buffer[5] === 177 && buffer[6] === 26 && buffer[7] === 225;
+    case "txt":
+      const checkLength = Math.min(buffer.length, 1024);
+      for (let i = 0; i < checkLength; i++) {
+        if (buffer[i] === 0) return false;
+      }
+      return true;
+    default:
+      return false;
+  }
+}
+function validateEvidenceFile(file) {
+  if (!file || !file.originalname) {
+    return {
+      valid: false,
+      error: "File is required and must have a valid filename.",
+      extension: "",
+      mimeType: "",
+      fileType: "DOCUMENT"
+    };
+  }
+  if (file.size > MAX_EVIDENCE_FILE_SIZE_BYTES) {
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+    return {
+      valid: false,
+      error: `File "${file.originalname}" (${sizeMb} MB) exceeds the maximum allowed size of 15 MB.`,
+      extension: "",
+      mimeType: "",
+      fileType: "DOCUMENT"
+    };
+  }
+  const rawExt = path3.extname(file.originalname).replace(/^\./, "").toLowerCase().trim();
+  if (!rawExt) {
+    return {
+      valid: false,
+      error: `File "${file.originalname}" must have a valid extension (.png, .jpg, .webp, .pdf, .txt, .docx, .xlsx).`,
+      extension: "",
+      mimeType: "",
+      fileType: "DOCUMENT"
+    };
+  }
+  if (DANGEROUS_EXTENSIONS.has(rawExt)) {
+    return {
+      valid: false,
+      error: `File type .${rawExt} is prohibited for security reasons.`,
+      extension: rawExt,
+      mimeType: "",
+      fileType: "DOCUMENT"
+    };
+  }
+  if (!ALLOWED_EXTENSIONS2.has(rawExt)) {
+    return {
+      valid: false,
+      error: `Unsupported file format .${rawExt}. Supported types are: PNG, JPG, JPEG, WEBP, PDF, TXT, DOC, DOCX, XLS, XLSX.`,
+      extension: rawExt,
+      mimeType: "",
+      fileType: "DOCUMENT"
+    };
+  }
+  if (file.buffer && !verifyMagicBytes(file.buffer, rawExt)) {
+    return {
+      valid: false,
+      error: `File content does not match its claimed file extension .${rawExt}. File verification failed.`,
+      extension: rawExt,
+      mimeType: "",
+      fileType: "DOCUMENT"
+    };
+  }
+  const fileType = ALLOWED_IMAGE_EXTENSIONS.has(rawExt) ? "IMAGE" : "DOCUMENT";
+  const canonicalMime = MIME_TYPE_MAP[rawExt] || file.mimetype || "application/octet-stream";
+  return {
+    valid: true,
+    extension: rawExt,
+    mimeType: canonicalMime,
+    fileType
+  };
+}
+function generateEvidenceStorageKey(projectId, originalName, ext) {
+  const baseName = path3.basename(originalName, path3.extname(originalName)).replace(/[^a-zA-Z0-9_-]/g, "_").substring(0, 50);
+  const safeProjectId = projectId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const uniqueToken = crypto3.randomUUID();
+  const timestamp = Date.now();
+  return `evidence/issues/${safeProjectId}/${timestamp}-${uniqueToken}-${baseName}.${ext}`;
+}
+async function storeEvidenceAttachment(params) {
+  const s3Key = generateEvidenceStorageKey(params.projectId, params.file.originalname, params.validation.extension);
+  return await uploadToS3({
+    key: s3Key,
+    body: params.file.buffer,
+    contentType: params.validation.mimeType
+  });
+}
+async function cleanupEvidenceFiles(s3Keys) {
+  if (!s3Keys || s3Keys.length === 0) return;
+  await Promise.allSettled(
+    s3Keys.map(async (key) => {
+      try {
+        await deleteFromS3(key);
+      } catch (err) {
+        console.warn(`[EvidenceService] Failed to clean up orphaned key "${key}":`, err);
+      }
+    })
+  );
+}
+
+// server/routes/issues.ts
 var router6 = Router6();
+var upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_EVIDENCE_FILE_SIZE_BYTES,
+    files: MAX_EVIDENCE_ATTACHMENTS
+  }
+});
 router6.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const { projectId, severity, state } = req.query;
     const where = {};
     if (projectId) {
       const pId = String(projectId);
-      if (user.role !== "CEO") {
-        const isOwner = await prisma.project.findFirst({ where: { id: pId, ownerId: user.id } });
-        const isMember = await prisma.projectMembership.findUnique({
-          where: { projectId_userId: { projectId: pId, userId: user.id } }
-        });
-        const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-          where: { assigneeId: user.id, phase: { projectId: pId } }
-        });
-        if (!isOwner && !isMember && !hasTask) {
-          return res.status(403).json({ error: "You do not have access to issues for this project." });
-        }
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: "You do not have access to issues for this project." });
       }
       where.projectId = pId;
     } else {
-      if (user.role !== "CEO") {
-        where.project = {
-          OR: [
-            { ownerId: user.id },
-            { memberships: { some: { userId: user.id } } },
-            // Also include projects where employee has an assigned task (safety net)
-            { phases: { some: { tasks: { some: { assigneeId: user.id } } } } }
-          ]
-        };
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
       }
     }
     if (severity) where.severity = String(severity);
@@ -3207,7 +4509,17 @@ router6.get("/", requireAuth, async (req, res) => {
         project: { select: { id: true, name: true, ownerId: true } },
         task: { select: { id: true, title: true } },
         owner: { select: { id: true, name: true, avatarUrl: true } },
-        raiser: { select: { id: true, name: true, avatarUrl: true } }
+        raiser: { select: { id: true, name: true, avatarUrl: true } },
+        attachments: {
+          select: {
+            id: true,
+            fileName: true,
+            fileSize: true,
+            mimeType: true,
+            fileType: true,
+            createdAt: true
+          }
+        }
       },
       orderBy: { raisedAt: "desc" }
     });
@@ -3216,7 +4528,8 @@ router6.get("/", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch issues" });
   }
 });
-router6.post("/", async (req, res) => {
+router6.post("/", requireAuth, upload.array("evidence", MAX_EVIDENCE_ATTACHMENTS), async (req, res) => {
+  const uploadedS3Keys = [];
   try {
     const user = req.user;
     if (!user) {
@@ -3224,7 +4537,12 @@ router6.post("/", async (req, res) => {
     }
     const validation = IssueCreateSchema.safeParse(req.body);
     if (!validation.success) {
-      return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
+      const firstIssue = validation.error.issues[0];
+      const field = firstIssue?.path?.[0] ? `${String(firstIssue.path[0])}: ` : "";
+      return res.status(400).json({
+        error: `${field}${firstIssue?.message || "Invalid input"}`,
+        details: validation.error.format()
+      });
     }
     const project = await prisma.project.findUnique({
       where: { id: validation.data.projectId }
@@ -3232,14 +4550,35 @@ router6.post("/", async (req, res) => {
     if (!project) {
       return res.status(400).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO") {
-      const isOwner = project.ownerId === user.id;
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId: project.id, userId: user.id } }
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: "Forbidden: You must be a member of the project to raise an issue." });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, project.id)) {
+      return res.status(403).json({ error: "Forbidden: You must have access to the project to raise an issue." });
+    }
+    const files = req.files || [];
+    const validatedFilesData = [];
+    for (const file of files) {
+      const fileValidation = validateEvidenceFile(file);
+      if (!fileValidation.valid) {
+        return res.status(400).json({ error: fileValidation.error || "Invalid file attachment" });
       }
+      validatedFilesData.push({ file, validation: fileValidation });
+    }
+    const attachmentsToCreate = [];
+    for (const item of validatedFilesData) {
+      const uploadResult = await storeEvidenceAttachment({
+        projectId: project.id,
+        file: item.file,
+        validation: item.validation
+      });
+      uploadedS3Keys.push(uploadResult.s3Key);
+      attachmentsToCreate.push({
+        fileName: item.file.originalname,
+        fileSize: item.file.size,
+        mimeType: item.validation.mimeType,
+        fileType: item.validation.fileType,
+        s3Key: uploadResult.s3Key,
+        s3Bucket: uploadResult.s3Bucket
+      });
     }
     const issue = await prisma.issue.create({
       data: {
@@ -3248,23 +4587,44 @@ router6.post("/", async (req, res) => {
         title: validation.data.title,
         severity: validation.data.severity,
         detail: validation.data.detail,
+        stepsToReproduce: validation.data.stepsToReproduce,
         state: "Open",
         // Rule: issue starts Open
         ownerId: project.ownerId,
-        raisedBy: user.id
+        raisedBy: user.id,
+        attachments: {
+          create: attachmentsToCreate
+        }
       },
       include: {
-        project: { select: { id: true, name: true } },
-        owner: { select: { id: true, name: true } },
-        raiser: { select: { id: true, name: true } }
+        project: { select: { id: true, name: true, ownerId: true } },
+        owner: { select: { id: true, name: true, avatarUrl: true } },
+        raiser: { select: { id: true, name: true, avatarUrl: true } },
+        attachments: {
+          select: {
+            id: true,
+            fileName: true,
+            fileSize: true,
+            mimeType: true,
+            fileType: true,
+            createdAt: true
+          }
+        }
       }
     });
     if (issue.severity === "Critical") {
-      const ceos = await prisma.user.findMany({ where: { role: "CEO" } });
-      for (const ceo of ceos) {
+      const executives = await prisma.user.findMany({
+        where: {
+          OR: [
+            { roleDefinition: { isExecutive: true } },
+            { role: "CEO" }
+          ]
+        }
+      });
+      for (const exec of executives) {
         await prisma.notification.create({
           data: {
-            userId: ceo.id,
+            userId: exec.id,
             projectId: project.id,
             title: "CRITICAL ISSUE RAISED",
             message: `${project.name}: "${issue.title}" raised by ${user.name}`,
@@ -3288,8 +4648,11 @@ router6.post("/", async (req, res) => {
     }
     res.status(201).json(issue);
   } catch (error) {
+    if (uploadedS3Keys.length > 0) {
+      await cleanupEvidenceFiles(uploadedS3Keys);
+    }
     console.error("Failed to raise issue:", error);
-    res.status(500).json({ error: "Failed to raise issue" });
+    res.status(500).json({ error: error.message || "Failed to raise issue" });
   }
 });
 router6.get("/:id", requireAuth, async (req, res) => {
@@ -3301,7 +4664,17 @@ router6.get("/:id", requireAuth, async (req, res) => {
         project: true,
         task: true,
         owner: { select: { id: true, name: true, email: true, avatarUrl: true } },
-        raiser: { select: { id: true, name: true, email: true, avatarUrl: true } }
+        raiser: { select: { id: true, name: true, email: true, avatarUrl: true } },
+        attachments: {
+          select: {
+            id: true,
+            fileName: true,
+            fileSize: true,
+            mimeType: true,
+            fileType: true,
+            createdAt: true
+          }
+        }
       }
     });
     if (!issue) {
@@ -3312,13 +4685,59 @@ router6.get("/:id", requireAuth, async (req, res) => {
       const isMember = await prisma.projectMembership.findUnique({
         where: { projectId_userId: { projectId: issue.projectId, userId: user.id } }
       });
-      if (!isOwner && !isMember) {
+      const isRaiser = issue.raisedBy === user.id;
+      const isIssueOwner = issue.ownerId === user.id;
+      if (!isOwner && !isMember && !isRaiser && !isIssueOwner) {
         return res.status(403).json({ error: "Forbidden: You do not have access to view this issue." });
       }
     }
     res.json(issue);
   } catch (error) {
     res.status(500).json({ error: "Failed to retrieve issue" });
+  }
+});
+router6.get("/:id/attachments/:attachmentId", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { id: issueId, attachmentId } = req.params;
+    const download = req.query.download === "true" || req.query.download === "1";
+    const issue = await prisma.issue.findUnique({
+      where: { id: issueId },
+      include: {
+        project: { select: { id: true, ownerId: true } },
+        attachments: { where: { id: attachmentId } }
+      }
+    });
+    if (!issue) {
+      return res.status(404).json({ error: "Issue not found" });
+    }
+    const attachment = issue.attachments[0];
+    if (!attachment) {
+      return res.status(404).json({ error: "Attachment not found for this issue" });
+    }
+    if (user.role !== "CEO") {
+      const isOwner = issue.project.ownerId === user.id;
+      const isMember = await prisma.projectMembership.findUnique({
+        where: { projectId_userId: { projectId: issue.projectId, userId: user.id } }
+      });
+      const isRaiser = issue.raisedBy === user.id;
+      const isIssueOwner = issue.ownerId === user.id;
+      if (!isOwner && !isMember && !isRaiser && !isIssueOwner) {
+        return res.status(403).json({ error: "Forbidden: You do not have access to view evidence for this issue." });
+      }
+    }
+    const s3Data = await getFromS3(attachment.s3Key);
+    res.setHeader("Content-Type", attachment.mimeType || "application/octet-stream");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    const disposition = download ? "attachment" : "inline";
+    res.setHeader(
+      "Content-Disposition",
+      `${disposition}; filename="${encodeURIComponent(attachment.fileName)}"`
+    );
+    res.send(s3Data.buffer);
+  } catch (error) {
+    console.error("Failed to retrieve issue attachment:", error);
+    res.status(500).json({ error: "Failed to retrieve evidence file from storage" });
   }
 });
 router6.patch("/:id", requireAuth, async (req, res) => {
@@ -3331,11 +4750,9 @@ router6.patch("/:id", requireAuth, async (req, res) => {
     if (!issue) {
       return res.status(404).json({ error: "Issue not found" });
     }
-    if (user.role === "Employee" && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: Employees can only update their own issues." });
-    }
-    if (user.role === "CTO" && issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: CTO can only update issues on their own projects or issues they raised." });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageIssue(ctx, issue)) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to update this issue." });
     }
     const validation = IssueUpdateSchema.safeParse(req.body);
     if (!validation.success) {
@@ -3365,18 +4782,9 @@ router6.post("/:id/close", requireAuth, async (req, res) => {
     if (!issue) {
       return res.status(404).json({ error: "Issue not found" });
     }
-    if (user.role === "Employee") {
-      if (issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-        return res.status(403).json({
-          error: "Forbidden: Employees can only close issues they raised or own."
-        });
-      }
-    } else if (user.role === "CTO") {
-      if (issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-        return res.status(403).json({
-          error: "Forbidden: CTO can only close issues on their own projects."
-        });
-      }
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageIssue(ctx, issue)) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to close this issue." });
     }
     const updated = await prisma.issue.update({
       where: { id: req.params.id },
@@ -3406,18 +4814,9 @@ router6.post("/:id/reopen", requireAuth, async (req, res) => {
     if (!issue) {
       return res.status(404).json({ error: "Issue not found" });
     }
-    if (user.role === "Employee") {
-      if (issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-        return res.status(403).json({
-          error: "Forbidden: Employees can only reopen issues they raised or own."
-        });
-      }
-    } else if (user.role === "CTO") {
-      if (issue.project.ownerId !== user.id && issue.raisedBy !== user.id && issue.ownerId !== user.id) {
-        return res.status(403).json({
-          error: "Forbidden: CTO can only reopen issues on their own projects or issues they raised."
-        });
-      }
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageIssue(ctx, issue)) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to reopen this issue." });
     }
     const updated = await prisma.issue.update({
       where: { id: req.params.id },
@@ -3439,6 +4838,7 @@ router6.post("/:id/reopen", requireAuth, async (req, res) => {
 var issues_default = router6;
 
 // server/routes/risks.ts
+init_prisma();
 import { Router as Router7 } from "express";
 var router7 = Router7();
 function checkRiskStale(risk) {
@@ -3645,6 +5045,7 @@ router7.post("/:id/close", async (req, res) => {
 var risks_default = router7;
 
 // server/routes/milestones.ts
+init_prisma();
 import { Router as Router8 } from "express";
 var router8 = Router8();
 router8.post("/", requireOwnerOrCEO, async (req, res) => {
@@ -3769,6 +5170,8 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
 var milestones_default = router8;
 
 // server/routes/alerts.ts
+init_prisma();
+init_authorizationService();
 import { Router as Router9 } from "express";
 var router9 = Router9();
 router9.get("/", async (req, res) => {
@@ -3777,29 +5180,8 @@ router9.get("/", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    let projectFilter = {};
-    if (user.role === "CEO") {
-      projectFilter = {};
-    } else if (user.role === "CTO") {
-      projectFilter = {
-        OR: [
-          { ownerId: user.id },
-          { memberships: { some: { userId: user.id } } }
-        ]
-      };
-    } else {
-      projectFilter = {
-        OR: [
-          { memberships: { some: { userId: user.id } } },
-          { phases: { some: { tasks: { some: { assigneeId: user.id } } } } }
-        ]
-      };
-    }
-    const visibleProjects = await prisma.project.findMany({
-      where: projectFilter,
-      select: { id: true, name: true }
-    });
-    const visibleProjectIds = visibleProjects.map((p) => p.id);
+    const ctx = await getUserHierarchyContext(user.id);
+    const visibleProjectIds = ctx.authorizedProjectIds;
     const notifications = await prisma.notification.findMany({
       where: { userId: user.id },
       orderBy: { createdAt: "desc" },
@@ -3951,6 +5333,228 @@ router9.get("/", async (req, res) => {
       });
     }
     alertItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    const projects = await prisma.project.findMany({
+      where: { id: { in: visibleProjectIds } },
+      include: {
+        owner: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+            avatarUrl: true
+          }
+        },
+        phases: {
+          orderBy: { order: "asc" },
+          include: {
+            tasks: {
+              select: {
+                id: true,
+                title: true,
+                state: true,
+                priority: true,
+                plannedHours: true,
+                plannedStart: true,
+                plannedEnd: true,
+                assigneeId: true,
+                assignee: {
+                  select: {
+                    id: true,
+                    name: true,
+                    role: true,
+                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                    avatarUrl: true
+                  }
+                }
+              }
+            }
+          }
+        },
+        memberships: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                avatarUrl: true,
+                department: true
+              }
+            }
+          }
+        },
+        issues: {
+          where: { state: { in: ["Open", "In progress"] } },
+          select: { id: true, severity: true }
+        },
+        risks: {
+          where: { closedAt: null },
+          select: { id: true, severity: true }
+        }
+      },
+      orderBy: { name: "asc" }
+    });
+    let onTrackCount = 0;
+    let atRiskCount = 0;
+    let offTrackCount = 0;
+    const dashboardProjects = projects.map((p) => {
+      const allTasks = p.phases.flatMap((ph) => ph.tasks);
+      const progress = calculateProgress(
+        allTasks.map((t) => ({ state: t.state, plannedHours: t.plannedHours }))
+      );
+      const plan = calculatePlanPercentage(
+        p.startDate,
+        p.endDate,
+        p.phases.map((ph) => ({
+          plannedStart: ph.plannedStart,
+          plannedEnd: ph.plannedEnd,
+          order: ph.order
+        }))
+      );
+      const hasCritical = p.issues.some((i) => i.severity === "Critical");
+      const hasHighRisk = p.risks.some((r) => r.severity === "High");
+      const status = calculateProjectStatus({
+        progress,
+        plan,
+        hasCriticalIssueOpen: hasCritical,
+        hasHighRiskOpen: hasHighRisk,
+        statusOverride: p.statusOverride
+      });
+      if (status === "ON_TRACK") onTrackCount++;
+      else if (status === "AT_RISK") atRiskCount++;
+      else if (status === "OFF_TRACK") offTrackCount++;
+      const membersMap = /* @__PURE__ */ new Map();
+      if (p.owner) {
+        membersMap.set(p.owner.id, {
+          id: p.owner.id,
+          name: p.owner.name,
+          email: p.owner.email,
+          role: p.owner.roleDefinition?.name || p.owner.role,
+          roleRank: p.owner.roleDefinition?.rank ?? 2,
+          isExecutive: p.owner.roleDefinition?.isExecutive ?? false,
+          isIntern: p.owner.roleDefinition?.rank === 4 || p.owner.role === "Intern",
+          membershipType: "Project Owner",
+          avatarUrl: p.owner.avatarUrl,
+          assignedTasksCount: 0,
+          activeTasks: []
+        });
+      }
+      for (const m of p.memberships) {
+        if (!membersMap.has(m.user.id)) {
+          const rank = m.user.roleDefinition?.rank ?? (m.user.role === "Intern" ? 4 : 3);
+          membersMap.set(m.user.id, {
+            id: m.user.id,
+            name: m.user.name,
+            email: m.user.email,
+            role: m.user.roleDefinition?.name || m.user.role,
+            roleRank: rank,
+            isExecutive: m.user.roleDefinition?.isExecutive ?? false,
+            isIntern: rank === 4 || m.user.role === "Intern",
+            membershipType: m.role || "Member",
+            avatarUrl: m.user.avatarUrl,
+            department: m.user.department,
+            assignedTasksCount: 0,
+            activeTasks: []
+          });
+        }
+      }
+      for (const t of allTasks) {
+        if (t.assignee) {
+          if (!membersMap.has(t.assignee.id)) {
+            const rank = t.assignee.roleDefinition?.rank ?? (t.assignee.role === "Intern" ? 4 : 3);
+            membersMap.set(t.assignee.id, {
+              id: t.assignee.id,
+              name: t.assignee.name,
+              role: t.assignee.roleDefinition?.name || t.assignee.role,
+              roleRank: rank,
+              isExecutive: t.assignee.roleDefinition?.isExecutive ?? false,
+              isIntern: rank === 4 || t.assignee.role === "Intern",
+              membershipType: "Contributor",
+              avatarUrl: t.assignee.avatarUrl,
+              assignedTasksCount: 0,
+              activeTasks: []
+            });
+          }
+          const memberEntry = membersMap.get(t.assignee.id);
+          memberEntry.assignedTasksCount++;
+          if (t.state !== "Completed") {
+            memberEntry.activeTasks.push(t.title);
+          }
+        }
+      }
+      return {
+        id: p.id,
+        name: p.name,
+        goal: p.goal,
+        status,
+        progress,
+        plan,
+        owner: p.owner,
+        totalTasksCount: allTasks.length,
+        completedTasksCount: allTasks.filter((t) => t.state === "Completed").length,
+        activeTasksCount: allTasks.filter((t) => t.state !== "Completed").length,
+        members: Array.from(membersMap.values())
+      };
+    });
+    const allAuthorizedTasks = projects.flatMap((p) => p.phases.flatMap((ph) => ph.tasks));
+    let scopedTasks = allAuthorizedTasks;
+    if (!ctx.isExecutive) {
+      if (ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0) {
+        const allowedAssigneeIds = /* @__PURE__ */ new Set([user.id, ...ctx.allSubordinateIds]);
+        scopedTasks = allAuthorizedTasks.filter(
+          (t) => !t.assigneeId || allowedAssigneeIds.has(t.assigneeId)
+        );
+      } else {
+        scopedTasks = allAuthorizedTasks.filter((t) => t.assigneeId === user.id);
+      }
+    }
+    const taskDistribution = {
+      total: scopedTasks.length,
+      completed: scopedTasks.filter((t) => t.state === "Completed").length,
+      inProgress: scopedTasks.filter((t) => t.state === "In progress").length,
+      blocked: scopedTasks.filter((t) => t.state === "Blocked").length,
+      notStarted: scopedTasks.filter((t) => t.state === "Not started").length
+    };
+    let subordinateTasks = [];
+    if (ctx.roleRank <= 2 && ctx.allSubordinateIds.length > 0) {
+      subordinateTasks = allAuthorizedTasks.filter((t) => t.assigneeId && ctx.allSubordinateIds.includes(t.assigneeId) && t.state !== "Completed").map((t) => ({
+        id: t.id,
+        title: t.title,
+        state: t.state,
+        priority: t.priority,
+        plannedEnd: t.plannedEnd,
+        plannedHours: t.plannedHours,
+        assignee: t.assignee
+      }));
+    }
+    const visibleWorkloadUserIds = await getVisibleWorkloadUserIds(ctx);
+    const workloadAllocations = await prisma.allocation.findMany({
+      where: {
+        userId: { in: visibleWorkloadUserIds },
+        weekStartDate: /* @__PURE__ */ new Date("2026-09-14T00:00:00Z"),
+        ...ctx.isExecutive ? {} : { projectId: { in: visibleProjectIds } }
+      }
+    });
+    const userHoursMap = /* @__PURE__ */ new Map();
+    visibleWorkloadUserIds.forEach((id) => userHoursMap.set(id, 0));
+    workloadAllocations.forEach((a) => {
+      userHoursMap.set(a.userId, (userHoursMap.get(a.userId) || 0) + a.allocatedHours);
+    });
+    let overallocatedCount = 0;
+    let balancedCount = 0;
+    let availableCount = 0;
+    for (const hours of userHoursMap.values()) {
+      const metrics = calculateWorkload(hours, 37);
+      if (metrics.status === "OVER") overallocatedCount++;
+      else if (metrics.status === "BALANCED") balancedCount++;
+      else availableCount++;
+    }
+    const myAllocatedHours = userHoursMap.get(user.id) || 0;
+    const myWorkloadMetrics = calculateWorkload(myAllocatedHours, 37);
     const groupedByProject = {};
     for (const alert of alertItems) {
       if (!groupedByProject[alert.projectId]) {
@@ -3967,7 +5571,37 @@ router9.get("/", async (req, res) => {
         highRisksCount: highRisks.length,
         blockedTasksCount: blockedTasks.length,
         myTasksCount: myTasks.length,
-        pendingQualityChecksCount: pendingQualityChecks.length
+        pendingQualityChecksCount: pendingQualityChecks.length,
+        totalProjectsCount: projects.length,
+        onTrackCount,
+        atRiskCount,
+        offTrackCount
+      },
+      dashboardScope: {
+        roleRank: ctx.roleRank,
+        isExecutive: ctx.isExecutive,
+        canManageUsers: ctx.canManageUsers,
+        isManager: ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0,
+        visibleProjectsCount: projects.length,
+        visibleTeamCount: visibleWorkloadUserIds.length
+      },
+      dashboardProjects,
+      taskDistribution,
+      subordinateTasks,
+      workloadMetrics: {
+        teamDistribution: ctx.isExecutive || ctx.roleRank <= 2 ? {
+          totalTeam: visibleWorkloadUserIds.length,
+          overallocatedCount,
+          balancedCount,
+          availableCount
+        } : null,
+        myWorkload: {
+          allocatedHours: myAllocatedHours,
+          referenceHours: 37,
+          percentage: myWorkloadMetrics.percentage,
+          status: myWorkloadMetrics.status,
+          statusLabel: myWorkloadMetrics.statusLabel
+        }
       },
       groupedByProject,
       alerts: alertItems,
@@ -4003,22 +5637,33 @@ router9.post("/notifications/:id/read", async (req, res) => {
 var alerts_default = router9;
 
 // server/routes/workload.ts
+init_prisma();
 import { Router as Router10 } from "express";
+init_authorizationService();
 var router10 = Router10();
 router10.get("/", requireAuth, async (req, res) => {
   try {
-    const { weekStart } = req.query;
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { weekStart: queryWeekStart } = req.query;
     let weekDate;
-    if (weekStart) {
-      weekDate = new Date(String(weekStart));
+    if (queryWeekStart) {
+      weekDate = new Date(String(queryWeekStart));
     } else {
       weekDate = /* @__PURE__ */ new Date("2026-09-14T00:00:00Z");
     }
+    const visibleUserIds = await getVisibleWorkloadUserIds(ctx);
+    const projectScopeFilter = ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } };
     const users = await prisma.user.findMany({
+      where: {
+        id: { in: visibleUserIds },
+        isSignupCompleted: true
+      },
       include: {
         allocations: {
           where: {
-            weekStartDate: weekDate
+            weekStartDate: weekDate,
+            ...ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
           },
           include: {
             project: { select: { id: true, name: true } }
@@ -4026,7 +5671,8 @@ router10.get("/", requireAuth, async (req, res) => {
         },
         tasks: {
           where: {
-            state: { not: "Completed" }
+            state: { not: "Completed" },
+            ...ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
           },
           include: {
             phase: {
@@ -4035,11 +5681,53 @@ router10.get("/", requireAuth, async (req, res) => {
           }
         }
       },
-      orderBy: { name: "asc" }
+      orderBy: [{ role: "asc" }, { name: "asc" }]
+    });
+    const weekStart = weekDate;
+    const weekEnd = new Date(weekDate.getTime() + 7 * 24 * 60 * 60 * 1e3 - 1);
+    const approvedLeaves = await prisma.leaveRequest.findMany({
+      where: {
+        requestedBy: { in: visibleUserIds },
+        status: "Approved",
+        startDate: { lte: weekEnd },
+        endDate: { gte: weekStart }
+      }
     });
     const workloadData = users.map((u) => {
+      const userLeaves = approvedLeaves.filter((l) => l.requestedBy === u.id);
+      let leaveDeductionHours = 0;
+      for (const l of userLeaves) {
+        const lStart = Math.max(new Date(l.startDate).getTime(), weekStart.getTime());
+        const lEnd = Math.min(new Date(l.endDate).getTime(), weekEnd.getTime());
+        const days = Math.max(1, Math.round((lEnd - lStart) / (1e3 * 60 * 60 * 24)) + 1);
+        const dayHours = l.dayType === "Half day" ? 3.7 : 7.4;
+        leaveDeductionHours += days * dayHours;
+      }
+      leaveDeductionHours = Math.min(37, Math.round(leaveDeductionHours * 10) / 10);
+      const effectiveReferenceHours = Math.max(0, 37 - leaveDeductionHours);
       const totalAllocatedHours = u.allocations.reduce((sum, a) => sum + a.allocatedHours, 0);
-      const metrics = calculateWorkload(totalAllocatedHours, 37);
+      const metrics = calculateWorkload(totalAllocatedHours, effectiveReferenceHours > 0 ? effectiveReferenceHours : 1);
+      if (effectiveReferenceHours === 0) {
+        if (totalAllocatedHours > 0) {
+          metrics.status = "OVER";
+          metrics.statusLabel = "Overallocated (On Leave)";
+        } else {
+          metrics.status = "AVAILABLE";
+          metrics.statusLabel = "On Full Leave";
+        }
+      }
+      const schedulingConflicts = [];
+      for (const t of u.tasks) {
+        for (const l of userLeaves) {
+          const tStart = t.plannedStart ? new Date(t.plannedStart).getTime() : weekStart.getTime();
+          const tEnd = t.plannedEnd ? new Date(t.plannedEnd).getTime() : weekEnd.getTime();
+          const lStart = new Date(l.startDate).getTime();
+          const lEnd = new Date(l.endDate).getTime();
+          if (tStart <= lEnd && tEnd >= lStart) {
+            schedulingConflicts.push(`Task "${t.title}" scheduled during approved ${l.leaveType}`);
+          }
+        }
+      }
       const projectMap = /* @__PURE__ */ new Map();
       for (const a of u.allocations) {
         if (!projectMap.has(a.project.id)) {
@@ -4058,6 +5746,19 @@ router10.get("/", requireAuth, async (req, res) => {
           avatarUrl: u.avatarUrl
         },
         referenceHours: 37,
+        effectiveReferenceHours,
+        leaveDeductionHours,
+        approvedLeaves: userLeaves.map((l) => ({
+          id: l.id,
+          leaveType: l.leaveType,
+          dayType: l.dayType,
+          startDate: l.startDate,
+          endDate: l.endDate,
+          // Reason is sanitized to null for colleagues to safeguard private information
+          reason: u.id === ctx.userId || ctx.allSubordinateIds.includes(u.id) || ctx.isExecutive ? l.reason : null
+        })),
+        hasSchedulingConflict: schedulingConflicts.length > 0,
+        schedulingConflicts,
         allocatedHours: totalAllocatedHours,
         workloadPercentage: metrics.percentage,
         status: metrics.status,
@@ -4069,15 +5770,24 @@ router10.get("/", requireAuth, async (req, res) => {
     const overallocatedCount = workloadData.filter((w) => w.status === "OVER").length;
     const balancedCount = workloadData.filter((w) => w.status === "BALANCED").length;
     const availableCount = workloadData.filter((w) => w.status === "AVAILABLE").length;
+    const teamOnLeaveCount = workloadData.filter((w) => w.approvedLeaves.length > 0).length;
+    const schedulingConflictsCount = workloadData.filter((w) => w.hasSchedulingConflict).length;
     res.json({
       weekStartDate: weekDate.toISOString(),
       summary: {
         totalTeam: users.length,
         overallocatedCount,
         balancedCount,
-        availableCount
+        availableCount,
+        teamOnLeaveCount,
+        schedulingConflictsCount
       },
-      workload: workloadData
+      workload: workloadData,
+      scope: {
+        isExecutive: ctx.isExecutive,
+        subordinatesCount: ctx.allSubordinateIds.length,
+        visibleUserCount: users.length
+      }
     });
   } catch (error) {
     console.error("Failed to calculate workload:", error);
@@ -4087,9 +5797,7 @@ router10.get("/", requireAuth, async (req, res) => {
 router10.post("/allocate", requireAuth, async (req, res) => {
   try {
     const user = req.user;
-    if (user.role === "Employee") {
-      return res.status(403).json({ error: "Forbidden: Employees cannot manage workload allocations." });
-    }
+    const ctx = await getUserHierarchyContext(user.id);
     const { userId, projectId, weekStartDate, allocatedHours } = req.body;
     if (!userId || !projectId || !weekStartDate || allocatedHours === void 0) {
       return res.status(400).json({ error: "userId, projectId, weekStartDate, and allocatedHours are required" });
@@ -4101,8 +5809,27 @@ router10.post("/allocate", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only allocate resources on projects you own." });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: You can only allocate resources on projects you own or manage." });
+    }
+    const isMember = await prisma.projectMembership.findUnique({
+      where: { projectId_userId: { projectId, userId } }
+    });
+    const isSubordinate = ctx.allSubordinateIds.includes(userId);
+    const isSelf = userId === ctx.userId;
+    if (!ctx.isExecutive && !isMember && !isSubordinate && !isSelf) {
+      return res.status(403).json({
+        error: "Forbidden: Cannot allocate a user who is not a project member or in your reporting scope."
+      });
+    }
+    if (!isMember) {
+      await prisma.projectMembership.create({
+        data: {
+          projectId,
+          userId,
+          role: "Member"
+        }
+      });
     }
     const allocation = await prisma.allocation.upsert({
       where: {
@@ -4128,12 +5855,14 @@ router10.post("/allocate", requireAuth, async (req, res) => {
     });
     res.json(allocation);
   } catch (error) {
+    console.error("Failed to save allocation:", error);
     res.status(500).json({ error: "Failed to save allocation" });
   }
 });
 var workload_default = router10;
 
 // server/routes/notifications.ts
+init_prisma();
 import { Router as Router11 } from "express";
 var router11 = Router11();
 router11.get("/", requireAuth, async (req, res) => {
@@ -4192,32 +5921,29 @@ router11.post("/read-all", requireAuth, async (req, res) => {
 var notifications_default = router11;
 
 // server/routes/approvals.ts
+init_prisma();
 import { Router as Router12 } from "express";
+init_authorizationService();
 var router12 = Router12();
 router12.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const filter = req.query.filter;
+    const ctx = await getUserHierarchyContext(user.id);
     let whereClause = {};
     if (filter === "actionable") {
       whereClause = { approverId: user.id, state: "Pending" };
     } else if (filter === "mine") {
       whereClause = { requestedBy: user.id };
-    } else if (user.role === "CEO") {
+    } else if (ctx.isExecutive) {
       whereClause = {};
-    } else if (user.role === "CTO") {
+    } else {
       whereClause = {
         OR: [
           { approverId: user.id },
           { requestedBy: user.id },
-          { project: { ownerId: user.id } }
-        ]
-      };
-    } else {
-      whereClause = {
-        OR: [
-          { requestedBy: user.id },
-          { project: { memberships: { some: { userId: user.id } } } }
+          { projectId: { in: ctx.authorizedProjectIds } },
+          ...ctx.allSubordinateIds.length > 0 ? [{ requestedBy: { in: ctx.allSubordinateIds } }] : []
         ]
       };
     }
@@ -4367,13 +6093,12 @@ router12.post("/:id/decide", requireAuth, async (req, res) => {
     if (approval.state !== "Pending") {
       return res.status(400).json({ error: `Request is already in '${approval.state}' state.` });
     }
-    if (user.role === "Employee") {
-      return res.status(403).json({ error: "Forbidden: Employees cannot approve or send back requests." });
-    }
-    const isCEO = user.role === "CEO";
+    const ctx = await getUserHierarchyContext(user.id);
+    const isExecutive = ctx.isExecutive;
     const isProjectOwner = approval.project.ownerId === user.id;
     const isDesignatedApprover = user.id === approval.approverId;
-    const canDecide = isCEO || isProjectOwner || isDesignatedApprover;
+    const isAuthorizedManager = ctx.allSubordinateIds.includes(approval.requestedBy) && ctx.authorizedProjectIds.includes(approval.projectId);
+    const canDecide = isExecutive || isProjectOwner || isDesignatedApprover || isAuthorizedManager;
     if (!canDecide) {
       return res.status(403).json({ error: "You are not authorized to decide this request." });
     }
@@ -4530,30 +6255,29 @@ router12.post("/:id/resubmit", requireAuth, async (req, res) => {
 var approvals_default = router12;
 
 // server/routes/baselines.ts
+init_prisma();
 import { Router as Router13 } from "express";
+init_authorizationService();
 var router13 = Router13();
 router13.get("/:id/baselines", requireAuth, async (req, res) => {
   try {
     const { id: projectId } = req.params;
     const user = req.user;
-    if (user.role !== "CEO") {
-      const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
-      const isMember = !isOwner && await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId, userId: user.id } }
-      });
-      const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-        where: { assigneeId: user.id, phase: { projectId } }
-      });
-      if (!isOwner && !isMember && !hasTask) {
-        return res.status(403).json({ error: "You do not have access to view baselines for this project." });
-      }
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, projectId)) {
+      return res.status(403).json({ error: "You do not have access to view baselines for this project." });
     }
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { ownerId: true }
+    });
     const baselines = await prisma.baseline.findMany({
       where: { projectId },
       orderBy: { version: "desc" }
     });
+    const hideFinancials = !ctx.isExecutive && project?.ownerId !== user.id && ctx.roleRank > 2;
     const sanitizedBaselines = baselines.map((b) => {
-      if (user.role === "Employee") {
+      if (hideFinancials) {
         try {
           const snap = JSON.parse(b.dataSnapshot);
           if (snap.project) {
@@ -4598,9 +6322,9 @@ router13.post("/:id/baselines", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    const isAuthorized = user.role === "CEO" || project.ownerId === user.id;
-    if (!isAuthorized) {
-      return res.status(403).json({ error: "Only the Project Owner or CEO can establish a baseline." });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Only the Project Owner or Executive can establish a baseline." });
     }
     const latestBaseline = await prisma.baseline.findFirst({
       where: { projectId },
@@ -4691,17 +6415,9 @@ router13.get("/:id/baselines/compare", requireAuth, async (req, res) => {
     const { id: projectId } = req.params;
     const versionParam = req.query.version;
     const user = req.user;
-    if (user.role !== "CEO") {
-      const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
-      const isMember = !isOwner && await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId, userId: user.id } }
-      });
-      const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-        where: { assigneeId: user.id, phase: { projectId } }
-      });
-      if (!isOwner && !isMember && !hasTask) {
-        return res.status(403).json({ error: "You do not have access to view baseline comparison for this project." });
-      }
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, projectId)) {
+      return res.status(403).json({ error: "You do not have access to view baseline comparison for this project." });
     }
     const project = await prisma.project.findUnique({
       where: { id: projectId },
@@ -4772,7 +6488,8 @@ router13.get("/:id/baselines/compare", requireAuth, async (req, res) => {
       (sum, ph) => sum + ph.tasks.reduce((tSum, t) => tSum + t.plannedHours, 0),
       0
     );
-    const budgetComparison = user.role === "Employee" ? { baselinedBudget: 0, currentBudget: 0, deltaBudget: 0 } : {
+    const hideBudget = !ctx.isExecutive && project.ownerId !== user.id && ctx.roleRank > 2;
+    const budgetComparison = hideBudget ? { baselinedBudget: 0, currentBudget: 0, deltaBudget: 0 } : {
       baselinedBudget: snapshot.project?.plannedBudget || 0,
       currentBudget: project.plannedBudget,
       deltaBudget: project.plannedBudget - (snapshot.project?.plannedBudget || 0)
@@ -4804,6 +6521,7 @@ router13.get("/:id/baselines/compare", requireAuth, async (req, res) => {
 var baselines_default = router13;
 
 // server/routes/changelog.ts
+init_prisma();
 import { Router as Router14 } from "express";
 var router14 = Router14();
 router14.get("/:id/changelog", requireAuth, async (req, res) => {
@@ -4840,15 +6558,15 @@ router14.get("/:id/changelog", requireAuth, async (req, res) => {
 var changelog_default = router14;
 
 // server/routes/budget.ts
+init_prisma();
 import { Router as Router15 } from "express";
+init_authorizationService();
 var router15 = Router15();
 router15.get("/:id/budget", requireAuth, async (req, res) => {
   try {
     const { id: projectId } = req.params;
     const user = req.user;
-    if (user.role === "Employee") {
-      return res.status(403).json({ error: "Access denied. Budget information is strictly confidential and reserved for Project Owners and CEO." });
-    }
+    const ctx = await getUserHierarchyContext(user.id);
     const project = await prisma.project.findUnique({
       where: { id: projectId },
       include: {
@@ -4861,8 +6579,8 @@ router15.get("/:id/budget", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Access denied. You can only view budgets for projects you own." });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "Access denied. Budget information is confidential and reserved for Project Owners and Executive management." });
     }
     const planPercent = calculatePlanPercentage(
       project.startDate,
@@ -4922,9 +6640,7 @@ router15.post("/:id/budget/spend", requireAuth, async (req, res) => {
     const { id: projectId } = req.params;
     const user = req.user;
     const { amount, phaseId, description } = req.body;
-    if (user.role === "Employee") {
-      return res.status(403).json({ error: "Employees cannot modify budget or record spend." });
-    }
+    const ctx = await getUserHierarchyContext(user.id);
     const project = await prisma.project.findUnique({
       where: { id: projectId },
       include: { owner: true, phases: true }
@@ -4932,8 +6648,8 @@ router15.post("/:id/budget/spend", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "You can only record spend for projects you own." });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: "You are not authorized to modify budget or record spend for this project." });
     }
     const spendDelta = Number(amount);
     if (!spendDelta || spendDelta <= 0) {
@@ -4996,11 +6712,25 @@ router15.post("/:id/budget/spend", requireAuth, async (req, res) => {
 var budget_default = router15;
 
 // server/routes/portfolio.ts
+init_prisma();
 import { Router as Router16 } from "express";
+init_authorizationService();
 var router16 = Router16();
-router16.get("/", requireAuth, requireCEO, async (req, res) => {
+router16.get(["/", "/ceo"], requireAuth, async (req, res) => {
   try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({
+        error: "Forbidden: Portfolio dashboard is restricted to executive leadership and management."
+      });
+    }
+    const where = {};
+    if (!ctx.isExecutive) {
+      where.id = { in: ctx.authorizedProjectIds };
+    }
     const projects = await prisma.project.findMany({
+      where,
       include: {
         owner: { select: { id: true, name: true, avatarUrl: true } },
         phases: {
@@ -5118,96 +6848,12 @@ router16.get("/", requireAuth, requireCEO, async (req, res) => {
 var portfolio_default = router16;
 
 // server/routes/documents.ts
+init_prisma();
 import { Router as Router17 } from "express";
-import multer from "multer";
-
-// server/services/s3Service.ts
-import fs from "fs";
-import path2 from "path";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-var MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
-var ALLOWED_EXTENSIONS = /* @__PURE__ */ new Set(["pdf", "xlsx", "docx", "dwg", "png", "jpg", "jpeg"]);
-var isVercel = !!process.env.VERCEL;
-var LOCAL_S3_DIR = isVercel ? path2.join("/tmp", "storage", "s3") : path2.join(process.cwd(), "storage", "s3");
-try {
-  if (!fs.existsSync(LOCAL_S3_DIR)) {
-    fs.mkdirSync(LOCAL_S3_DIR, { recursive: true });
-  }
-} catch {
-}
-var s3Bucket = process.env.AWS_S3_BUCKET || "fern-foley-documents-vault";
-var hasAwsCredentials = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
-var s3Client = hasAwsCredentials ? new S3Client({
-  region: process.env.AWS_REGION || "eu-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-  }
-}) : null;
-function validateFileType(fileName, mimeType) {
-  const parts = fileName.split(".");
-  if (parts.length < 2) {
-    return { valid: false, error: "File must have a valid extension (.pdf, .xlsx, .docx, .dwg, .png, .jpg)", extension: "" };
-  }
-  const ext = parts[parts.length - 1].toLowerCase();
-  if (!ALLOWED_EXTENSIONS.has(ext)) {
-    return {
-      valid: false,
-      error: `File extension .${ext} is not allowed. Allowed types: PDF, XLSX, DOCX, DWG, PNG, JPG.`,
-      extension: ext
-    };
-  }
-  return { valid: true, extension: ext.toUpperCase() };
-}
-async function uploadToS3(params) {
-  if (s3Client && hasAwsCredentials) {
-    await s3Client.send(
-      new PutObjectCommand({
-        Bucket: s3Bucket,
-        Key: params.key,
-        Body: params.body,
-        ContentType: params.contentType
-      })
-    );
-    return { s3Key: params.key, s3Bucket };
-  }
-  const destPath = path2.join(LOCAL_S3_DIR, params.key);
-  const destDir = path2.dirname(destPath);
-  if (!fs.existsSync(destDir)) {
-    fs.mkdirSync(destDir, { recursive: true });
-  }
-  fs.writeFileSync(destPath, params.body);
-  return { s3Key: params.key, s3Bucket };
-}
-async function getFromS3(key) {
-  if (s3Client && hasAwsCredentials) {
-    const response = await s3Client.send(
-      new GetObjectCommand({
-        Bucket: s3Bucket,
-        Key: key
-      })
-    );
-    const streamToBuffer = (stream) => new Promise((resolve, reject) => {
-      const chunks = [];
-      stream.on("data", (chunk) => chunks.push(chunk));
-      stream.on("error", reject);
-      stream.on("end", () => resolve(Buffer.concat(chunks)));
-    });
-    const buffer2 = await streamToBuffer(response.Body);
-    return { buffer: buffer2, contentType: response.ContentType || "application/octet-stream" };
-  }
-  const filePath = path2.join(LOCAL_S3_DIR, key);
-  if (!fs.existsSync(filePath)) {
-    throw new Error("File not found in storage");
-  }
-  const buffer = fs.readFileSync(filePath);
-  return { buffer, contentType: "application/octet-stream" };
-}
-
-// server/routes/documents.ts
+import multer2 from "multer";
 var router17 = Router17();
-var upload = multer({
-  storage: multer.memoryStorage(),
+var upload2 = multer2({
+  storage: multer2.memoryStorage(),
   limits: {
     fileSize: MAX_FILE_SIZE_BYTES
     // 25 MB max limit
@@ -5260,7 +6906,7 @@ router17.get("/projects/:id/documents", requireAuth, async (req, res) => {
 router17.post(
   "/projects/:id/documents",
   requireAuth,
-  upload.single("file"),
+  upload2.single("file"),
   async (req, res) => {
     try {
       const { id: projectId } = req.params;
@@ -5328,7 +6974,7 @@ router17.post(
 router17.post(
   "/documents/:id/versions",
   requireAuth,
-  upload.single("file"),
+  upload2.single("file"),
   async (req, res) => {
     try {
       const { id: documentId } = req.params;
@@ -5428,32 +7074,13 @@ router17.get("/documents/:id/download", requireAuth, async (req, res) => {
 var documents_default = router17;
 
 // server/routes/calendar.ts
+init_prisma();
+init_authorizationService();
 import { Router as Router18 } from "express";
 var router18 = Router18();
 async function getCalendarEvents(user, startDate, endDate) {
-  let projectFilter = {};
-  if (user.role === "CEO") {
-    projectFilter = {};
-  } else if (user.role === "CTO") {
-    projectFilter = {
-      OR: [
-        { ownerId: user.id },
-        { memberships: { some: { userId: user.id } } }
-      ]
-    };
-  } else {
-    projectFilter = {
-      OR: [
-        { memberships: { some: { userId: user.id } } },
-        { phases: { some: { tasks: { some: { assigneeId: user.id } } } } }
-      ]
-    };
-  }
-  const visibleProjects = await prisma.project.findMany({
-    where: projectFilter,
-    select: { id: true, name: true }
-  });
-  const visibleProjectIds = visibleProjects.map((p) => p.id);
+  const ctx = await getUserHierarchyContext(user.id);
+  const visibleProjectIds = ctx.authorizedProjectIds;
   const events = [];
   const tasks = await prisma.task.findMany({
     where: {
@@ -5792,19 +7419,35 @@ router18.delete("/reminders/:id", async (req, res) => {
 var calendar_default = router18;
 
 // server/routes/users.ts
+init_prisma();
 import { Router as Router19 } from "express";
+init_authorizationService();
 var router19 = Router19();
 router19.get("/", requireAuth, async (req, res) => {
   try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const visibleIds = await getVisibleDirectoryUserIds(ctx);
     const users = await prisma.user.findMany({
-      where: { isSignupCompleted: true },
+      where: {
+        id: { in: visibleIds },
+        isSignupCompleted: true
+      },
       select: {
         id: true,
         name: true,
         email: true,
         role: true,
+        roleId: true,
         department: true,
-        avatarUrl: true
+        avatarUrl: true,
+        managerId: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true }
+        },
+        manager: {
+          select: { id: true, name: true, role: true }
+        }
       },
       orderBy: [{ role: "asc" }, { name: "asc" }]
     });
@@ -5814,7 +7457,7 @@ router19.get("/", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve users" });
   }
 });
-router19.get("/management", requireCEO, async (req, res) => {
+router19.get("/management", requireAuth, requireCanManageUsers, async (req, res) => {
   try {
     const users = await prisma.user.findMany({
       select: {
@@ -5823,10 +7466,18 @@ router19.get("/management", requireCEO, async (req, res) => {
         email: true,
         phone: true,
         role: true,
+        roleId: true,
+        managerId: true,
         department: true,
         avatarUrl: true,
         isSignupCompleted: true,
-        createdAt: true
+        createdAt: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true }
+        },
+        manager: {
+          select: { id: true, name: true, role: true }
+        }
       },
       orderBy: [{ isSignupCompleted: "asc" }, { name: "asc" }]
     });
@@ -5836,9 +7487,9 @@ router19.get("/management", requireCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve user directory" });
   }
 });
-router19.post("/pre-register", requireCEO, async (req, res) => {
+router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, res) => {
   try {
-    const { name, email, phone, role, department } = req.body;
+    const { name, email, phone, role, roleId, department, managerId } = req.body;
     if (!name || typeof name !== "string" || name.trim().length < 2) {
       return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
     }
@@ -5862,29 +7513,53 @@ router19.post("/pre-register", requireCEO, async (req, res) => {
     if (existingPhone) {
       return res.status(400).json({ error: "An account with this phone number already exists." });
     }
-    let assignedRole = "Employee";
-    if (role === "CTO") {
-      assignedRole = "CTO";
+    let targetRole = null;
+    if (roleId) {
+      targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
+    } else if (role) {
+      targetRole = await prisma.role.findFirst({ where: { name: String(role), isActive: true } });
+    }
+    if (!targetRole) {
+      targetRole = await prisma.role.findFirst({ where: { name: "Employee" } });
+    }
+    const assignedRoleName = targetRole?.name || "Employee";
+    const assignedRoleId = targetRole?.id || null;
+    let assignedManagerId = null;
+    if (managerId) {
+      const managerUser = await prisma.user.findUnique({ where: { id: String(managerId) } });
+      if (managerUser) {
+        assignedManagerId = managerUser.id;
+      }
     }
     const preRegistered = await prisma.user.create({
       data: {
         name: name.trim(),
         email: cleanEmail,
         phone: cleanPhone,
-        role: assignedRole,
+        role: assignedRoleName,
+        roleId: assignedRoleId,
+        managerId: assignedManagerId,
         department: department ? String(department).trim() : "Operations",
         avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
         isSignupCompleted: false
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } }
       }
     });
     res.status(201).json({
-      message: "User successfully pre-registered. They can now complete account creation using their email and phone.",
+      message: "User successfully pre-registered with organizational role and reporting manager.",
       user: {
         id: preRegistered.id,
         name: preRegistered.name,
         email: preRegistered.email,
         phone: preRegistered.phone,
         role: preRegistered.role,
+        roleId: preRegistered.roleId,
+        managerId: preRegistered.managerId,
+        manager: preRegistered.manager,
+        roleDefinition: preRegistered.roleDefinition,
         department: preRegistered.department,
         isSignupCompleted: false,
         createdAt: preRegistered.createdAt
@@ -5895,41 +7570,649 @@ router19.post("/pre-register", requireCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to pre-register user" });
   }
 });
+router19.patch("/:id/manager", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const { managerId } = req.body;
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (managerId === null || managerId === "") {
+      const updated2 = await prisma.user.update({
+        where: { id: targetUserId },
+        data: { managerId: null }
+      });
+      return res.json({ message: "Reporting manager removed.", user: updated2 });
+    }
+    if (managerId === targetUserId) {
+      return res.status(400).json({ error: "A user cannot report to themselves." });
+    }
+    const managerUser = await prisma.user.findUnique({
+      where: { id: String(managerId) }
+    });
+    if (!managerUser) {
+      return res.status(404).json({ error: "Designated manager does not exist." });
+    }
+    let currentCheckId = managerUser.managerId;
+    const visited = /* @__PURE__ */ new Set([managerUser.id]);
+    while (currentCheckId) {
+      if (currentCheckId === targetUserId) {
+        return res.status(400).json({
+          error: "Circular reporting relationship detected: the designated manager already reports to this user."
+        });
+      }
+      visited.add(currentCheckId);
+      const nextMgr = await prisma.user.findUnique({ where: { id: currentCheckId }, select: { managerId: true } });
+      currentCheckId = nextMgr?.managerId || null;
+      if (currentCheckId && visited.has(currentCheckId)) break;
+    }
+    const updated = await prisma.user.update({
+      where: { id: targetUserId },
+      data: { managerId: String(managerId) },
+      include: {
+        manager: { select: { id: true, name: true, role: true } },
+        roleDefinition: true
+      }
+    });
+    res.json({ message: "Reporting manager updated successfully.", user: updated });
+  } catch (error) {
+    console.error("Failed to update reporting manager:", error);
+    res.status(500).json({ error: "Failed to update reporting manager" });
+  }
+});
+router19.patch("/:id/role", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const { roleId, role } = req.body;
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    let targetRole = null;
+    if (roleId) {
+      targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
+    } else if (role) {
+      targetRole = await prisma.role.findFirst({ where: { name: String(role) } });
+    }
+    if (!targetRole) {
+      return res.status(400).json({ error: "Valid role definition is required." });
+    }
+    const updated = await prisma.user.update({
+      where: { id: targetUserId },
+      data: {
+        roleId: targetRole.id,
+        role: targetRole.name
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } }
+      }
+    });
+    res.json({ message: `Role updated to "${targetRole.name}".`, user: updated });
+  } catch (error) {
+    console.error("Failed to update user role:", error);
+    res.status(500).json({ error: "Failed to update user role" });
+  }
+});
+router19.get("/profile", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required." });
+    }
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        role: true,
+        roleId: true,
+        managerId: true,
+        department: true,
+        avatarUrl: true,
+        isSignupCompleted: true,
+        createdAt: true,
+        updatedAt: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true }
+        },
+        manager: {
+          select: { id: true, name: true, role: true }
+        }
+      }
+    });
+    if (!user) {
+      return res.status(404).json({ error: "User profile not found." });
+    }
+    res.json({ user });
+  } catch (error) {
+    console.error("Failed to retrieve user profile:", error);
+    res.status(500).json({ error: "Failed to retrieve profile." });
+  }
+});
+var handleProfileUpdate = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required." });
+    }
+    const currentUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { roleDefinition: true }
+    });
+    if (!currentUser) {
+      return res.status(404).json({ error: "User account not found." });
+    }
+    const { name, department, role, email, phone, password, resetToken, isSignupCompleted } = req.body || {};
+    if (role !== void 0 && role !== currentUser.role) {
+      return res.status(403).json({
+        error: "Forbidden: User role cannot be self-modified. Roles are managed by organizational administration."
+      });
+    }
+    if (password !== void 0 || resetToken !== void 0 || isSignupCompleted !== void 0) {
+      return res.status(400).json({
+        error: "Modifying security credentials or signup status via profile updates is forbidden."
+      });
+    }
+    let newEmail;
+    if (email !== void 0) {
+      if (typeof email !== "string") {
+        return res.status(400).json({ error: "Email must be a valid text string." });
+      }
+      const cleanEmail = normalizeEmail(email);
+      if (!isValidEmail(cleanEmail)) {
+        return res.status(400).json({ error: "Please enter a valid email address." });
+      }
+      if (cleanEmail !== currentUser.email) {
+        const existingEmail = await prisma.user.findFirst({
+          where: {
+            email: cleanEmail,
+            NOT: { id: userId }
+          }
+        });
+        if (existingEmail) {
+          return res.status(400).json({ error: "An account with this email address already exists." });
+        }
+        newEmail = cleanEmail;
+      }
+    }
+    let newPhone;
+    if (phone !== void 0) {
+      if (typeof phone !== "string") {
+        return res.status(400).json({ error: "Mobile phone must be a valid text string." });
+      }
+      const rawPhone = phone.trim();
+      if (rawPhone) {
+        const cleanPhone = normalizePhone(rawPhone);
+        if (!isValidPhone(cleanPhone)) {
+          return res.status(400).json({ error: "Please enter a valid mobile phone number (7\u201315 digits)." });
+        }
+        const currentPhone = currentUser.phone ? normalizePhone(currentUser.phone) : "";
+        if (cleanPhone !== currentPhone) {
+          const existingPhone = await prisma.user.findFirst({
+            where: {
+              phone: cleanPhone,
+              NOT: { id: userId }
+            }
+          });
+          if (existingPhone) {
+            return res.status(400).json({ error: "An account with this phone number already exists." });
+          }
+          newPhone = cleanPhone;
+        }
+      } else if (currentUser.phone) {
+        newPhone = null;
+      }
+    }
+    let newName;
+    if (name !== void 0) {
+      if (typeof name !== "string") {
+        return res.status(400).json({ error: "Full name must be a valid text string." });
+      }
+      const trimmedName = name.trim();
+      if (trimmedName.length < 2 || trimmedName.length > 100) {
+        return res.status(400).json({ error: "Full name must be between 2 and 100 characters in length." });
+      }
+      if (/[<>{}]/.test(trimmedName)) {
+        return res.status(400).json({ error: "Full name contains invalid characters." });
+      }
+      if (trimmedName !== currentUser.name) {
+        newName = trimmedName;
+      }
+    }
+    let newDept;
+    if (department !== void 0) {
+      if (typeof department !== "string") {
+        return res.status(400).json({ error: "Department must be a valid text string." });
+      }
+      const trimmedDept = department.trim();
+      const isExecutive = currentUser.roleDefinition?.isExecutive ?? currentUser.role === "CEO";
+      if (isExecutive) {
+        if (trimmedDept.length < 2 || trimmedDept.length > 100) {
+          return res.status(400).json({ error: "Department must be between 2 and 100 characters in length." });
+        }
+        if (/[<>{}]/.test(trimmedDept)) {
+          return res.status(400).json({ error: "Department contains invalid characters." });
+        }
+        if (trimmedDept !== (currentUser.department || "")) {
+          newDept = trimmedDept;
+        }
+      } else {
+        if (trimmedDept !== (currentUser.department || "")) {
+          return res.status(403).json({
+            error: "Forbidden: Department assignments are managed by organizational administration."
+          });
+        }
+      }
+    }
+    if (newName === void 0 && newEmail === void 0 && newPhone === void 0 && newDept === void 0) {
+      return res.json({
+        message: "No changes were detected in your profile.",
+        user: {
+          id: currentUser.id,
+          name: currentUser.name,
+          email: currentUser.email,
+          phone: currentUser.phone,
+          role: currentUser.role,
+          department: currentUser.department,
+          avatarUrl: currentUser.avatarUrl,
+          isSignupCompleted: currentUser.isSignupCompleted,
+          createdAt: currentUser.createdAt,
+          updatedAt: currentUser.updatedAt
+        }
+      });
+    }
+    const updateData = {};
+    if (newName) {
+      updateData.name = newName;
+      updateData.avatarUrl = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(newName)}`;
+    }
+    if (newEmail) {
+      updateData.email = newEmail;
+    }
+    if (newPhone !== void 0) {
+      updateData.phone = newPhone;
+    }
+    if (newDept !== void 0) {
+      updateData.department = newDept;
+    }
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: updateData,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        role: true,
+        department: true,
+        avatarUrl: true,
+        isSignupCompleted: true,
+        createdAt: true,
+        updatedAt: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true }
+        }
+      }
+    });
+    res.json({
+      message: "Profile updated successfully.",
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error("Failed to update user profile:", error);
+    res.status(500).json({ error: "Failed to update profile." });
+  }
+};
+router19.patch("/profile", requireAuth, handleProfileUpdate);
+router19.put("/profile", requireAuth, handleProfileUpdate);
 var users_default = router19;
 
-// server/routes/leave.ts
+// server/routes/roles.ts
+init_prisma();
 import { Router as Router20 } from "express";
+init_authorizationService();
 var router20 = Router20();
-var LEAVE_TYPES = ["Annual Leave", "Sick Leave", "Personal Leave", "Unpaid Leave", "Other"];
-var DAY_TYPES = ["Full day", "Half day"];
 router20.get("/", requireAuth, async (req, res) => {
   try {
+    const roles = await prisma.role.findMany({
+      orderBy: [{ rank: "asc" }, { name: "asc" }],
+      include: {
+        _count: {
+          select: { users: true }
+        }
+      }
+    });
+    res.json(roles);
+  } catch (error) {
+    console.error("Failed to retrieve roles:", error);
+    res.status(500).json({ error: "Failed to retrieve role hierarchy configuration" });
+  }
+});
+router20.get("/hierarchy", requireAuth, async (req, res) => {
+  try {
     const user = req.user;
-    const { status } = req.query;
-    const where = user.role === "CEO" ? {} : { requestedBy: user.id };
+    const ctx = await getUserHierarchyContext(user.id);
+    const roles = await prisma.role.findMany({
+      orderBy: { rank: "asc" }
+    });
+    const users = await prisma.user.findMany({
+      where: { isSignupCompleted: true },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        roleId: true,
+        managerId: true,
+        department: true,
+        avatarUrl: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true }
+        }
+      },
+      orderBy: [{ role: "asc" }, { name: "asc" }]
+    });
+    res.json({
+      currentUserContext: {
+        userId: ctx.userId,
+        roleName: ctx.roleName,
+        roleRank: ctx.roleRank,
+        isExecutive: ctx.isExecutive,
+        subordinatesCount: ctx.allSubordinateIds.length
+      },
+      roles,
+      users
+    });
+  } catch (error) {
+    console.error("Failed to retrieve hierarchy tree:", error);
+    res.status(500).json({ error: "Failed to retrieve hierarchy tree" });
+  }
+});
+router20.post("/", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const { name, rank, isExecutive = false, canManageUsers = false } = req.body;
+    if (!name || typeof name !== "string" || name.trim().length < 2) {
+      return res.status(400).json({ error: "Role name is required (minimum 2 characters)." });
+    }
+    const parsedRank = parseInt(String(rank), 10);
+    if (isNaN(parsedRank) || parsedRank < 1) {
+      return res.status(400).json({ error: "Rank must be a positive integer (e.g. 1 for Executive, 2, 3, etc.)." });
+    }
+    const cleanName = name.trim();
+    const existing = await prisma.role.findUnique({
+      where: { name: cleanName }
+    });
+    if (existing) {
+      return res.status(400).json({ error: `A role with name "${cleanName}" already exists.` });
+    }
+    const newRole = await prisma.role.create({
+      data: {
+        name: cleanName,
+        rank: parsedRank,
+        isExecutive: Boolean(isExecutive),
+        canManageUsers: Boolean(canManageUsers),
+        isActive: true
+      }
+    });
+    res.status(201).json(newRole);
+  } catch (error) {
+    console.error("Failed to create role:", error);
+    res.status(500).json({ error: "Failed to create role" });
+  }
+});
+router20.patch("/:id", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, rank, isExecutive, canManageUsers, isActive } = req.body;
+    const existing = await prisma.role.findUnique({
+      where: { id }
+    });
+    if (!existing) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+    const updateData = {};
+    if (name !== void 0) {
+      const cleanName = String(name).trim();
+      if (cleanName.length < 2) {
+        return res.status(400).json({ error: "Role name must be at least 2 characters." });
+      }
+      if (cleanName !== existing.name) {
+        const nameConflict = await prisma.role.findUnique({ where: { name: cleanName } });
+        if (nameConflict) {
+          return res.status(400).json({ error: `A role with name "${cleanName}" already exists.` });
+        }
+        updateData.name = cleanName;
+      }
+    }
+    if (rank !== void 0) {
+      const parsedRank = parseInt(String(rank), 10);
+      if (isNaN(parsedRank) || parsedRank < 1) {
+        return res.status(400).json({ error: "Rank must be a positive integer." });
+      }
+      updateData.rank = parsedRank;
+    }
+    if (isExecutive !== void 0) updateData.isExecutive = Boolean(isExecutive);
+    if (canManageUsers !== void 0) updateData.canManageUsers = Boolean(canManageUsers);
+    if (isActive !== void 0) updateData.isActive = Boolean(isActive);
+    const updated = await prisma.role.update({
+      where: { id },
+      data: updateData
+    });
+    if (updateData.name && updateData.name !== existing.name) {
+      await prisma.user.updateMany({
+        where: { roleId: id },
+        data: { role: updateData.name }
+      });
+    }
+    res.json(updated);
+  } catch (error) {
+    console.error("Failed to update role:", error);
+    res.status(500).json({ error: "Failed to update role" });
+  }
+});
+router20.delete("/:id", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const role = await prisma.role.findUnique({
+      where: { id },
+      include: { _count: { select: { users: true } } }
+    });
+    if (!role) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+    if (role._count.users > 0) {
+      const deactivated = await prisma.role.update({
+        where: { id },
+        data: { isActive: false }
+      });
+      return res.json({
+        message: `Role "${role.name}" has ${role._count.users} assigned user(s) and has been deactivated.`,
+        role: deactivated
+      });
+    }
+    await prisma.role.delete({ where: { id } });
+    res.json({ message: `Role "${role.name}" removed successfully.` });
+  } catch (error) {
+    console.error("Failed to delete role:", error);
+    res.status(500).json({ error: "Failed to delete role" });
+  }
+});
+var roles_default = router20;
+
+// server/routes/leave.ts
+init_prisma();
+import { Router as Router21 } from "express";
+init_authorizationService();
+var router21 = Router21();
+var LEAVE_TYPES = ["Annual Leave", "Sick Leave", "Personal Leave", "Unpaid Leave", "Other"];
+var DAY_TYPES = ["Full day", "Half day"];
+router21.get("/", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { status, scope, startDate, endDate } = req.query;
+    let targetUserIds = [];
+    if (scope === "mine") {
+      targetUserIds = [user.id];
+    } else if (scope === "subordinates" || scope === "pending_review") {
+      if (ctx.isExecutive) {
+        const allUsers = await prisma.user.findMany({ select: { id: true } });
+        targetUserIds = allUsers.map((u) => u.id);
+      } else if (ctx.allSubordinateIds.length > 0) {
+        targetUserIds = ctx.allSubordinateIds;
+      } else {
+        targetUserIds = [];
+      }
+    } else if (scope === "team" || scope === "availability") {
+      if (ctx.isExecutive) {
+        const allUsers = await prisma.user.findMany({ select: { id: true } });
+        targetUserIds = allUsers.map((u) => u.id);
+      } else {
+        const sharedIds = await getSharedProjectUserIds(ctx);
+        const subordinateSet = /* @__PURE__ */ new Set([user.id, ...ctx.allSubordinateIds, ...sharedIds]);
+        targetUserIds = Array.from(subordinateSet);
+      }
+    } else {
+      if (ctx.isExecutive) {
+        const allUsers = await prisma.user.findMany({ select: { id: true } });
+        targetUserIds = allUsers.map((u) => u.id);
+      } else if (ctx.allSubordinateIds.length > 0) {
+        targetUserIds = [user.id, ...ctx.allSubordinateIds];
+      } else {
+        targetUserIds = [user.id];
+      }
+    }
+    const where = {
+      requestedBy: { in: targetUserIds }
+    };
     if (status && typeof status === "string") {
       where.status = status;
+    } else if (scope === "pending_review") {
+      where.status = "Pending";
+    }
+    if (startDate || endDate) {
+      if (startDate) where.endDate = { gte: new Date(String(startDate)) };
+      if (endDate) where.startDate = { lte: new Date(String(endDate)) };
     }
     const requests = await prisma.leaveRequest.findMany({
       where,
       orderBy: { createdAt: "desc" },
       include: {
-        requester: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
-        reviewer: { select: { id: true, name: true, role: true } }
+        requester: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+          }
+        },
+        reviewer: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+          }
+        }
       }
     });
-    res.json(requests);
+    const sanitizedRequests = requests.filter((reqItem) => {
+      const isSelf = reqItem.requestedBy === ctx.userId;
+      const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
+      if (isSelf || isSubordinate || ctx.isExecutive) {
+        return true;
+      }
+      return reqItem.status === "Approved";
+    }).map((reqItem) => {
+      const isSelf = reqItem.requestedBy === ctx.userId;
+      const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
+      const hasFullAccess = isSelf || isSubordinate || ctx.isExecutive;
+      if (!hasFullAccess) {
+        return {
+          ...reqItem,
+          reason: null,
+          // Sanitized for peer privacy
+          reviewNote: null
+        };
+      }
+      return reqItem;
+    });
+    res.json(sanitizedRequests);
   } catch (error) {
     console.error("Failed to get leave requests:", error);
     res.status(500).json({ error: "Failed to retrieve leave requests" });
   }
 });
-router20.post("/", requireAuth, async (req, res) => {
+router21.get("/approver", requireAuth, async (req, res) => {
   try {
     const user = req.user;
-    if (user.role === "CEO") {
-      return res.status(403).json({ error: "CEO does not submit leave requests in this system." });
+    const approver = await getLeaveApprover(user.id);
+    res.json({ approver });
+  } catch (error) {
+    console.error("Failed to get designated approver:", error);
+    res.status(500).json({ error: "Failed to resolve leave approver" });
+  }
+});
+router21.get("/summary", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const myLeaves = await prisma.leaveRequest.findMany({
+      where: { requestedBy: user.id }
+    });
+    const myApproved = myLeaves.filter((l) => l.status === "Approved");
+    const myPending = myLeaves.filter((l) => l.status === "Pending");
+    const now = /* @__PURE__ */ new Date();
+    const currentlyOnLeave = myApproved.some(
+      (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
+    );
+    let teamSummary = null;
+    if (ctx.isExecutive || ctx.allSubordinateIds.length > 0) {
+      const subordinateIds = ctx.isExecutive ? (await prisma.user.findMany({ select: { id: true } })).map((u) => u.id).filter((id) => id !== user.id) : ctx.allSubordinateIds;
+      const teamLeaves = await prisma.leaveRequest.findMany({
+        where: { requestedBy: { in: subordinateIds } }
+      });
+      const teamPending = teamLeaves.filter((l) => l.status === "Pending");
+      const teamApproved = teamLeaves.filter((l) => l.status === "Approved");
+      const teamCurrentlyOnLeave = teamApproved.filter(
+        (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
+      );
+      teamSummary = {
+        totalSubordinatesCount: subordinateIds.length,
+        pendingApprovalsCount: teamPending.length,
+        currentlyOnLeaveCount: teamCurrentlyOnLeave.length,
+        totalApprovedLeavesCount: teamApproved.length
+      };
     }
+    res.json({
+      mySummary: {
+        totalSubmitted: myLeaves.length,
+        pendingCount: myPending.length,
+        approvedCount: myApproved.length,
+        currentlyOnLeave
+      },
+      teamSummary,
+      canApproveLeaves: ctx.isExecutive || ctx.allSubordinateIds.length > 0
+    });
+  } catch (error) {
+    console.error("Failed to get leave summary:", error);
+    res.status(500).json({ error: "Failed to retrieve leave summary" });
+  }
+});
+router21.post("/", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const { startDate, endDate, dayType, leaveType, reason } = req.body;
     if (!startDate || !endDate || !leaveType) {
       return res.status(400).json({ error: "startDate, endDate, and leaveType are required." });
@@ -5950,6 +8233,20 @@ router20.post("/", requireAuth, async (req, res) => {
     if (endMs < startMs) {
       return res.status(400).json({ error: "End date cannot be before start date." });
     }
+    const overlapping = await prisma.leaveRequest.findFirst({
+      where: {
+        requestedBy: user.id,
+        status: { in: ["Pending", "Approved"] },
+        startDate: { lte: end },
+        endDate: { gte: start }
+      }
+    });
+    if (overlapping) {
+      return res.status(400).json({
+        error: `You already have a ${overlapping.status.toLowerCase()} leave request for overlapping dates (${new Date(overlapping.startDate).toLocaleDateString()} \u2013 ${new Date(overlapping.endDate).toLocaleDateString()}).`
+      });
+    }
+    const approver = await getLeaveApprover(user.id);
     const leave = await prisma.leaveRequest.create({
       data: {
         requestedBy: user.id,
@@ -5961,36 +8258,71 @@ router20.post("/", requireAuth, async (req, res) => {
         status: "Pending"
       },
       include: {
-        requester: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
-        reviewer: { select: { id: true, name: true, role: true } }
+        requester: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+          }
+        },
+        reviewer: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+          }
+        }
       }
     });
-    try {
-      const ceos = await prisma.user.findMany({ where: { role: "CEO" } });
-      for (const ceo of ceos) {
+    if (approver && approver.id !== user.id) {
+      try {
         await prisma.notification.create({
           data: {
-            userId: ceo.id,
-            title: "New Leave Request",
-            message: `${user.name} submitted a ${leaveType} request (${dayType || "Full day"})`,
+            userId: approver.id,
+            title: "New Leave Request Pending Review",
+            message: `${user.name} submitted a ${leaveType} request (${dayType || "Full day"}) for your review.`,
             type: "LEAVE_REQUEST",
-            linkUrl: "/alerts"
+            linkUrl: "/dashboard"
           }
         });
+      } catch (notifErr) {
+        console.error("Failed to create leave request notification:", notifErr);
       }
-    } catch (notifErr) {
-      console.error("Failed to create leave request notification:", notifErr);
     }
-    res.status(201).json(leave);
+    try {
+      await dispatchLeaveSubmissionEmails({
+        leaveId: leave.id,
+        requesterId: user.id,
+        requesterName: user.name,
+        requesterRole: leave.requester?.roleDefinition?.name || user.role,
+        leaveType: leave.leaveType,
+        dayType: leave.dayType,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        submissionDate: leave.createdAt,
+        status: leave.status
+      });
+    } catch (emailErr) {
+      console.error("[LeaveAPI] Failed to dispatch leave submission emails:", emailErr.message || emailErr);
+    }
+    res.status(201).json({
+      ...leave,
+      designatedApprover: approver
+    });
   } catch (error) {
     console.error("Failed to create leave request:", error);
     res.status(500).json({ error: "Failed to submit leave request" });
   }
 });
-router20.post("/:id/decide", requireAuth, requireCEO, async (req, res) => {
+router21.post("/:id/decide", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const { action, reviewNote } = req.body;
     let normalizedAction = (action || "").toUpperCase().trim().replace(/[\s-]+/g, "_");
     if (normalizedAction === "DECLINE" || normalizedAction === "DECLINED") normalizedAction = "REJECT";
@@ -6001,14 +8333,22 @@ router20.post("/:id/decide", requireAuth, requireCEO, async (req, res) => {
     }
     const trimmedNote = typeof reviewNote === "string" ? reviewNote.trim() : "";
     if ((normalizedAction === "SEND_BACK" || normalizedAction === "REJECT") && !trimmedNote) {
-      return res.status(400).json({ error: "A review note is required when sending back or rejecting." });
+      return res.status(400).json({ error: "A review note is required when sending back or declining a request." });
     }
-    const leave = await prisma.leaveRequest.findUnique({ where: { id } });
+    const leave = await prisma.leaveRequest.findUnique({
+      where: { id },
+      include: {
+        requester: {
+          select: { id: true, name: true, role: true, department: true }
+        }
+      }
+    });
     if (!leave) {
       return res.status(404).json({ error: "Leave request not found." });
     }
-    if (leave.status !== "Pending") {
-      return res.status(400).json({ error: `This request is already '${leave.status}'.` });
+    const decisionAuth = canDecideLeaveRequest(ctx, leave);
+    if (!decisionAuth.allowed) {
+      return res.status(403).json({ error: decisionAuth.reason || "Forbidden: Insufficient approval authority." });
     }
     const statusMap = {
       APPROVE: "Approved",
@@ -6025,8 +8365,24 @@ router20.post("/:id/decide", requireAuth, requireCEO, async (req, res) => {
         reviewedAt: /* @__PURE__ */ new Date()
       },
       include: {
-        requester: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
-        reviewer: { select: { id: true, name: true, role: true } }
+        requester: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+          }
+        },
+        reviewer: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+          }
+        }
       }
     });
     try {
@@ -6052,32 +8408,35 @@ var handleWithdraw = async (req, res) => {
   try {
     const { id } = req.params;
     const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
     const leave = await prisma.leaveRequest.findUnique({ where: { id } });
     if (!leave) {
       return res.status(404).json({ error: "Leave request not found." });
     }
-    if (leave.requestedBy !== user.id) {
-      return res.status(403).json({ error: "You can only withdraw your own leave requests." });
-    }
-    if (leave.status !== "Pending") {
-      return res.status(400).json({ error: `Only pending requests can be withdrawn. This request is '${leave.status}'.` });
+    if (!canWithdrawLeaveRequest(ctx, leave)) {
+      if (leave.requestedBy !== user.id) {
+        return res.status(403).json({ error: "You can only cancel or withdraw your own leave requests." });
+      }
+      return res.status(400).json({
+        error: `Only pending requests can be withdrawn. This request is already '${leave.status}'.`
+      });
     }
     await prisma.leaveRequest.delete({ where: { id } });
-    res.json({ success: true });
+    res.json({ success: true, message: "Leave request successfully withdrawn." });
   } catch (error) {
     console.error("Failed to withdraw leave request:", error);
     res.status(500).json({ error: "Failed to withdraw leave request." });
   }
 };
-router20.post("/:id/withdraw", requireAuth, handleWithdraw);
-router20.delete("/:id/withdraw", requireAuth, handleWithdraw);
-router20.delete("/:id", requireAuth, handleWithdraw);
-var leave_default = router20;
+router21.post("/:id/withdraw", requireAuth, handleWithdraw);
+router21.delete("/:id/withdraw", requireAuth, handleWithdraw);
+router21.delete("/:id", requireAuth, handleWithdraw);
+var leave_default = router21;
 
 // server.ts
 if (!process.env.DATABASE_URL || !process.env.APP_URL) {
-  dotenv2.config({ path: path3.join(process.cwd(), "backend", ".env") });
-  dotenv2.config({ path: path3.join(process.cwd(), ".env") });
+  dotenv2.config({ path: path4.join(process.cwd(), "backend", ".env") });
+  dotenv2.config({ path: path4.join(process.cwd(), ".env") });
 }
 dotenv2.config();
 var app = express();
@@ -6139,6 +8498,7 @@ app.use("/api/alerts", alerts_default);
 app.use("/api/workload", workload_default);
 app.use("/api/calendar", calendar_default);
 app.use("/api/users", users_default);
+app.use("/api/roles", roles_default);
 app.use("/api/notifications", notifications_default);
 app.use("/api", chat_default);
 app.use("/api/approvals", approvals_default);

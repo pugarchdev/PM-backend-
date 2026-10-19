@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { calculateMilestoneSlippage } from '../../lib/calculations.js';
+import { getUserHierarchyContext, canViewProject, canManageProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -10,27 +11,25 @@ router.get('/:id/baselines', requireAuth, async (req: AuthRequest, res: Response
   try {
     const { id: projectId } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
 
-    if (user.role !== 'CEO') {
-      const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
-      const isMember = !isOwner && await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId, userId: user.id } },
-      });
-      const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-        where: { assigneeId: user.id, phase: { projectId } },
-      });
-      if (!isOwner && !isMember && !hasTask) {
-        return res.status(403).json({ error: 'You do not have access to view baselines for this project.' });
-      }
+    if (!canViewProject(ctx, projectId)) {
+      return res.status(403).json({ error: 'You do not have access to view baselines for this project.' });
     }
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { ownerId: true },
+    });
 
     const baselines = await prisma.baseline.findMany({
       where: { projectId },
       orderBy: { version: 'desc' },
     });
 
+    const hideFinancials = !ctx.isExecutive && project?.ownerId !== user.id && ctx.roleRank > 2;
     const sanitizedBaselines = baselines.map((b) => {
-      if (user.role === 'Employee') {
+      if (hideFinancials) {
         try {
           const snap = JSON.parse(b.dataSnapshot);
           if (snap.project) {
@@ -82,9 +81,9 @@ router.post('/:id/baselines', requireAuth, async (req: AuthRequest, res: Respons
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    const isAuthorized = user.role === 'CEO' || project.ownerId === user.id;
-    if (!isAuthorized) {
-      return res.status(403).json({ error: 'Only the Project Owner or CEO can establish a baseline.' });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Only the Project Owner or Executive can establish a baseline.' });
     }
 
     // Determine baseline version
@@ -192,18 +191,10 @@ router.get('/:id/baselines/compare', requireAuth, async (req: AuthRequest, res: 
     const { id: projectId } = req.params;
     const versionParam = req.query.version as string;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
 
-    if (user.role !== 'CEO') {
-      const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
-      const isMember = !isOwner && await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId, userId: user.id } },
-      });
-      const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-        where: { assigneeId: user.id, phase: { projectId } },
-      });
-      if (!isOwner && !isMember && !hasTask) {
-        return res.status(403).json({ error: 'You do not have access to view baseline comparison for this project.' });
-      }
+    if (!canViewProject(ctx, projectId)) {
+      return res.status(403).json({ error: 'You do not have access to view baseline comparison for this project.' });
     }
 
     const project = await prisma.project.findUnique({
@@ -288,8 +279,9 @@ router.get('/:id/baselines/compare', requireAuth, async (req: AuthRequest, res: 
       0
     );
 
+    const hideBudget = !ctx.isExecutive && project.ownerId !== user.id && ctx.roleRank > 2;
     const budgetComparison =
-      user.role === 'Employee'
+      hideBudget
         ? { baselinedBudget: 0, currentBudget: 0, deltaBudget: 0 }
         : {
             baselinedBudget: snapshot.project?.plannedBudget || 0,

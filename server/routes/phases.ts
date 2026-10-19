@@ -1,15 +1,17 @@
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { AuthRequest, requireOwnerOrCEO } from '../auth.js';
+import { AuthRequest, requireAuth } from '../auth.js';
 import { PhaseCreateSchema, PhaseRenameSchema } from '../../lib/validators.js';
+import { getUserHierarchyContext, canManageProject } from '../services/authorizationService.js';
 
 const router = Router();
 
-// POST /api/projects/:projectId/phases - Create Phase (Only Project Owners and CEO)
-router.post('/projects/:projectId/phases', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// POST /api/projects/:projectId/phases - Create Phase (Project Owners and Executive)
+router.post('/projects/:projectId/phases', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { projectId } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
     const validation = PhaseCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid input' });
@@ -24,9 +26,9 @@ router.post('/projects/:projectId/phases', requireOwnerOrCEO, async (req: AuthRe
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // RBAC: Project Owner can only manage their own projects
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only create phases for projects you own.' });
+    // Dynamic hierarchy check: Must be project owner or executive
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: You can only create phases for projects you own or manage.' });
     }
 
     // Phase name must be unique within project
@@ -78,10 +80,11 @@ router.post('/projects/:projectId/phases', requireOwnerOrCEO, async (req: AuthRe
 });
 
 // PATCH /api/phases/:id - Rename phase or update planned dates
-router.patch('/phases/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+router.patch('/phases/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
     const { name, plannedStart, plannedEnd } = req.body;
 
     const phase = await prisma.phase.findUnique({
@@ -92,9 +95,9 @@ router.patch('/phases/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Res
       return res.status(404).json({ error: 'Phase not found' });
     }
 
-    // RBAC: Project Owner can only manage their own projects
-    if (user.role !== 'CEO' && phase.project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only update phases on projects you own.' });
+    // Dynamic hierarchy check: Must be project owner or executive
+    if (!canManageProject(ctx, phase.project)) {
+      return res.status(403).json({ error: 'Forbidden: You can only update phases on projects you own or manage.' });
     }
 
     const updateData: any = {};
@@ -140,10 +143,11 @@ router.patch('/phases/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Res
 });
 
 // POST /api/phases/:id/archive - Archive phase
-router.post('/phases/:id/archive', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+router.post('/phases/:id/archive', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
     const phase = await prisma.phase.findUnique({
       where: { id },
       include: { project: true },
@@ -152,8 +156,8 @@ router.post('/phases/:id/archive', requireOwnerOrCEO, async (req: AuthRequest, r
       return res.status(404).json({ error: 'Phase not found' });
     }
 
-    if (user.role !== 'CEO' && phase.project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only archive phases on projects you own.' });
+    if (!canManageProject(ctx, phase.project)) {
+      return res.status(403).json({ error: 'Forbidden: You can only archive phases on projects you own or manage.' });
     }
 
     const updated = await prisma.phase.update({
@@ -167,10 +171,11 @@ router.post('/phases/:id/archive', requireOwnerOrCEO, async (req: AuthRequest, r
 });
 
 // DELETE /api/phases/:id - Attempting delete when tasks exist
-router.delete('/phases/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+router.delete('/phases/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
     const phase = await prisma.phase.findUnique({
       where: { id },
       include: { project: true },
@@ -179,8 +184,8 @@ router.delete('/phases/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Re
       return res.status(404).json({ error: 'Phase not found' });
     }
 
-    if (user.role !== 'CEO' && phase.project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only delete phases on projects you own.' });
+    if (!canManageProject(ctx, phase.project)) {
+      return res.status(403).json({ error: 'Forbidden: You can only delete phases on projects you own or manage.' });
     }
 
     const taskCount = await prisma.task.count({

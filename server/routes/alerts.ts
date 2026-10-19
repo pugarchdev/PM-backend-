@@ -2,6 +2,14 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest } from '../auth.js';
 
+import { getUserHierarchyContext, getVisibleWorkloadUserIds } from '../services/authorizationService.js';
+import {
+  calculateProgress,
+  calculatePlanPercentage,
+  calculateProjectStatus,
+  calculateWorkload,
+} from '../../lib/calculations.js';
+
 const router = Router();
 
 // GET /api/alerts - Home screen attention engine
@@ -12,31 +20,8 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Determine project visibility for current user
-    let projectFilter: any = {};
-    if (user.role === 'CEO') {
-      projectFilter = {}; // CEO sees all
-    } else if (user.role === 'CTO') {
-      projectFilter = {
-        OR: [
-          { ownerId: user.id },
-          { memberships: { some: { userId: user.id } } },
-        ],
-      };
-    } else {
-      projectFilter = {
-        OR: [
-          { memberships: { some: { userId: user.id } } },
-          { phases: { some: { tasks: { some: { assigneeId: user.id } } } } },
-        ],
-      };
-    }
-
-    const visibleProjects = await prisma.project.findMany({
-      where: projectFilter,
-      select: { id: true, name: true },
-    });
-    const visibleProjectIds = visibleProjects.map((p) => p.id);
+    const ctx = await getUserHierarchyContext(user.id);
+    const visibleProjectIds = ctx.authorizedProjectIds;
 
     // 1. Direct Notifications for user
     const notifications = await prisma.notification.findMany({
@@ -229,6 +214,255 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     // Sort newest first
     alertItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
+    // 8. Query projects within visible scope to compute dashboard analytics
+    const projects = await prisma.project.findMany({
+      where: { id: { in: visibleProjectIds } },
+      include: {
+        owner: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+            avatarUrl: true,
+          },
+        },
+        phases: {
+          orderBy: { order: 'asc' },
+          include: {
+            tasks: {
+              select: {
+                id: true,
+                title: true,
+                state: true,
+                priority: true,
+                plannedHours: true,
+                plannedStart: true,
+                plannedEnd: true,
+                assigneeId: true,
+                assignee: {
+                  select: {
+                    id: true,
+                    name: true,
+                    role: true,
+                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                    avatarUrl: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+        memberships: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                avatarUrl: true,
+                department: true,
+              },
+            },
+          },
+        },
+        issues: {
+          where: { state: { in: ['Open', 'In progress'] } },
+          select: { id: true, severity: true },
+        },
+        risks: {
+          where: { closedAt: null },
+          select: { id: true, severity: true },
+        },
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    let onTrackCount = 0;
+    let atRiskCount = 0;
+    let offTrackCount = 0;
+
+    const dashboardProjects = projects.map((p) => {
+      const allTasks = p.phases.flatMap((ph) => ph.tasks);
+      const progress = calculateProgress(
+        allTasks.map((t) => ({ state: t.state, plannedHours: t.plannedHours }))
+      );
+      const plan = calculatePlanPercentage(
+        p.startDate,
+        p.endDate,
+        p.phases.map((ph) => ({
+          plannedStart: ph.plannedStart,
+          plannedEnd: ph.plannedEnd,
+          order: ph.order,
+        }))
+      );
+      const hasCritical = p.issues.some((i) => i.severity === 'Critical');
+      const hasHighRisk = p.risks.some((r) => r.severity === 'High');
+
+      const status = calculateProjectStatus({
+        progress,
+        plan,
+        hasCriticalIssueOpen: hasCritical,
+        hasHighRiskOpen: hasHighRisk,
+        statusOverride: p.statusOverride,
+      });
+
+      if (status === 'ON_TRACK') onTrackCount++;
+      else if (status === 'AT_RISK') atRiskCount++;
+      else if (status === 'OFF_TRACK') offTrackCount++;
+
+      // Deduplicate project team contributors & identify interns clearly
+      const membersMap = new Map<string, any>();
+
+      if (p.owner) {
+        membersMap.set(p.owner.id, {
+          id: p.owner.id,
+          name: p.owner.name,
+          email: p.owner.email,
+          role: p.owner.roleDefinition?.name || p.owner.role,
+          roleRank: p.owner.roleDefinition?.rank ?? 2,
+          isExecutive: p.owner.roleDefinition?.isExecutive ?? false,
+          isIntern: (p.owner.roleDefinition?.rank === 4 || p.owner.role === 'Intern'),
+          membershipType: 'Project Owner',
+          avatarUrl: p.owner.avatarUrl,
+          assignedTasksCount: 0,
+          activeTasks: [] as string[],
+        });
+      }
+
+      for (const m of p.memberships) {
+        if (!membersMap.has(m.user.id)) {
+          const rank = m.user.roleDefinition?.rank ?? (m.user.role === 'Intern' ? 4 : 3);
+          membersMap.set(m.user.id, {
+            id: m.user.id,
+            name: m.user.name,
+            email: m.user.email,
+            role: m.user.roleDefinition?.name || m.user.role,
+            roleRank: rank,
+            isExecutive: m.user.roleDefinition?.isExecutive ?? false,
+            isIntern: (rank === 4 || m.user.role === 'Intern'),
+            membershipType: m.role || 'Member',
+            avatarUrl: m.user.avatarUrl,
+            department: m.user.department,
+            assignedTasksCount: 0,
+            activeTasks: [] as string[],
+          });
+        }
+      }
+
+      for (const t of allTasks) {
+        if (t.assignee) {
+          if (!membersMap.has(t.assignee.id)) {
+            const rank = t.assignee.roleDefinition?.rank ?? (t.assignee.role === 'Intern' ? 4 : 3);
+            membersMap.set(t.assignee.id, {
+              id: t.assignee.id,
+              name: t.assignee.name,
+              role: t.assignee.roleDefinition?.name || t.assignee.role,
+              roleRank: rank,
+              isExecutive: t.assignee.roleDefinition?.isExecutive ?? false,
+              isIntern: (rank === 4 || t.assignee.role === 'Intern'),
+              membershipType: 'Contributor',
+              avatarUrl: t.assignee.avatarUrl,
+              assignedTasksCount: 0,
+              activeTasks: [] as string[],
+            });
+          }
+          const memberEntry = membersMap.get(t.assignee.id);
+          memberEntry.assignedTasksCount++;
+          if (t.state !== 'Completed') {
+            memberEntry.activeTasks.push(t.title);
+          }
+        }
+      }
+
+      return {
+        id: p.id,
+        name: p.name,
+        goal: p.goal,
+        status,
+        progress,
+        plan,
+        owner: p.owner,
+        totalTasksCount: allTasks.length,
+        completedTasksCount: allTasks.filter((t) => t.state === 'Completed').length,
+        activeTasksCount: allTasks.filter((t) => t.state !== 'Completed').length,
+        members: Array.from(membersMap.values()),
+      };
+    });
+
+    // 9. Compute task distribution scoped to hierarchy permissions
+    const allAuthorizedTasks = projects.flatMap((p) => p.phases.flatMap((ph) => ph.tasks));
+    let scopedTasks = allAuthorizedTasks;
+
+    if (!ctx.isExecutive) {
+      if (ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0) {
+        // Manager sees tasks of subordinates and themselves
+        const allowedAssigneeIds = new Set([user.id, ...ctx.allSubordinateIds]);
+        scopedTasks = allAuthorizedTasks.filter(
+          (t) => !t.assigneeId || allowedAssigneeIds.has(t.assigneeId)
+        );
+      } else {
+        // Employee / Intern sees their own assigned tasks
+        scopedTasks = allAuthorizedTasks.filter((t) => t.assigneeId === user.id);
+      }
+    }
+
+    const taskDistribution = {
+      total: scopedTasks.length,
+      completed: scopedTasks.filter((t) => t.state === 'Completed').length,
+      inProgress: scopedTasks.filter((t) => t.state === 'In progress').length,
+      blocked: scopedTasks.filter((t) => t.state === 'Blocked').length,
+      notStarted: scopedTasks.filter((t) => t.state === 'Not started').length,
+    };
+
+    // 10. Subordinate tasks for managers
+    let subordinateTasks: any[] = [];
+    if (ctx.roleRank <= 2 && ctx.allSubordinateIds.length > 0) {
+      subordinateTasks = allAuthorizedTasks
+        .filter((t) => t.assigneeId && ctx.allSubordinateIds.includes(t.assigneeId) && t.state !== 'Completed')
+        .map((t) => ({
+          id: t.id,
+          title: t.title,
+          state: t.state,
+          priority: t.priority,
+          plannedEnd: t.plannedEnd,
+          plannedHours: t.plannedHours,
+          assignee: t.assignee,
+        }));
+    }
+
+    // 11. Workload summary calculation
+    const visibleWorkloadUserIds = await getVisibleWorkloadUserIds(ctx);
+    const workloadAllocations = await prisma.allocation.findMany({
+      where: {
+        userId: { in: visibleWorkloadUserIds },
+        weekStartDate: new Date('2026-09-14T00:00:00Z'),
+        ...(ctx.isExecutive ? {} : { projectId: { in: visibleProjectIds } }),
+      },
+    });
+
+    const userHoursMap = new Map<string, number>();
+    visibleWorkloadUserIds.forEach((id) => userHoursMap.set(id, 0));
+    workloadAllocations.forEach((a) => {
+      userHoursMap.set(a.userId, (userHoursMap.get(a.userId) || 0) + a.allocatedHours);
+    });
+
+    let overallocatedCount = 0;
+    let balancedCount = 0;
+    let availableCount = 0;
+    for (const hours of userHoursMap.values()) {
+      const metrics = calculateWorkload(hours, 37);
+      if (metrics.status === 'OVER') overallocatedCount++;
+      else if (metrics.status === 'BALANCED') balancedCount++;
+      else availableCount++;
+    }
+
+    const myAllocatedHours = userHoursMap.get(user.id) || 0;
+    const myWorkloadMetrics = calculateWorkload(myAllocatedHours, 37);
+
     // Group alerts by project
     const groupedByProject: Record<string, { projectName: string; alerts: AlertItem[] }> = {};
     for (const alert of alertItems) {
@@ -248,6 +482,39 @@ router.get('/', async (req: AuthRequest, res: Response) => {
         blockedTasksCount: blockedTasks.length,
         myTasksCount: myTasks.length,
         pendingQualityChecksCount: pendingQualityChecks.length,
+        totalProjectsCount: projects.length,
+        onTrackCount,
+        atRiskCount,
+        offTrackCount,
+      },
+      dashboardScope: {
+        roleRank: ctx.roleRank,
+        isExecutive: ctx.isExecutive,
+        canManageUsers: ctx.canManageUsers,
+        isManager: ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0,
+        visibleProjectsCount: projects.length,
+        visibleTeamCount: visibleWorkloadUserIds.length,
+      },
+      dashboardProjects,
+      taskDistribution,
+      subordinateTasks,
+      workloadMetrics: {
+        teamDistribution:
+          ctx.isExecutive || ctx.roleRank <= 2
+            ? {
+                totalTeam: visibleWorkloadUserIds.length,
+                overallocatedCount,
+                balancedCount,
+                availableCount,
+              }
+            : null,
+        myWorkload: {
+          allocatedHours: myAllocatedHours,
+          referenceHours: 37,
+          percentage: myWorkloadMetrics.percentage,
+          status: myWorkloadMetrics.status,
+          statusLabel: myWorkloadMetrics.statusLabel,
+        },
       },
       groupedByProject,
       alerts: alertItems,

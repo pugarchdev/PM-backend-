@@ -62,17 +62,19 @@ export const PhaseRenameSchema = z.object({
 });
 
 export const IssueCreateSchema = z.object({
-  projectId: z.string().min(1, 'Project is required'),
+  projectId: z.string({ required_error: 'Project is required' }).min(1, 'Project is required'),
   taskId: z.string().nullable().optional(),
-  title: z.string().trim().min(1, 'Title is required').max(150, 'Title cannot exceed 150 characters'),
-  severity: z.enum(['Minor', 'Major', 'Critical']),
-  detail: z.string().trim().min(1, 'Detail is required'),
+  title: z.string({ required_error: 'Title is required' }).trim().min(1, 'Title is required').max(150, 'Title cannot exceed 150 characters'),
+  severity: z.enum(['Minor', 'Major', 'Critical'], { required_error: 'Severity is required' }),
+  detail: z.string({ required_error: 'Detailed context is required' }).trim().min(1, 'Detailed context is required'),
+  stepsToReproduce: z.string({ required_error: 'Steps to reproduce are required' }).trim().min(1, 'Steps to reproduce are required'),
 });
 
 export const IssueUpdateSchema = z.object({
   title: z.string().trim().min(1).max(150).optional(),
   severity: z.enum(['Minor', 'Major', 'Critical']).optional(),
   detail: z.string().trim().min(1).optional(),
+  stepsToReproduce: z.string().trim().min(1).optional(),
   state: z.enum(['Open', 'In progress', 'Closed']).optional(),
   reopenComment: z.string().trim().optional(),
 });

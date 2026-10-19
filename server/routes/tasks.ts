@@ -2,8 +2,78 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest } from '../auth.js';
 import { TaskCreateSchema, TaskUpdateSchema } from '../../lib/validators.js';
+import {
+  getUserHierarchyContext,
+  canViewProject,
+  canViewTask,
+  canUpdateTask,
+  canDeleteTask,
+} from '../services/authorizationService.js';
 
 const router = Router();
+
+// GET /api/tasks - List tasks filtered by project and hierarchy authorization
+router.get('/', async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId, assigneeId, scope } = req.query;
+
+    const where: any = {};
+    if (projectId) {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: 'Forbidden: You do not have access to this project.' });
+      }
+      where.phase = { projectId: pId };
+    } else if (!ctx.isExecutive) {
+      where.phase = { projectId: { in: ctx.authorizedProjectIds } };
+    }
+
+    if (scope === 'mine') {
+      where.assigneeId = user.id;
+    } else if (scope === 'subordinates') {
+      if (ctx.isExecutive) {
+        // Executive sees all subordinate tasks across organization
+      } else if (ctx.allSubordinateIds.length > 0) {
+        where.assigneeId = { in: ctx.allSubordinateIds };
+      } else {
+        where.assigneeId = '__none__';
+      }
+    } else if (assigneeId) {
+      where.assigneeId = String(assigneeId);
+    }
+
+    const tasks = await prisma.task.findMany({
+      where,
+      include: {
+        assignee: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatarUrl: true,
+            role: true,
+            roleDefinition: {
+              select: { id: true, name: true, rank: true, isExecutive: true },
+            },
+          },
+        },
+        qualityChecks: true,
+        phase: { select: { id: true, name: true, projectId: true } },
+      },
+      orderBy: { plannedStart: 'asc' },
+    });
+
+    res.json(tasks);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
+});
 
 // GET /api/tasks/:id - View task with checks and relations
 router.get('/:id', async (req: AuthRequest, res: Response) => {
@@ -12,6 +82,8 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
     if (!user) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+
+    const ctx = await getUserHierarchyContext(user.id);
 
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
@@ -24,7 +96,16 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
           },
         },
         assignee: {
-          select: { id: true, name: true, email: true, avatarUrl: true },
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatarUrl: true,
+            role: true,
+            roleDefinition: {
+              select: { id: true, name: true, rank: true, isExecutive: true },
+            },
+          },
         },
         qualityChecks: {
           include: {
@@ -40,22 +121,9 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // RBAC: Check project access for non-CEO
-    if (user.role !== 'CEO') {
-      const isOwner = task.phase.project.ownerId === user.id;
-      const isAssignee = task.assigneeId === user.id;
-      const isMember = !isOwner && !isAssignee && await prisma.projectMembership.findUnique({
-        where: {
-          projectId_userId: {
-            projectId: task.phase.project.id,
-            userId: user.id,
-          },
-        },
-      });
-
-      if (!isOwner && !isAssignee && !isMember) {
-        return res.status(403).json({ error: 'Forbidden: You do not have access to this task.' });
-      }
+    // Dynamic hierarchy & project authorization check
+    if (!canViewTask(ctx, task)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to this task.' });
     }
 
     // Check if there is a blocking task dependency
@@ -74,7 +142,6 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
 });
 
 // POST /api/tasks - Create task
-// RBAC: Any authenticated project member (Employee, Project Owner, CEO) can create tasks.
 router.post('/', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -82,6 +149,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const validation = TaskCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid input' });
@@ -96,26 +164,11 @@ router.post('/', async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Phase does not exist.' });
     }
 
-    // CEO can create tasks on any project.
-    // Project owners can create tasks on their own projects.
-    // Employees (and project owners) must be a project member.
-    if (user.role !== 'CEO') {
-      const isOwner = phase.project.ownerId === user.id;
-      if (!isOwner) {
-        const membership = await prisma.projectMembership.findUnique({
-          where: {
-            projectId_userId: {
-              projectId: phase.projectId,
-              userId: user.id,
-            },
-          },
-        });
-        if (!membership) {
-          return res.status(403).json({
-            error: 'Forbidden: You must be a member of this project to create tasks.',
-          });
-        }
-      }
+    // Verify project authorization
+    if (!canViewProject(ctx, phase.projectId)) {
+      return res.status(403).json({
+        error: 'Forbidden: You must have access to this project to create tasks.',
+      });
     }
 
     const isPostBaseline = !!phase.project.baselineId;
@@ -130,7 +183,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
         plannedEnd: new Date(validation.data.plannedEnd),
         plannedHours: validation.data.plannedHours,
         dependsOn: validation.data.dependsOn || null,
-        isBaselined: !isPostBaseline, // If after baseline, isBaselined = false
+        isBaselined: !isPostBaseline,
         state: 'Not started',
       },
       include: {
@@ -199,7 +252,6 @@ router.post('/', async (req: AuthRequest, res: Response) => {
 });
 
 // PATCH /api/tasks/:id - Edit task
-// RBAC: Employee can update own tasks. Project Owner and CEO can update any task.
 router.patch('/:id', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -207,6 +259,7 @@ router.patch('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } },
@@ -216,15 +269,10 @@ router.patch('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    if (user.role === 'Employee' && task.assigneeId !== user.id) {
+    // Authorization: User, subordinate's manager, project owner, or executive
+    if (!canUpdateTask(ctx, task)) {
       return res.status(403).json({
-        error: 'Forbidden: Employees can only update their own assigned tasks.',
-      });
-    }
-
-    if (user.role === 'CTO' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
-      return res.status(403).json({
-        error: 'Forbidden: You can only update tasks on projects you own or tasks assigned to you.',
+        error: 'Forbidden: You can only update tasks assigned to you, your subordinates, or on projects you manage.',
       });
     }
 
@@ -254,7 +302,7 @@ router.patch('/:id', async (req: AuthRequest, res: Response) => {
       },
     });
 
-    // If reassigned to a new user, ensure they have project membership so they can see the project
+    // If reassigned to a new user, ensure they have project membership
     if (updated.assigneeId) {
       await prisma.projectMembership.upsert({
         where: {
@@ -327,6 +375,7 @@ router.post('/:id/state', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const { state } = req.body;
     if (!['Not started', 'In progress', 'Blocked', 'Completed'].includes(state)) {
       return res.status(400).json({ error: 'Invalid task state' });
@@ -341,13 +390,11 @@ router.post('/:id/state', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // RBAC check
-    if (user.role === 'Employee' && task.assigneeId !== user.id) {
-      return res.status(403).json({ error: 'Employees can only update their own assigned tasks.' });
-    }
-
-    if (user.role === 'CTO' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
-      return res.status(403).json({ error: 'You can only update tasks on projects you own or tasks assigned to you.' });
+    // Dynamic hierarchy check: assignee, subordinate's manager, owner, or executive
+    if (!canUpdateTask(ctx, task)) {
+      return res.status(403).json({
+        error: 'Forbidden: You can only update tasks assigned to you, your subordinates, or on projects you manage.',
+      });
     }
 
     // Strict completion rule enforcement
@@ -373,7 +420,7 @@ router.post('/:id/state', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// POST /api/tasks/:id/risk-flag - Flag task risk (creates/links Risk register entry & prevents duplicates)
+// POST /api/tasks/:id/risk-flag - Flag task risk
 router.post('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -381,6 +428,7 @@ router.post('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const { reason, severity = 'Medium' } = req.body;
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
@@ -392,14 +440,8 @@ router.post('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
     }
 
     // Verify user has access to this project
-    if (user.role !== 'CEO') {
-      const isOwner = task.phase.project.ownerId === user.id;
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId: task.phase.projectId, userId: user.id } },
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: 'Forbidden: You do not have access to this project.' });
-      }
+    if (!canViewProject(ctx, task.phase.projectId)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to this project.' });
     }
 
     const flagReason = (reason && String(reason).trim()) || `Task execution risk flagged on "${task.title}"`;
@@ -412,7 +454,6 @@ router.post('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
       },
     });
 
-    // Sync with Risk register: check for existing open risk on this task to prevent duplicates
     const existingRisk = await prisma.risk.findFirst({
       where: {
         taskId: task.id,
@@ -421,7 +462,6 @@ router.post('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
     });
 
     if (existingRisk) {
-      // Update existing record rather than creating a duplicate
       await prisma.risk.update({
         where: { id: existingRisk.id },
         data: {
@@ -431,7 +471,6 @@ router.post('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
         },
       });
     } else {
-      // Create new linked risk register entry
       await prisma.risk.create({
         data: {
           projectId: task.phase.projectId,
@@ -460,6 +499,7 @@ router.delete('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } },
@@ -469,15 +509,8 @@ router.delete('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // Verify user has access to this project
-    if (user.role !== 'CEO') {
-      const isOwner = task.phase.project.ownerId === user.id;
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId: task.phase.projectId, userId: user.id } },
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: 'Forbidden: You do not have access to this project.' });
-      }
+    if (!canViewProject(ctx, task.phase.projectId)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to this project.' });
     }
 
     const updatedTask = await prisma.task.update({
@@ -488,7 +521,6 @@ router.delete('/:id/risk-flag', async (req: AuthRequest, res: Response) => {
       },
     });
 
-    // Close any open risk associated with this task
     await prisma.risk.updateMany({
       where: {
         taskId: task.id,
@@ -513,6 +545,7 @@ router.post('/:id/quality-checks', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } },
@@ -522,15 +555,9 @@ router.post('/:id/quality-checks', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    if (user.role === 'Employee' && task.assigneeId !== user.id) {
+    if (!canUpdateTask(ctx, task)) {
       return res.status(403).json({
-        error: 'Forbidden: Employees can only add quality checks on their own tasks.',
-      });
-    }
-
-    if (user.role === 'CTO' && task.phase.project.ownerId !== user.id && task.assigneeId !== user.id) {
-      return res.status(403).json({
-        error: 'Forbidden: You can only add quality checks on projects you own or tasks assigned to you.',
+        error: 'Forbidden: You can only add quality checks on tasks assigned to you, your subordinates, or on projects you manage.',
       });
     }
 
@@ -553,7 +580,7 @@ router.post('/:id/quality-checks', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// POST /api/quality-checks/:id/toggle - Tick / untick quality check
+// POST /api/tasks/quality-checks/:id/toggle - Tick / untick quality check
 router.post('/quality-checks/:id/toggle', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -561,6 +588,7 @@ router.post('/quality-checks/:id/toggle', async (req: AuthRequest, res: Response
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const check = await prisma.qualityCheck.findUnique({
       where: { id: req.params.id },
       include: { task: { include: { phase: { include: { project: true } } } } },
@@ -570,16 +598,9 @@ router.post('/quality-checks/:id/toggle', async (req: AuthRequest, res: Response
       return res.status(404).json({ error: 'Quality check not found' });
     }
 
-    // Employees can tick checks on tasks assigned to them, PO on their projects/tasks, or CEO
-    if (user.role === 'Employee' && check.task.assigneeId !== user.id) {
+    if (!canUpdateTask(ctx, check.task)) {
       return res.status(403).json({
-        error: 'Forbidden: You can only check off quality requirements on your assigned tasks.',
-      });
-    }
-
-    if (user.role === 'CTO' && check.task.phase.project.ownerId !== user.id && check.task.assigneeId !== user.id) {
-      return res.status(403).json({
-        error: 'Forbidden: You can only check off quality requirements on projects you own or tasks assigned to you.',
+        error: 'Forbidden: You can only check off quality requirements on your assigned tasks, subordinate tasks, or projects you manage.',
       });
     }
 
@@ -602,7 +623,6 @@ router.post('/quality-checks/:id/toggle', async (req: AuthRequest, res: Response
 });
 
 // DELETE /api/tasks/:id - Delete task
-// RBAC: Only Project Owner of this project or CEO can delete tasks.
 router.delete('/:id', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -610,6 +630,7 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
       include: { phase: { include: { project: true } } },
@@ -619,9 +640,10 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    if (user.role === 'Employee' || (user.role !== 'CEO' && task.phase.project.ownerId !== user.id)) {
+    // Dynamic hierarchy check: only project owner or executive
+    if (!canDeleteTask(ctx, task)) {
       return res.status(403).json({
-        error: 'Forbidden: Only the Project Owner or CEO can delete tasks.',
+        error: 'Forbidden: Only the Project Owner or Executive leadership can delete tasks.',
       });
     }
 

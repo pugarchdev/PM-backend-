@@ -3,6 +3,7 @@ import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { calculatePlanPercentage, calculateBudgetHealth } from '../../lib/calculations.js';
 import { createNotification } from '../services/notificationService.js';
+import { getUserHierarchyContext, canManageProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -11,11 +12,7 @@ router.get('/:id/budget', requireAuth, async (req: AuthRequest, res: Response) =
   try {
     const { id: projectId } = req.params;
     const user = req.user!;
-
-    // RBAC: STRICTLY FORBIDDEN TO EMPLOYEES
-    if (user.role === 'Employee') {
-      return res.status(403).json({ error: 'Access denied. Budget information is strictly confidential and reserved for Project Owners and CEO.' });
-    }
+    const ctx = await getUserHierarchyContext(user.id);
 
     const project = await prisma.project.findUnique({
       where: { id: projectId },
@@ -31,9 +28,9 @@ router.get('/:id/budget', requireAuth, async (req: AuthRequest, res: Response) =
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Check PO authorization (must be owner of project or CEO)
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Access denied. You can only view budgets for projects you own.' });
+    // Dynamic authorization check: Must be project owner or executive
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Access denied. Budget information is confidential and reserved for Project Owners and Executive management.' });
     }
 
     // Calculate baseline plan percentage
@@ -103,10 +100,7 @@ router.post('/:id/budget/spend', requireAuth, async (req: AuthRequest, res: Resp
     const user = req.user!;
     const { amount, phaseId, description } = req.body;
 
-    if (user.role === 'Employee') {
-      return res.status(403).json({ error: 'Employees cannot modify budget or record spend.' });
-    }
-
+    const ctx = await getUserHierarchyContext(user.id);
     const project = await prisma.project.findUnique({
       where: { id: projectId },
       include: { owner: true, phases: true },
@@ -116,8 +110,8 @@ router.post('/:id/budget/spend', requireAuth, async (req: AuthRequest, res: Resp
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'You can only record spend for projects you own.' });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'You are not authorized to modify budget or record spend for this project.' });
     }
 
     const spendDelta = Number(amount);

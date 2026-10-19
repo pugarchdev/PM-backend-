@@ -3,32 +3,14 @@ import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { emitToProject } from '../socket.js';
 import { createNotification } from '../services/notificationService.js';
+import { getUserHierarchyContext, canViewProject } from '../services/authorizationService.js';
 
 const router = Router();
 
 // Helper to verify user can access project chat
-export async function canAccessProjectChat(userId: string, userRole: string, projectId: string): Promise<boolean> {
-  if (userRole === 'CEO') return true;
-
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { ownerId: true },
-  });
-  if (!project) return false;
-  if (project.ownerId === userId) return true;
-
-  const membership = await prisma.projectMembership.findUnique({
-    where: {
-      projectId_userId: { projectId, userId },
-    },
-  });
-  if (membership) return true;
-
-  // Also allow if they have an assigned task in this project
-  const hasTask = await prisma.task.findFirst({
-    where: { assigneeId: userId, phase: { projectId } },
-  });
-  return !!hasTask;
+export async function canAccessProjectChat(userId: string, _userRole: string, projectId: string): Promise<boolean> {
+  const ctx = await getUserHierarchyContext(userId);
+  return canViewProject(ctx, projectId);
 }
 
 // GET /api/projects/:id/chat — Message history
@@ -209,15 +191,12 @@ router.post('/projects/:id/chat/read', requireAuth, async (req: AuthRequest, res
 router.get('/chat/unread-counts', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
     
     // Find projects user has access to
     const projects = await prisma.project.findMany({
-      where: user.role === 'CEO' ? {} : {
-        OR: [
-          { ownerId: user.id },
-          { memberships: { some: { userId: user.id } } },
-          { phases: { some: { tasks: { some: { assigneeId: user.id } } } } },
-        ],
+      where: ctx.isExecutive ? {} : {
+        id: { in: ctx.authorizedProjectIds },
       },
       select: { id: true },
     });

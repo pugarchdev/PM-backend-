@@ -865,7 +865,7 @@ router.post('/reset-password', async (req: AuthRequest, res: Response) => {
 // POST /api/auth/pre-register — HR/CEO Pre-registers a new user (HR/CEO only)
 router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response) => {
   try {
-    const { name, email, phone, role, department } = req.body;
+    const { name, email, phone, role, roleId, managerId, department } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
       return res.status(400).json({ error: 'Full name is required (minimum 2 characters).' });
@@ -898,21 +898,53 @@ router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response)
       return res.status(400).json({ error: 'An account with this phone number already exists.' });
     }
 
-    // Role assignment: default to Employee; allow CTO if requested; never allow CEO
-    let assignedRole: 'Employee' | 'CTO' = 'Employee';
-    if (role === 'CTO') {
-      assignedRole = 'CTO';
+    let finalRoleId: string | null = null;
+    let assignedRole = 'Employee';
+
+    if (roleId) {
+      const roleDef = await prisma.role.findUnique({ where: { id: roleId } });
+      if (!roleDef || !roleDef.isActive) {
+        return res.status(400).json({ error: 'Selected role is invalid or inactive.' });
+      }
+      if (roleDef.isExecutive && !req.user!.isExecutive) {
+        return res.status(403).json({ error: 'Only executive leadership can assign executive roles.' });
+      }
+      finalRoleId = roleDef.id;
+      assignedRole = roleDef.name;
+    } else if (role) {
+      const roleDef = await prisma.role.findFirst({
+        where: { name: role, isActive: true },
+      });
+      if (roleDef) {
+        finalRoleId = roleDef.id;
+        assignedRole = roleDef.name;
+      } else {
+        assignedRole = role;
+      }
     }
 
-    const preRegistered = await (prisma.user as any).create({
+    if (managerId) {
+      const manager = await prisma.user.findUnique({ where: { id: managerId } });
+      if (!manager) {
+        return res.status(400).json({ error: 'Specified manager not found.' });
+      }
+    }
+
+    const preRegistered = await prisma.user.create({
       data: {
         name: name.trim(),
         email: cleanEmail,
         phone: cleanPhone,
         role: assignedRole,
+        roleId: finalRoleId,
+        managerId: managerId || null,
         department: department ? String(department).trim() : 'Operations',
         avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
         isSignupCompleted: false,
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } },
       },
     });
 
@@ -1091,7 +1123,7 @@ router.patch('/profile', requireAuth, async (req: AuthRequest, res: Response) =>
         return res.status(400).json({ error: 'Department must be a valid text string.' });
       }
       const trimmedDept = department.trim();
-      if (currentUser.role === 'CEO') {
+      if (currentUser.isExecutive) {
         if (trimmedDept.length < 2 || trimmedDept.length > 100) {
           return res.status(400).json({ error: 'Department must be between 2 and 100 characters in length.' });
         }

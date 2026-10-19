@@ -8,12 +8,29 @@ import {
   calculateBudgetHealth,
 } from '../../lib/calculations.js';
 
+import { getUserHierarchyContext } from '../services/authorizationService.js';
+
 const router = Router();
 
-// GET /api/portfolio — CEO-only portfolio summary & KPIs
-router.get('/', requireAuth, requireCEO, async (req: AuthRequest, res: Response) => {
+// GET /api/portfolio or /api/portfolio/ceo — Scoped portfolio summary & KPIs
+router.get(['/', '/ceo'], requireAuth, async (req: AuthRequest, res: Response) => {
   try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({
+        error: 'Forbidden: Portfolio dashboard is restricted to executive leadership and management.',
+      });
+    }
+
+    const where: any = {};
+    if (!ctx.isExecutive) {
+      where.id = { in: ctx.authorizedProjectIds };
+    }
+
     const projects = await prisma.project.findMany({
+      where,
       include: {
         owner: { select: { id: true, name: true, avatarUrl: true } },
         phases: {

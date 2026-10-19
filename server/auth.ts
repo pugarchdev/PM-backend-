@@ -7,7 +7,12 @@ export interface AuthenticatedUser {
   name: string;
   email: string;
   phone?: string | null;
-  role: 'Employee' | 'CTO' | 'CEO';
+  role: string;
+  roleId?: string | null;
+  roleRank: number;
+  isExecutive: boolean;
+  canManageUsers: boolean;
+  managerId?: string | null;
   department: string | null;
   avatarUrl: string | null;
   isSignupCompleted?: boolean;
@@ -181,16 +186,28 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
     if (userId) {
       user = await prisma.user.findUnique({
         where: { id: userId },
+        include: { roleDefinition: true },
       });
     }
 
     if (user) {
+      const roleDef = user.roleDefinition;
+      const roleName = roleDef?.name || user.role;
+      const roleRank = roleDef?.rank ?? (user.role === 'CEO' ? 1 : user.role === 'CTO' || user.role === 'ProjectOwner' ? 2 : user.role === 'Intern' ? 4 : 3);
+      const isExecutive = roleDef?.isExecutive ?? (user.role === 'CEO');
+      const canManageUsers = roleDef?.canManageUsers ?? (user.role === 'CEO');
+
       req.user = {
         id: user.id,
         name: user.name,
         email: user.email,
         phone: (user as any).phone || null,
-        role: user.role as 'Employee' | 'CTO' | 'CEO',
+        role: roleName,
+        roleId: user.roleId || roleDef?.id || null,
+        roleRank,
+        isExecutive,
+        canManageUsers,
+        managerId: user.managerId || null,
         department: user.department,
         avatarUrl: user.avatarUrl,
         isSignupCompleted: (user as any).isSignupCompleted ?? true,
@@ -216,16 +233,17 @@ export function requireAuth(req: AuthRequest, res: Response, next: NextFunction)
 }
 
 /**
- * Enforce RBAC: CTO or CEO
+ * Enforce Hierarchy Authorization: Manager rank or Executive
  */
 export function requireCTOOrCEO(req: AuthRequest, res: Response, next: NextFunction) {
   if (!req.user) {
     return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
   }
 
-  if (req.user.role !== 'CEO' && req.user.role !== 'CTO') {
+  // Hierarchy check: Executive or role rank <= 2 (or legacy role names for full compatibility)
+  if (!req.user.isExecutive && req.user.roleRank > 2 && req.user.role !== 'CEO' && req.user.role !== 'CTO' && req.user.role !== 'ProjectOwner') {
     return res.status(403).json({
-      error: 'Forbidden: Only CTO or CEO have permission to perform this action.',
+      error: 'Forbidden: This action requires manager or executive hierarchy authorization.',
     });
   }
 
@@ -236,16 +254,37 @@ export function requireCTOOrCEO(req: AuthRequest, res: Response, next: NextFunct
 export const requireOwnerOrCEO = requireCTOOrCEO;
 
 /**
- * Enforce RBAC: CEO only
+ * Enforce Hierarchy Authorization: Top-Level Executive
  */
-export function requireCEO(req: AuthRequest, res: Response, next: NextFunction) {
+export function requireExecutive(req: AuthRequest, res: Response, next: NextFunction) {
   if (!req.user) {
     return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
   }
 
-  if (req.user.role !== 'CEO') {
+  // Hierarchy check: Executive capability or Rank 1
+  if (!req.user.isExecutive && req.user.roleRank !== 1 && req.user.role !== 'CEO') {
     return res.status(403).json({
-      error: 'Forbidden: This action requires CEO administrative authority.',
+      error: 'Forbidden: This action requires executive administrative authority.',
+    });
+  }
+
+  next();
+}
+
+// Retain requireCEO alias for full compatibility
+export const requireCEO = requireExecutive;
+
+/**
+ * Enforce Hierarchy Authorization: User & Role Management Capability
+ */
+export function requireCanManageUsers(req: AuthRequest, res: Response, next: NextFunction) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
+  }
+
+  if (!req.user.canManageUsers && !req.user.isExecutive && req.user.role !== 'CEO') {
+    return res.status(403).json({
+      error: 'Forbidden: You do not have permission to manage users or organizational roles.',
     });
   }
 

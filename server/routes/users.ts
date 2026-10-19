@@ -3,31 +3,52 @@ import { prisma } from '../../lib/prisma.js';
 import {
   AuthRequest,
   requireAuth,
-  requireCEO,
+  requireCanManageUsers,
   normalizeEmail,
   normalizePhone,
   isValidEmail,
   isValidPhone,
 } from '../auth.js';
+import {
+  getUserHierarchyContext,
+  getVisibleDirectoryUserIds,
+} from '../services/authorizationService.js';
 
 const router = Router();
 
 /**
  * GET /api/users
- * Returns all active users eligible to be assigned tasks (Employees and CTOs).
- * Only authenticated users can access this.
+ * Returns active users scoped by dynamic hierarchy and authorized project memberships.
+ * Executives see all users; employees/interns see teammates on authorized projects.
  */
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const users = await (prisma.user as any).findMany({
-      where: { isSignupCompleted: true },
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    // Get list of user IDs visible within current user's authorized scope
+    const visibleIds = await getVisibleDirectoryUserIds(ctx);
+
+    const users = await prisma.user.findMany({
+      where: {
+        id: { in: visibleIds },
+        isSignupCompleted: true,
+      },
       select: {
         id: true,
         name: true,
         email: true,
         role: true,
+        roleId: true,
         department: true,
         avatarUrl: true,
+        managerId: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true },
+        },
+        manager: {
+          select: { id: true, name: true, role: true },
+        },
       },
       orderBy: [{ role: 'asc' }, { name: 'asc' }],
     });
@@ -42,21 +63,29 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
 /**
  * GET /api/users/management
  * Returns all users in the system including their phone and signup completion status.
- * Restricted to HR/CEO.
+ * Restricted to executive / user management capability.
  */
-router.get('/management', requireCEO, async (req: AuthRequest, res: Response) => {
+router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
   try {
-    const users = await (prisma.user as any).findMany({
+    const users = await prisma.user.findMany({
       select: {
         id: true,
         name: true,
         email: true,
         phone: true,
         role: true,
+        roleId: true,
+        managerId: true,
         department: true,
         avatarUrl: true,
         isSignupCompleted: true,
         createdAt: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true },
+        },
+        manager: {
+          select: { id: true, name: true, role: true },
+        },
       },
       orderBy: [{ isSignupCompleted: 'asc' }, { name: 'asc' }],
     });
@@ -70,12 +99,12 @@ router.get('/management', requireCEO, async (req: AuthRequest, res: Response) =>
 
 /**
  * POST /api/users/pre-register
- * HR/CEO pre-registers a user's details before the user can complete signup.
- * Restricted to HR/CEO.
+ * Pre-registers a user's details with configurable role and reporting manager.
+ * Restricted to executive / user management capability.
  */
-router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response) => {
+router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
   try {
-    const { name, email, phone, role, department } = req.body;
+    const { name, email, phone, role, roleId, department, managerId } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
       return res.status(400).json({ error: 'Full name is required (minimum 2 characters).' });
@@ -101,39 +130,68 @@ router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response)
     }
 
     // Check duplicate phone
-    const existingPhone = await (prisma.user as any).findUnique({
+    const existingPhone = await prisma.user.findUnique({
       where: { phone: cleanPhone },
     });
     if (existingPhone) {
       return res.status(400).json({ error: 'An account with this phone number already exists.' });
     }
 
-    // Assign role
-    let assignedRole: 'Employee' | 'CTO' = 'Employee';
-    if (role === 'CTO') {
-      assignedRole = 'CTO';
+    // Resolve Role dynamically from configured Role model
+    let targetRole = null;
+    if (roleId) {
+      targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
+    } else if (role) {
+      targetRole = await prisma.role.findFirst({ where: { name: String(role), isActive: true } });
     }
 
-    const preRegistered = await (prisma.user as any).create({
+    if (!targetRole) {
+      // Fallback: default to Employee role
+      targetRole = await prisma.role.findFirst({ where: { name: 'Employee' } });
+    }
+
+    const assignedRoleName = targetRole?.name || 'Employee';
+    const assignedRoleId = targetRole?.id || null;
+
+    // Validate reporting manager if provided
+    let assignedManagerId: string | null = null;
+    if (managerId) {
+      const managerUser = await prisma.user.findUnique({ where: { id: String(managerId) } });
+      if (managerUser) {
+        assignedManagerId = managerUser.id;
+      }
+    }
+
+    const preRegistered = await prisma.user.create({
       data: {
         name: name.trim(),
         email: cleanEmail,
         phone: cleanPhone,
-        role: assignedRole,
+        role: assignedRoleName,
+        roleId: assignedRoleId,
+        managerId: assignedManagerId,
         department: department ? String(department).trim() : 'Operations',
         avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
         isSignupCompleted: false,
       },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } },
+      },
     });
 
     res.status(201).json({
-      message: 'User successfully pre-registered. They can now complete account creation using their email and phone.',
+      message: 'User successfully pre-registered with organizational role and reporting manager.',
       user: {
         id: preRegistered.id,
         name: preRegistered.name,
         email: preRegistered.email,
-        phone: (preRegistered as any).phone,
+        phone: preRegistered.phone,
         role: preRegistered.role,
+        roleId: preRegistered.roleId,
+        managerId: preRegistered.managerId,
+        manager: preRegistered.manager,
+        roleDefinition: preRegistered.roleDefinition,
         department: preRegistered.department,
         isSignupCompleted: false,
         createdAt: preRegistered.createdAt,
@@ -142,6 +200,123 @@ router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response)
   } catch (error: any) {
     console.error('Pre-registration error:', error);
     res.status(500).json({ error: 'Failed to pre-register user' });
+  }
+});
+
+/**
+ * PATCH /api/users/:id/manager
+ * Updates a user's reporting manager in the hierarchy.
+ * Restricted to executive / user managers.
+ */
+router.patch('/:id/manager', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
+  try {
+    const targetUserId = req.params.id;
+    const { managerId } = req.body;
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (managerId === null || managerId === '') {
+      const updated = await prisma.user.update({
+        where: { id: targetUserId },
+        data: { managerId: null },
+      });
+      return res.json({ message: 'Reporting manager removed.', user: updated });
+    }
+
+    if (managerId === targetUserId) {
+      return res.status(400).json({ error: 'A user cannot report to themselves.' });
+    }
+
+    const managerUser = await prisma.user.findUnique({
+      where: { id: String(managerId) },
+    });
+
+    if (!managerUser) {
+      return res.status(404).json({ error: 'Designated manager does not exist.' });
+    }
+
+    // Circular hierarchy protection: check if targetUser is an ancestor of managerUser
+    let currentCheckId: string | null = managerUser.managerId;
+    const visited = new Set<string>([managerUser.id]);
+    while (currentCheckId) {
+      if (currentCheckId === targetUserId) {
+        return res.status(400).json({
+          error: 'Circular reporting relationship detected: the designated manager already reports to this user.',
+        });
+      }
+      visited.add(currentCheckId);
+      const nextMgr = await prisma.user.findUnique({ where: { id: currentCheckId }, select: { managerId: true } });
+      currentCheckId = nextMgr?.managerId || null;
+      if (currentCheckId && visited.has(currentCheckId)) break;
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: targetUserId },
+      data: { managerId: String(managerId) },
+      include: {
+        manager: { select: { id: true, name: true, role: true } },
+        roleDefinition: true,
+      },
+    });
+
+    res.json({ message: 'Reporting manager updated successfully.', user: updated });
+  } catch (error: any) {
+    console.error('Failed to update reporting manager:', error);
+    res.status(500).json({ error: 'Failed to update reporting manager' });
+  }
+});
+
+/**
+ * PATCH /api/users/:id/role
+ * Assigns a configured organizational role to a user.
+ * Restricted to executive / user managers.
+ */
+router.patch('/:id/role', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
+  try {
+    const targetUserId = req.params.id;
+    const { roleId, role } = req.body;
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    let targetRole = null;
+    if (roleId) {
+      targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
+    } else if (role) {
+      targetRole = await prisma.role.findFirst({ where: { name: String(role) } });
+    }
+
+    if (!targetRole) {
+      return res.status(400).json({ error: 'Valid role definition is required.' });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: targetUserId },
+      data: {
+        roleId: targetRole.id,
+        role: targetRole.name,
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } },
+      },
+    });
+
+    res.json({ message: `Role updated to "${targetRole.name}".`, user: updated });
+  } catch (error: any) {
+    console.error('Failed to update user role:', error);
+    res.status(500).json({ error: 'Failed to update user role' });
   }
 });
 
@@ -156,7 +331,7 @@ router.get('/profile', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
     }
 
-    const user = await (prisma.user as any).findUnique({
+    const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
@@ -164,11 +339,19 @@ router.get('/profile', requireAuth, async (req: AuthRequest, res: Response) => {
         email: true,
         phone: true,
         role: true,
+        roleId: true,
+        managerId: true,
         department: true,
         avatarUrl: true,
         isSignupCompleted: true,
         createdAt: true,
         updatedAt: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true },
+        },
+        manager: {
+          select: { id: true, name: true, role: true },
+        },
       },
     });
 
@@ -194,8 +377,9 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
     }
 
-    const currentUser = await (prisma.user as any).findUnique({
+    const currentUser = await prisma.user.findUnique({
       where: { id: userId },
+      include: { roleDefinition: true },
     });
 
     if (!currentUser) {
@@ -204,10 +388,10 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
 
     const { name, department, role, email, phone, password, resetToken, isSignupCompleted } = req.body || {};
 
-    // 1. Guard against role modifications
+    // 1. Guard against self role modifications
     if (role !== undefined && role !== currentUser.role) {
       return res.status(403).json({
-        error: 'Forbidden: User role cannot be modified. Roles are managed strictly by executive leadership.',
+        error: 'Forbidden: User role cannot be self-modified. Roles are managed by organizational administration.',
       });
     }
 
@@ -256,7 +440,7 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
         }
         const currentPhone = currentUser.phone ? normalizePhone(currentUser.phone) : '';
         if (cleanPhone !== currentPhone) {
-          const existingPhone = await (prisma.user as any).findFirst({
+          const existingPhone = await prisma.user.findFirst({
             where: {
               phone: cleanPhone,
               NOT: { id: userId },
@@ -297,7 +481,8 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
         return res.status(400).json({ error: 'Department must be a valid text string.' });
       }
       const trimmedDept = department.trim();
-      if (currentUser.role === 'CEO') {
+      const isExecutive = currentUser.roleDefinition?.isExecutive ?? (currentUser.role === 'CEO');
+      if (isExecutive) {
         if (trimmedDept.length < 2 || trimmedDept.length > 100) {
           return res.status(400).json({ error: 'Department must be between 2 and 100 characters in length.' });
         }
@@ -310,7 +495,7 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
       } else {
         if (trimmedDept !== (currentUser.department || '')) {
           return res.status(403).json({
-            error: 'Forbidden: Department assignments are managed by executive management.',
+            error: 'Forbidden: Department assignments are managed by organizational administration.',
           });
         }
       }
@@ -349,7 +534,7 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
       updateData.department = newDept;
     }
 
-    const updatedUser = await (prisma.user as any).update({
+    const updatedUser = await prisma.user.update({
       where: { id: userId },
       data: updateData,
       select: {
@@ -363,6 +548,9 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
         isSignupCompleted: true,
         createdAt: true,
         updatedAt: true,
+        roleDefinition: {
+          select: { id: true, name: true, rank: true, isExecutive: true },
+        },
       },
     });
 

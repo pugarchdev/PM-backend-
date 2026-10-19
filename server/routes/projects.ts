@@ -1,8 +1,14 @@
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { AuthRequest, requireAuth, requireOwnerOrCEO } from '../auth.js';
+import { AuthRequest, requireAuth } from '../auth.js';
 import { calculateProgress, calculatePlanPercentage, calculateProjectStatus } from '../../lib/calculations.js';
 import { StatusOverrideSchema, ProjectCreateSchema, ProjectCharterUpdateSchema } from '../../lib/validators.js';
+import {
+  getUserHierarchyContext,
+  canViewProject,
+  canManageProject,
+  canTransferProjectOwnership,
+} from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -52,9 +58,22 @@ export async function enrichProject(project: any) {
   };
 }
 
-// Helper to sanitize budget data based on RBAC
-export function sanitizeProjectForRole(project: any, userRole: string) {
-  if (userRole === 'Employee') {
+// Helper to sanitize budget data based on hierarchy and ownership
+export function sanitizeProjectForRole(
+  project: any,
+  userRoleOrRank: string | number,
+  isExecutive: boolean = false,
+  isOwner: boolean = false
+) {
+  if (isExecutive || isOwner) {
+    return project;
+  }
+  const isRestricted =
+    userRoleOrRank === 'Employee' ||
+    userRoleOrRank === 'Intern' ||
+    (typeof userRoleOrRank === 'number' && userRoleOrRank > 2);
+
+  if (isRestricted) {
     return {
       ...project,
       plannedBudget: 0,
@@ -71,36 +90,16 @@ export function sanitizeProjectForRole(project: any, userRole: string) {
   return project;
 }
 
-// GET /api/projects - List projects with RBAC filtering
-router.get('/', async (req: AuthRequest, res: Response) => {
+// GET /api/projects - List projects with dynamic hierarchy & membership filtering
+router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const user = req.user;
-    if (!user) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
 
-    let whereClause: any = {};
-
-    // CEO sees ALL projects
-    if (user.role === 'CEO') {
-      whereClause = {};
-    } else if (user.role === 'CTO') {
-      // CTO sees projects they own OR where they are a member
-      whereClause = {
-        OR: [
-          { ownerId: user.id },
-          { memberships: { some: { userId: user.id } } },
-        ],
-      };
-    } else {
-      // Employee sees projects where they are a member OR have any assigned task
-      whereClause = {
-        OR: [
-          { memberships: { some: { userId: user.id } } },
-          { phases: { some: { tasks: { some: { assigneeId: user.id } } } } },
-        ],
-      };
-    }
+    // Dynamic hierarchy filtering: executive sees all; non-executive sees authorized projects
+    const whereClause: any = ctx.isExecutive
+      ? {}
+      : { id: { in: ctx.authorizedProjectIds } };
 
     const projects = await prisma.project.findMany({
       where: whereClause,
@@ -130,7 +129,9 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     });
 
     const enriched = await Promise.all(projects.map(enrichProject));
-    const sanitized = enriched.map((p) => sanitizeProjectForRole(p, user.role));
+    const sanitized = enriched.map((p) =>
+      sanitizeProjectForRole(p, ctx.roleRank, ctx.isExecutive, p.ownerId === user.id)
+    );
     res.json(sanitized);
   } catch (error: any) {
     console.error('Failed to fetch projects:', error);
@@ -138,10 +139,17 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// POST /api/projects - Create a new project (CEO or Project Owner)
-router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// POST /api/projects - Create a new project (Executive or Manager rank)
+router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    // Only executive or manager level can create new projects
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient organizational hierarchy permission to charter projects.' });
+    }
+
     const validation = ProjectCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid project input' });
@@ -149,9 +157,9 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
 
     const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0 } = validation.data;
 
-    // Determine project owner: CEO can designate any owner or themselves; CTO is always owner
+    // Executive can designate any owner or themselves; others are owner of their chartered projects
     let designatedOwnerId = user.id;
-    if (user.role === 'CEO' && validation.data.ownerId) {
+    if (ctx.isExecutive && validation.data.ownerId) {
       const targetUser = await prisma.user.findUnique({ where: { id: validation.data.ownerId } });
       if (targetUser) {
         designatedOwnerId = targetUser.id;
@@ -185,8 +193,8 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
         },
       });
 
-      // If creator is CEO and owner is another user, also add CEO as member
-      if (user.role === 'CEO' && designatedOwnerId !== user.id) {
+      // If creator is executive and designated owner is someone else, also add executive as member
+      if (ctx.isExecutive && designatedOwnerId !== user.id) {
         await tx.projectMembership.create({
           data: {
             projectId: p.id,
@@ -230,7 +238,7 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
     });
 
     const enriched = await enrichProject(fullProject);
-    res.status(201).json(sanitizeProjectForRole(enriched, user.role));
+    res.status(201).json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, fullProject?.ownerId === user.id));
   } catch (error: any) {
     console.error('Failed to create project:', error);
     res.status(500).json({ error: 'Failed to create project' });
@@ -238,23 +246,41 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
 });
 
 // GET /api/projects/:id - Full Project Overview
-router.get('/:id', async (req: AuthRequest, res: Response) => {
+router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const user = req.user;
-    if (!user) {
-      return res.status(401).json({ error: 'Unauthorized' });
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to this project' });
     }
 
     const project = await prisma.project.findUnique({
       where: { id: req.params.id },
       include: {
         owner: {
-          select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true },
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+            department: true,
+            avatarUrl: true,
+          },
         },
         memberships: {
           include: {
             user: {
-              select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true },
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                department: true,
+                avatarUrl: true,
+              },
             },
           },
         },
@@ -263,7 +289,15 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
           include: {
             tasks: {
               include: {
-                assignee: { select: { id: true, name: true, avatarUrl: true } },
+                assignee: {
+                  select: {
+                    id: true,
+                    name: true,
+                    avatarUrl: true,
+                    role: true,
+                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                  },
+                },
                 qualityChecks: {
                   include: {
                     checker: { select: { id: true, name: true } },
@@ -281,6 +315,16 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
           include: {
             owner: { select: { id: true, name: true } },
             raiser: { select: { id: true, name: true } },
+            attachments: {
+              select: {
+                id: true,
+                fileName: true,
+                fileSize: true,
+                mimeType: true,
+                fileType: true,
+                createdAt: true,
+              },
+            },
           },
           orderBy: { raisedAt: 'desc' },
         },
@@ -309,26 +353,8 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // RBAC access check
-    if (user.role === 'Employee') {
-      const isMember = project.memberships.some((m) => m.userId === user.id);
-      // Also allow access if the employee has a task assigned in this project (legacy safety net)
-      const hasAssignedTask =
-        !isMember &&
-        project.phases.some((ph: any) => ph.tasks?.some((t: any) => t.assigneeId === user.id));
-      if (!isMember && !hasAssignedTask) {
-        return res.status(403).json({ error: 'Forbidden: You are not a member of this project' });
-      }
-    } else if (user.role === 'CTO') {
-      const isOwnerOrMember =
-        project.ownerId === user.id || project.memberships.some((m) => m.userId === user.id);
-      if (!isOwnerOrMember) {
-        return res.status(403).json({ error: 'Forbidden: You do not have access to this project' });
-      }
-    }
-
     const enriched = await enrichProject(project);
-    const sanitized = sanitizeProjectForRole(enriched, user.role);
+    const sanitized = sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, project.ownerId === user.id);
     res.json(sanitized);
   } catch (error: any) {
     console.error('Failed to fetch project details:', error);
@@ -336,10 +362,12 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// PATCH /api/projects/:id - Update Project Charter and Governance (Owner or CEO)
-router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// PATCH /api/projects/:id - Update Project Charter and Governance
+router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
     const project = await prisma.project.findUnique({
       where: { id: req.params.id },
       include: { owner: true },
@@ -349,9 +377,9 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Permission check: Must be project owner or CEO
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only edit projects you own.' });
+    // Permission check: Must be project owner or executive
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: You can only edit projects you own or manage.' });
     }
 
     const validation = ProjectCharterUpdateSchema.safeParse(req.body);
@@ -361,19 +389,17 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
 
     const data = validation.data;
 
-    // Only CEO can transfer project ownership
-    if (data.ownerId && data.ownerId !== project.ownerId && user.role !== 'CEO') {
-      return res.status(403).json({ error: 'Only the CEO can transfer project ownership to another user.' });
+    // Only executive leadership can transfer project ownership
+    if (data.ownerId && data.ownerId !== project.ownerId && !canTransferProjectOwnership(ctx)) {
+      return res.status(403).json({ error: 'Only executive leadership can transfer project ownership to another user.' });
     }
 
-    // Verify date ordering if either or both dates are provided
     const newStart = data.startDate ? new Date(data.startDate) : project.startDate;
     const newEnd = data.endDate ? new Date(data.endDate) : project.endDate;
     if (newEnd.getTime() < newStart.getTime()) {
       return res.status(400).json({ error: 'Project end date cannot precede start date' });
     }
 
-    // Prepare updates and change log notes
     const updateData: any = {};
     const changeLogs: any[] = [];
 
@@ -465,7 +491,6 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
         },
       });
 
-      // If owner was transferred, ensure membership exists
       if (updateData.ownerId) {
         await tx.projectMembership.upsert({
           where: { projectId_userId: { projectId: project.id, userId: updateData.ownerId } },
@@ -474,7 +499,6 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
         });
       }
 
-      // Record change log entries
       for (const log of changeLogs) {
         await tx.changeLogEntry.create({
           data: {
@@ -498,17 +522,19 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
     });
 
     const enriched = await enrichProject(updated);
-    res.json(sanitizeProjectForRole(enriched, user.role));
+    res.json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, updated.ownerId === user.id));
   } catch (error: any) {
     console.error('Failed to update project charter:', error);
     res.status(500).json({ error: 'Failed to update project charter' });
   }
 });
 
-// POST /api/projects/:id/status-override - Project Owner or CEO overrides status
-router.post('/:id/status-override', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// POST /api/projects/:id/status-override
+router.post('/:id/status-override', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
     const validation = StatusOverrideSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid input' });
@@ -522,15 +548,13 @@ router.post('/:id/status-override', requireOwnerOrCEO, async (req: AuthRequest, 
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Only owner of this project or CEO
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Only the Project Owner or CEO can override status' });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Only the Project Owner or Executive leadership can override status' });
     }
 
     const previousStatus = project.statusOverride || 'AUTO';
     const newStatus = validation.data.status;
 
-    // Transaction: update project + log status override + create changelog entry
     const [updatedProject, log] = await prisma.$transaction([
       prisma.project.update({
         where: { id: project.id },
@@ -565,9 +589,11 @@ router.post('/:id/status-override', requireOwnerOrCEO, async (req: AuthRequest, 
 });
 
 // DELETE /api/projects/:id/status-override - Clear status override
-router.delete('/:id/status-override', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+router.delete('/:id/status-override', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
     const project = await prisma.project.findUnique({
       where: { id: req.params.id },
     });
@@ -576,8 +602,8 @@ router.delete('/:id/status-override', requireOwnerOrCEO, async (req: AuthRequest
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or CEO can remove status override' });
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can remove status override' });
     }
 
     const updated = await prisma.project.update({
@@ -587,6 +613,122 @@ router.delete('/:id/status-override', requireOwnerOrCEO, async (req: AuthRequest
     res.json({ message: 'Status override removed', project: updated });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to remove status override' });
+  }
+});
+
+// -------------------------------------------------------------
+// DEDICATED PROJECT MEMBERSHIP MANAGEMENT ENDPOINTS
+// -------------------------------------------------------------
+
+// GET /api/projects/:id/members - List all members of a project
+router.get('/:id/members', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to view this project.' });
+    }
+
+    const memberships = await prisma.projectMembership.findMany({
+      where: { projectId: req.params.id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { rank: true, name: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    res.json(memberships);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch project members' });
+  }
+});
+
+// POST /api/projects/:id/members - Add member to project
+router.post('/:id/members', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage project team members.' });
+    }
+
+    const { userId, role = 'Member' } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const targetUser = await prisma.user.findUnique({ where: { id: userId } });
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Target user does not exist' });
+    }
+
+    const membership = await prisma.projectMembership.upsert({
+      where: { projectId_userId: { projectId: project.id, userId } },
+      create: { projectId: project.id, userId, role },
+      update: { role },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, role: true, avatarUrl: true },
+        },
+      },
+    });
+
+    res.status(201).json(membership);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to add project member' });
+  }
+});
+
+// DELETE /api/projects/:id/members/:userId - Remove member from project
+router.delete('/:id/members/:userId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage project team members.' });
+    }
+
+    const targetUserId = req.params.userId;
+    if (targetUserId === project.ownerId) {
+      return res.status(400).json({ error: 'Cannot remove the Project Owner from project membership.' });
+    }
+
+    await prisma.projectMembership.deleteMany({
+      where: { projectId: project.id, userId: targetUserId },
+    });
+
+    res.json({ success: true, message: 'Member removed from project.' });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to remove project member' });
   }
 });
 

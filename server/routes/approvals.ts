@@ -3,6 +3,7 @@ import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { determineApprovalRoute } from '../../lib/calculations.js';
 import { createNotification } from '../services/notificationService.js';
+import { getUserHierarchyContext, canManageProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -12,27 +13,21 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     const user = req.user!;
     const filter = req.query.filter as string; // 'actionable' | 'all' | 'mine'
 
+    const ctx = await getUserHierarchyContext(user.id);
     let whereClause: any = {};
     if (filter === 'actionable') {
       whereClause = { approverId: user.id, state: 'Pending' };
     } else if (filter === 'mine') {
       whereClause = { requestedBy: user.id };
-    } else if (user.role === 'CEO') {
-      whereClause = {}; // CEO sees all approvals
-    } else if (user.role === 'CTO') {
+    } else if (ctx.isExecutive) {
+      whereClause = {}; // Executive sees all approvals
+    } else {
       whereClause = {
         OR: [
           { approverId: user.id },
           { requestedBy: user.id },
-          { project: { ownerId: user.id } },
-        ],
-      };
-    } else {
-      // Employee sees their own requests and approvals for projects they belong to
-      whereClause = {
-        OR: [
-          { requestedBy: user.id },
-          { project: { memberships: { some: { userId: user.id } } } },
+          { projectId: { in: ctx.authorizedProjectIds } },
+          ...(ctx.allSubordinateIds.length > 0 ? [{ requestedBy: { in: ctx.allSubordinateIds } }] : []),
         ],
       };
     }
@@ -209,17 +204,15 @@ router.post('/:id/decide', requireAuth, async (req: AuthRequest, res: Response) 
       return res.status(400).json({ error: `Request is already in '${approval.state}' state.` });
     }
 
-    // EMPLOYEES CANNOT DECIDE APPROVALS
-    if (user.role === 'Employee') {
-      return res.status(403).json({ error: 'Forbidden: Employees cannot approve or send back requests.' });
-    }
-
-    // Permission check: Both Project Owner and CEO are eligible to approve/send back requests on the project
-    const isCEO = user.role === 'CEO';
+    const ctx = await getUserHierarchyContext(user.id);
+    const isExecutive = ctx.isExecutive;
     const isProjectOwner = approval.project.ownerId === user.id;
     const isDesignatedApprover = user.id === approval.approverId;
+    const isAuthorizedManager =
+      ctx.allSubordinateIds.includes(approval.requestedBy) &&
+      ctx.authorizedProjectIds.includes(approval.projectId);
 
-    const canDecide = isCEO || isProjectOwner || isDesignatedApprover;
+    const canDecide = isExecutive || isProjectOwner || isDesignatedApprover || isAuthorizedManager;
     if (!canDecide) {
       return res.status(403).json({ error: 'You are not authorized to decide this request.' });
     }

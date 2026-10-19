@@ -1,7 +1,17 @@
 import { Router, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
-import { AuthRequest, requireAuth, requireCEO } from '../auth.js';
+import { AuthRequest, requireAuth } from '../auth.js';
+import {
+  getUserHierarchyContext,
+  getLeaveApprover,
+  canViewLeaveRequest,
+  canDecideLeaveRequest,
+  canWithdrawLeaveRequest,
+  getVisibleLeaveUserIds,
+  getSharedProjectUserIds,
+} from '../services/authorizationService.js';
+import { dispatchLeaveSubmissionEmails } from '../services/emailService.js';
 
 const router = Router();
 
@@ -9,49 +19,207 @@ const LEAVE_TYPES = ['Annual Leave', 'Sick Leave', 'Personal Leave', 'Unpaid Lea
 const DAY_TYPES = ['Full day', 'Half day'];
 
 // ─── GET /api/leave ─────────────────────────────────────────────────────────
-// Employee / Project Owner: returns their own requests.
-// CEO: returns ALL requests (for the Approvals area).
-// Optional query parameter: ?status=Pending|Approved|Sent back|Declined
+// Dynamic Scoping:
+// - Executives see all organization leave requests.
+// - Managers see their own requests plus all subordinate requests in their reporting line.
+// - Employees/Interns see their own requests.
+// - scope=team / availability allows viewing approved leaves of colleagues on shared authorized projects (with private reasons sanitized).
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
-    const { status } = req.query;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { status, scope, startDate, endDate } = req.query;
 
-    const where: Prisma.LeaveRequestWhereInput =
-      user.role === 'CEO'
-        ? {} // CEO sees everything
-        : { requestedBy: user.id }; // Others see only their own
+    let targetUserIds: string[] = [];
+
+    if (scope === 'mine') {
+      targetUserIds = [user.id];
+    } else if (scope === 'subordinates' || scope === 'pending_review') {
+      if (ctx.isExecutive) {
+        const allUsers = await prisma.user.findMany({ select: { id: true } });
+        targetUserIds = allUsers.map((u) => u.id);
+      } else if (ctx.allSubordinateIds.length > 0) {
+        targetUserIds = ctx.allSubordinateIds;
+      } else {
+        targetUserIds = [];
+      }
+    } else if (scope === 'team' || scope === 'availability') {
+      if (ctx.isExecutive) {
+        const allUsers = await prisma.user.findMany({ select: { id: true } });
+        targetUserIds = allUsers.map((u) => u.id);
+      } else {
+        const sharedIds = await getSharedProjectUserIds(ctx);
+        const subordinateSet = new Set([user.id, ...ctx.allSubordinateIds, ...sharedIds]);
+        targetUserIds = Array.from(subordinateSet);
+      }
+    } else {
+      // Default:
+      if (ctx.isExecutive) {
+        const allUsers = await prisma.user.findMany({ select: { id: true } });
+        targetUserIds = allUsers.map((u) => u.id);
+      } else if (ctx.allSubordinateIds.length > 0) {
+        targetUserIds = [user.id, ...ctx.allSubordinateIds];
+      } else {
+        targetUserIds = [user.id];
+      }
+    }
+
+    const where: Prisma.LeaveRequestWhereInput = {
+      requestedBy: { in: targetUserIds },
+    };
 
     if (status && typeof status === 'string') {
       where.status = status;
+    } else if (scope === 'pending_review') {
+      where.status = 'Pending';
+    }
+
+    if (startDate || endDate) {
+      if (startDate) where.endDate = { gte: new Date(String(startDate)) };
+      if (endDate) where.startDate = { lte: new Date(String(endDate)) };
     }
 
     const requests = await prisma.leaveRequest.findMany({
       where,
       orderBy: { createdAt: 'desc' },
       include: {
-        requester: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
-        reviewer: { select: { id: true, name: true, role: true } },
+        requester: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+          },
+        },
+        reviewer: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+          },
+        },
       },
     });
 
-    res.json(requests);
+    // PRIVACY ENFORCEMENT:
+    // If request belongs to a colleague who is NOT a subordinate and user is NOT an executive:
+    // - Only APPROVED requests may be viewed (for team availability).
+    // - The 'reason' and 'reviewNote' fields are sanitized to protect sensitive medical or personal privacy.
+    const sanitizedRequests = requests
+      .filter((reqItem) => {
+        const isSelf = reqItem.requestedBy === ctx.userId;
+        const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
+        if (isSelf || isSubordinate || ctx.isExecutive) {
+          return true;
+        }
+        // Colleague on shared project: only approved leaves can be seen for scheduling
+        return reqItem.status === 'Approved';
+      })
+      .map((reqItem) => {
+        const isSelf = reqItem.requestedBy === ctx.userId;
+        const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
+        const hasFullAccess = isSelf || isSubordinate || ctx.isExecutive;
+
+        if (!hasFullAccess) {
+          return {
+            ...reqItem,
+            reason: null, // Sanitized for peer privacy
+            reviewNote: null,
+          };
+        }
+        return reqItem;
+      });
+
+    res.json(sanitizedRequests);
   } catch (error) {
     console.error('Failed to get leave requests:', error);
     res.status(500).json({ error: 'Failed to retrieve leave requests' });
   }
 });
 
+// ─── GET /api/leave/approver ────────────────────────────────────────────────
+// Resolves the current user's designated leave approver in the reporting hierarchy.
+router.get('/approver', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const approver = await getLeaveApprover(user.id);
+    res.json({ approver });
+  } catch (error) {
+    console.error('Failed to get designated approver:', error);
+    res.status(500).json({ error: 'Failed to resolve leave approver' });
+  }
+});
+
+// ─── GET /api/leave/summary ────────────────────────────────────────────────
+// Aggregated leave metrics and team availability indicators scoped to user permissions.
+router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const myLeaves = await prisma.leaveRequest.findMany({
+      where: { requestedBy: user.id },
+    });
+
+    const myApproved = myLeaves.filter((l) => l.status === 'Approved');
+    const myPending = myLeaves.filter((l) => l.status === 'Pending');
+
+    const now = new Date();
+    const currentlyOnLeave = myApproved.some(
+      (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
+    );
+
+    let teamSummary: any = null;
+
+    if (ctx.isExecutive || ctx.allSubordinateIds.length > 0) {
+      const subordinateIds = ctx.isExecutive
+        ? (await prisma.user.findMany({ select: { id: true } })).map((u) => u.id).filter((id) => id !== user.id)
+        : ctx.allSubordinateIds;
+
+      const teamLeaves = await prisma.leaveRequest.findMany({
+        where: { requestedBy: { in: subordinateIds } },
+      });
+
+      const teamPending = teamLeaves.filter((l) => l.status === 'Pending');
+      const teamApproved = teamLeaves.filter((l) => l.status === 'Approved');
+      const teamCurrentlyOnLeave = teamApproved.filter(
+        (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
+      );
+
+      teamSummary = {
+        totalSubordinatesCount: subordinateIds.length,
+        pendingApprovalsCount: teamPending.length,
+        currentlyOnLeaveCount: teamCurrentlyOnLeave.length,
+        totalApprovedLeavesCount: teamApproved.length,
+      };
+    }
+
+    res.json({
+      mySummary: {
+        totalSubmitted: myLeaves.length,
+        pendingCount: myPending.length,
+        approvedCount: myApproved.length,
+        currentlyOnLeave,
+      },
+      teamSummary,
+      canApproveLeaves: ctx.isExecutive || ctx.allSubordinateIds.length > 0,
+    });
+  } catch (error) {
+    console.error('Failed to get leave summary:', error);
+    res.status(500).json({ error: 'Failed to retrieve leave summary' });
+  }
+});
+
 // ─── POST /api/leave ─────────────────────────────────────────────────────────
-// Employee or Project Owner can submit a leave request.
-// CEO cannot use this endpoint (they have no leave workflow in this MVP).
+// Submits a new leave request.
+// Determines designated approver via dynamic hierarchy and routes notifications accordingly.
 router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
-
-    if (user.role === 'CEO') {
-      return res.status(403).json({ error: 'CEO does not submit leave requests in this system.' });
-    }
+    const ctx = await getUserHierarchyContext(user.id);
 
     const { startDate, endDate, dayType, leaveType, reason } = req.body;
 
@@ -82,6 +250,25 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'End date cannot be before start date.' });
     }
 
+    // Prevent duplicate pending or approved requests for overlapping dates
+    const overlapping = await prisma.leaveRequest.findFirst({
+      where: {
+        requestedBy: user.id,
+        status: { in: ['Pending', 'Approved'] },
+        startDate: { lte: end },
+        endDate: { gte: start },
+      },
+    });
+
+    if (overlapping) {
+      return res.status(400).json({
+        error: `You already have a ${overlapping.status.toLowerCase()} leave request for overlapping dates (${new Date(overlapping.startDate).toLocaleDateString()} – ${new Date(overlapping.endDate).toLocaleDateString()}).`,
+      });
+    }
+
+    // Resolve designated approver using dynamic reporting hierarchy
+    const approver = await getLeaveApprover(user.id);
+
     const leave = await prisma.leaveRequest.create({
       data: {
         requestedBy: user.id,
@@ -93,30 +280,67 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
         status: 'Pending',
       },
       include: {
-        requester: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
-        reviewer: { select: { id: true, name: true, role: true } },
+        requester: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+          },
+        },
+        reviewer: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+          },
+        },
       },
     });
 
-    // Notify CEO of new leave request
-    try {
-      const ceos = await prisma.user.findMany({ where: { role: 'CEO' } });
-      for (const ceo of ceos) {
+    // Notify the designated direct approver in the hierarchy (if not self)
+    if (approver && approver.id !== user.id) {
+      try {
         await prisma.notification.create({
           data: {
-            userId: ceo.id,
-            title: 'New Leave Request',
-            message: `${user.name} submitted a ${leaveType} request (${dayType || 'Full day'})`,
+            userId: approver.id,
+            title: 'New Leave Request Pending Review',
+            message: `${user.name} submitted a ${leaveType} request (${dayType || 'Full day'}) for your review.`,
             type: 'LEAVE_REQUEST',
-            linkUrl: '/alerts',
+            linkUrl: '/dashboard',
           },
         });
+      } catch (notifErr) {
+        console.error('Failed to create leave request notification:', notifErr);
       }
-    } catch (notifErr) {
-      console.error('Failed to create leave request notification:', notifErr);
     }
 
-    res.status(201).json(leave);
+    // Dispatch email notifications in compliance with dynamic leave recipient rules
+    try {
+      await dispatchLeaveSubmissionEmails({
+        leaveId: leave.id,
+        requesterId: user.id,
+        requesterName: user.name,
+        requesterRole: (leave.requester as any)?.roleDefinition?.name || user.role,
+        leaveType: leave.leaveType,
+        dayType: leave.dayType,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        submissionDate: leave.createdAt,
+        status: leave.status,
+      });
+    } catch (emailErr: any) {
+      // Non-blocking: email delivery errors must NOT rollback or fail the saved leave request
+      console.error('[LeaveAPI] Failed to dispatch leave submission emails:', emailErr.message || emailErr);
+    }
+
+    res.status(201).json({
+      ...leave,
+      designatedApprover: approver,
+    });
   } catch (error) {
     console.error('Failed to create leave request:', error);
     res.status(500).json({ error: 'Failed to submit leave request' });
@@ -124,11 +348,13 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
 });
 
 // ─── POST /api/leave/:id/decide ──────────────────────────────────────────────
-// CEO only: Approve, Send Back, or Reject a leave request.
-router.post('/:id/decide', requireAuth, requireCEO, async (req: AuthRequest, res: Response) => {
+// Executive or authorized manager in reporting hierarchy: Approve, Send Back, or Decline a leave request.
+// Enforces self-approval prevention and hierarchical approval authority.
+router.post('/:id/decide', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
     const { action, reviewNote } = req.body;
 
     let normalizedAction = (action || '').toUpperCase().trim().replace(/[\s-]+/g, '_');
@@ -143,17 +369,26 @@ router.post('/:id/decide', requireAuth, requireCEO, async (req: AuthRequest, res
     const trimmedNote = typeof reviewNote === 'string' ? reviewNote.trim() : '';
 
     if ((normalizedAction === 'SEND_BACK' || normalizedAction === 'REJECT') && !trimmedNote) {
-      return res.status(400).json({ error: 'A review note is required when sending back or rejecting.' });
+      return res.status(400).json({ error: 'A review note is required when sending back or declining a request.' });
     }
 
-    const leave = await prisma.leaveRequest.findUnique({ where: { id } });
+    const leave = await prisma.leaveRequest.findUnique({
+      where: { id },
+      include: {
+        requester: {
+          select: { id: true, name: true, role: true, department: true },
+        },
+      },
+    });
 
     if (!leave) {
       return res.status(404).json({ error: 'Leave request not found.' });
     }
 
-    if (leave.status !== 'Pending') {
-      return res.status(400).json({ error: `This request is already '${leave.status}'.` });
+    // Dynamic authorization check & self-approval prevention
+    const decisionAuth = canDecideLeaveRequest(ctx, leave);
+    if (!decisionAuth.allowed) {
+      return res.status(403).json({ error: decisionAuth.reason || 'Forbidden: Insufficient approval authority.' });
     }
 
     const statusMap: Record<string, string> = {
@@ -173,8 +408,24 @@ router.post('/:id/decide', requireAuth, requireCEO, async (req: AuthRequest, res
         reviewedAt: new Date(),
       },
       include: {
-        requester: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
-        reviewer: { select: { id: true, name: true, role: true } },
+        requester: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            department: true,
+            avatarUrl: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+          },
+        },
+        reviewer: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+          },
+        },
       },
     });
 
@@ -201,11 +452,12 @@ router.post('/:id/decide', requireAuth, requireCEO, async (req: AuthRequest, res
 });
 
 // ─── POST / DELETE /api/leave/:id/withdraw ───────────────────────────────────
-// Employee / Project Owner: withdraw their own PENDING request.
+// Employee / Intern / Requester: withdraw their own PENDING request.
 const handleWithdraw = async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
 
     const leave = await prisma.leaveRequest.findUnique({ where: { id } });
 
@@ -213,18 +465,18 @@ const handleWithdraw = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Leave request not found.' });
     }
 
-    // Only the requester (not the CEO) can withdraw
-    if (leave.requestedBy !== user.id) {
-      return res.status(403).json({ error: 'You can only withdraw your own leave requests.' });
-    }
-
-    if (leave.status !== 'Pending') {
-      return res.status(400).json({ error: `Only pending requests can be withdrawn. This request is '${leave.status}'.` });
+    if (!canWithdrawLeaveRequest(ctx, leave)) {
+      if (leave.requestedBy !== user.id) {
+        return res.status(403).json({ error: 'You can only cancel or withdraw your own leave requests.' });
+      }
+      return res.status(400).json({
+        error: `Only pending requests can be withdrawn. This request is already '${leave.status}'.`,
+      });
     }
 
     await prisma.leaveRequest.delete({ where: { id } });
 
-    res.json({ success: true });
+    res.json({ success: true, message: 'Leave request successfully withdrawn.' });
   } catch (error) {
     console.error('Failed to withdraw leave request:', error);
     res.status(500).json({ error: 'Failed to withdraw leave request.' });
@@ -236,6 +488,3 @@ router.delete('/:id/withdraw', requireAuth, handleWithdraw);
 router.delete('/:id', requireAuth, handleWithdraw);
 
 export default router;
-
-
-

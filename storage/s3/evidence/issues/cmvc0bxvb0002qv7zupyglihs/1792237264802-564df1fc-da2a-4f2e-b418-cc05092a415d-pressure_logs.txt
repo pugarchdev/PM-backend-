@@ -1,0 +1,2 @@
+Sensor readings log:
+Timestamp: 16:40:00 - Pressure: 1.2 bar (Expected: 3.5 bar)

@@ -4,33 +4,13 @@ import { AuthRequest, AuthenticatedUser } from '../auth.js';
 
 const router = Router();
 
+import { getUserHierarchyContext } from '../services/authorizationService.js';
+
 // Helper to fetch and aggregate calendar events for a user within a date range
 export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date, endDate: Date) {
-  // Determine project visibility for current user
-  let projectFilter: any = {};
-  if (user.role === 'CEO') {
-    projectFilter = {}; // CEO sees all
-  } else if (user.role === 'CTO') {
-    projectFilter = {
-      OR: [
-        { ownerId: user.id },
-        { memberships: { some: { userId: user.id } } },
-      ],
-    };
-  } else {
-    projectFilter = {
-      OR: [
-        { memberships: { some: { userId: user.id } } },
-        { phases: { some: { tasks: { some: { assigneeId: user.id } } } } },
-      ],
-    };
-  }
-
-  const visibleProjects = await prisma.project.findMany({
-    where: projectFilter,
-    select: { id: true, name: true },
-  });
-  const visibleProjectIds = visibleProjects.map((p) => p.id);
+  // Determine project visibility for current user using centralized authorization
+  const ctx = await getUserHierarchyContext(user.id);
+  const visibleProjectIds = ctx.authorizedProjectIds;
 
   // Aggregate events from all sources
   const events = [];

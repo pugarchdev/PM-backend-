@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
 export const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
@@ -121,4 +121,27 @@ export async function getFromS3(key: string): Promise<{ buffer: Buffer; contentT
 
   const buffer = fs.readFileSync(filePath);
   return { buffer, contentType: 'application/octet-stream' };
+}
+
+export async function deleteFromS3(key: string): Promise<boolean> {
+  try {
+    if (s3Client && hasAwsCredentials) {
+      await s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: s3Bucket,
+          Key: key,
+        })
+      );
+      return true;
+    }
+
+    const filePath = path.join(LOCAL_S3_DIR, key);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[s3Service] Failed to delete object with key "${key}":`, err);
+    return false;
+  }
 }

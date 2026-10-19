@@ -19,11 +19,16 @@ model User {
   verificationExpiry        DateTime?
   name                      String
   role                      String
+  roleId                    String?
+  managerId                 String?
   department                String?
   avatarUrl                 String?
   isSignupCompleted         Boolean             @default(false)
   createdAt                 DateTime            @default(now())
   updatedAt                 DateTime            @updatedAt
+  roleDefinition            Role?               @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  manager                   User?               @relation("ReportingLine", fields: [managerId], references: [id], onDelete: SetNull)
+  subordinates              User[]              @relation("ReportingLine")
   allocations               Allocation[]
   approvalRequestsApproving ApprovalRequest[]   @relation("ApprovalApprover")
   approvalRequestsRequested ApprovalRequest[]   @relation("ApprovalRequester")
@@ -45,6 +50,23 @@ model User {
   tasks                     Task[]              @relation("TaskAssignee")
 
   @@index([role])
+  @@index([roleId])
+  @@index([managerId])
+}
+
+model Role {
+  id             String   @id @default(cuid())
+  name           String   @unique
+  rank           Int      // 1 = Highest executive, 2 = Senior, 3 = Staff, 4 = Intern, etc.
+  isExecutive    Boolean  @default(false)
+  canManageUsers Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  users          User[]
+
+  @@index([rank])
+  @@index([name])
 }
 
 model Project {
@@ -216,22 +238,39 @@ model Issue {
   severity      String
   state         String    @default("Open")
   ownerId       String
-  detail        String
-  raisedBy      String
-  raisedAt      DateTime  @default(now())
-  closedAt      DateTime?
-  reopenComment String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  owner         User      @relation("IssueOwner", fields: [ownerId], references: [id])
-  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  raiser        User      @relation("IssueRaiser", fields: [raisedBy], references: [id])
-  task          Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  detail            String
+  stepsToReproduce  String?
+  raisedBy          String
+  raisedAt          DateTime          @default(now())
+  closedAt          DateTime?
+  reopenComment     String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  owner             User              @relation("IssueOwner", fields: [ownerId], references: [id])
+  project           Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  raiser            User              @relation("IssueRaiser", fields: [raisedBy], references: [id])
+  task              Task?             @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  attachments       IssueAttachment[]
 
   @@index([projectId])
   @@index([ownerId])
   @@index([taskId])
   @@index([state])
+}
+
+model IssueAttachment {
+  id        String   @id @default(cuid())
+  issueId   String
+  fileName  String
+  fileSize  Int
+  mimeType  String
+  fileType  String
+  s3Key     String
+  s3Bucket  String
+  createdAt DateTime @default(now())
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+
+  @@index([issueId])
 }
 
 model Allocation {
