@@ -2751,12 +2751,12 @@ var PhaseRenameSchema = z.object({
   name: z.string().trim().min(1, "Phase name is required").max(100, "Phase name cannot exceed 100 characters")
 });
 var IssueCreateSchema = z.object({
-  projectId: z.string({ required_error: "Project is required" }).min(1, "Project is required"),
+  projectId: z.string({ error: "Project is required" }).min(1, "Project is required"),
   taskId: z.string().nullable().optional(),
-  title: z.string({ required_error: "Title is required" }).trim().min(1, "Title is required").max(150, "Title cannot exceed 150 characters"),
-  severity: z.enum(["Minor", "Major", "Critical"], { required_error: "Severity is required" }),
-  detail: z.string({ required_error: "Detailed context is required" }).trim().min(1, "Detailed context is required"),
-  stepsToReproduce: z.string({ required_error: "Steps to reproduce are required" }).trim().min(1, "Steps to reproduce are required")
+  title: z.string({ error: "Title is required" }).trim().min(1, "Title is required").max(150, "Title cannot exceed 150 characters"),
+  severity: z.enum(["Minor", "Major", "Critical"], { error: "Severity is required" }),
+  detail: z.string({ error: "Detailed context is required" }).trim().min(1, "Detailed context is required"),
+  stepsToReproduce: z.string().trim().nullable().optional()
 });
 var IssueUpdateSchema = z.object({
   title: z.string().trim().min(1).max(150).optional(),
