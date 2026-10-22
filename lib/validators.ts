@@ -106,7 +106,7 @@ export const ProjectCreateSchema = z
   .object({
     name: z.string().trim().min(1, 'Project name is required').max(150, 'Name cannot exceed 150 characters'),
     goal: z.string().trim().min(1, 'Goal is required'),
-    sponsor: z.string().trim().min(1, 'Sponsor is required'),
+    sponsor: z.string().trim().min(1, 'Client is required'),
     startDate: z.string().or(z.date()),
     endDate: z.string().or(z.date()),
     ownerId: z.string().min(1).optional(),
@@ -129,7 +129,7 @@ export const ProjectCharterUpdateSchema = z
   .object({
     name: z.string().trim().min(1, 'Project name is required').max(150).optional(),
     goal: z.string().trim().min(1, 'Goal is required').optional(),
-    sponsor: z.string().trim().min(1, 'Sponsor is required').optional(),
+    sponsor: z.string().trim().min(1, 'Client is required').optional(),
     startDate: z.string().or(z.date()).optional(),
     endDate: z.string().or(z.date()).optional(),
     ownerId: z.string().min(1).optional(),

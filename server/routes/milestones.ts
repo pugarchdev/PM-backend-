@@ -90,7 +90,7 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
     if (baselineDate) {
       if (milestone.isBaselined) {
         return res.status(400).json({
-          error: 'Moving or altering a baselined milestone date requires a formal Timeline Change Request and Sponsor/CEO approval.',
+          error: 'Moving or altering a baselined milestone date requires a formal Timeline Change Request and Client/CEO approval.',
         });
       }
       const bDate = new Date(baselineDate);

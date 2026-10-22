@@ -210,7 +210,7 @@ export interface ApprovalRoutingInput {
  * 1. Budget within project contingency: Project Owner
  *    - If requester is the Project Owner: escalate one level to CEO.
  * 2. Budget beyond contingency OR any increase over ₹50,000: CEO
- * 3. Timeline change moving a baselined milestone: Sponsor / CEO
+ * 3. Timeline change moving a baselined milestone: Client / CEO
  * 4. Scope change OR cross-project resourcing: CEO
  * 5. Self-approval prevention: Nobody can approve their own request.
  */
@@ -241,7 +241,7 @@ export function determineApprovalRoute(input: ApprovalRoutingInput): {
     if (movesBaselinedMilestone) {
       targetRole = 'CEO';
       designatedId = ceoId;
-      escalation = 'Timeline change shifts a baselined milestone (Sponsor/CEO approval required).';
+      escalation = 'Timeline change shifts a baselined milestone (Client/CEO approval required).';
     } else {
       targetRole = 'ProjectOwner';
       designatedId = projectOwnerId;

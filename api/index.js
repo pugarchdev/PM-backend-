@@ -2704,7 +2704,7 @@ function determineApprovalRoute(input) {
     if (movesBaselinedMilestone) {
       targetRole = "CEO";
       designatedId = ceoId;
-      escalation = "Timeline change shifts a baselined milestone (Sponsor/CEO approval required).";
+      escalation = "Timeline change shifts a baselined milestone (Client/CEO approval required).";
     } else {
       targetRole = "ProjectOwner";
       designatedId = projectOwnerId;
@@ -2847,7 +2847,7 @@ var MilestoneCreateSchema = z.object({
 var ProjectCreateSchema = z.object({
   name: z.string().trim().min(1, "Project name is required").max(150, "Name cannot exceed 150 characters"),
   goal: z.string().trim().min(1, "Goal is required"),
-  sponsor: z.string().trim().min(1, "Sponsor is required"),
+  sponsor: z.string().trim().min(1, "Client is required"),
   startDate: z.string().or(z.date()),
   endDate: z.string().or(z.date()),
   ownerId: z.string().min(1).optional(),
@@ -2867,7 +2867,7 @@ var ProjectCreateSchema = z.object({
 var ProjectCharterUpdateSchema = z.object({
   name: z.string().trim().min(1, "Project name is required").max(150).optional(),
   goal: z.string().trim().min(1, "Goal is required").optional(),
-  sponsor: z.string().trim().min(1, "Sponsor is required").optional(),
+  sponsor: z.string().trim().min(1, "Client is required").optional(),
   startDate: z.string().or(z.date()).optional(),
   endDate: z.string().or(z.date()).optional(),
   ownerId: z.string().min(1).optional()
@@ -3435,10 +3435,10 @@ router3.patch("/:id", requireAuth, async (req, res) => {
     if (data.sponsor && data.sponsor !== project.sponsor) {
       updateData.sponsor = data.sponsor;
       changeLogs.push({
-        what: "Executive Sponsor Updated",
+        what: "Client Updated",
         fromValue: project.sponsor,
         toValue: data.sponsor,
-        details: `Executive sponsor updated from "${project.sponsor}" to "${data.sponsor}".`
+        details: `Client updated from "${project.sponsor}" to "${data.sponsor}".`
       });
     }
     if (data.startDate && new Date(data.startDate).getTime() !== project.startDate.getTime()) {
@@ -5805,7 +5805,7 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
     if (baselineDate) {
       if (milestone.isBaselined) {
         return res.status(400).json({
-          error: "Moving or altering a baselined milestone date requires a formal Timeline Change Request and Sponsor/CEO approval."
+          error: "Moving or altering a baselined milestone date requires a formal Timeline Change Request and Client/CEO approval."
         });
       }
       const bDate = new Date(baselineDate);
@@ -6829,7 +6829,8 @@ router11.get("/", requireAuth, async (req, res) => {
       prisma.notification.findMany({
         where,
         orderBy: { createdAt: "desc" },
-        ...isPaginated ? { skip, take } : { take: 50 }
+        take,
+        skip
       }),
       prisma.notification.count({ where }),
       prisma.notification.count({

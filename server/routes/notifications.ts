@@ -38,7 +38,8 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       prisma.notification.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        ...(isPaginated ? { skip, take } : { take: 50 }),
+        take,
+        skip,
       }),
       prisma.notification.count({ where }),
       prisma.notification.count({

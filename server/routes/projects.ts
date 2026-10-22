@@ -643,10 +643,10 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
     if (data.sponsor && data.sponsor !== project.sponsor) {
       updateData.sponsor = data.sponsor;
       changeLogs.push({
-        what: 'Executive Sponsor Updated',
+        what: 'Client Updated',
         fromValue: project.sponsor,
         toValue: data.sponsor,
-        details: `Executive sponsor updated from "${project.sponsor}" to "${data.sponsor}".`,
+        details: `Client updated from "${project.sponsor}" to "${data.sponsor}".`,
       });
     }
 
