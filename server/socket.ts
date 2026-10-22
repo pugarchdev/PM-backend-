@@ -138,16 +138,20 @@ export function initSocket(httpServer: HTTPServer): SocketIOServer {
       }
     });
 
-    // Typing Indicators
-    socket.on('typing:start', ({ projectId, userName }: { projectId: string; userName: string }) => {
-      if (projectId) {
-        socket.to(`project:${projectId}`).emit('chat:typing', { projectId, userName, isTyping: true });
+    // Typing Indicators (supports group and private direct messages)
+    socket.on('typing:start', ({ projectId, conversationId, recipientId, userName }: { projectId: string; conversationId?: string; recipientId?: string; userName: string }) => {
+      if (recipientId) {
+        emitToUser(recipientId, 'chat:typing', { projectId, conversationId, userName, isTyping: true });
+      } else if (projectId) {
+        socket.to(`project:${projectId}`).emit('chat:typing', { projectId, conversationId, userName, isTyping: true });
       }
     });
 
-    socket.on('typing:stop', ({ projectId, userName }: { projectId: string; userName: string }) => {
-      if (projectId) {
-        socket.to(`project:${projectId}`).emit('chat:typing', { projectId, userName, isTyping: false });
+    socket.on('typing:stop', ({ projectId, conversationId, recipientId, userName }: { projectId: string; conversationId?: string; recipientId?: string; userName: string }) => {
+      if (recipientId) {
+        emitToUser(recipientId, 'chat:typing', { projectId, conversationId, userName, isTyping: false });
+      } else if (projectId) {
+        socket.to(`project:${projectId}`).emit('chat:typing', { projectId, conversationId, userName, isTyping: false });
       }
     });
 

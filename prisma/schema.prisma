@@ -34,6 +34,8 @@ model User {
   approvalRequestsRequested ApprovalRequest[]   @relation("ApprovalRequester")
   chatMessages              ChatMessage[]       @relation("ChatAuthor")
   chatReadStates            ChatReadState[]
+  conversationsAsUser1      ChatConversation[]  @relation("ConversationUser1")
+  conversationsAsUser2      ChatConversation[]  @relation("ConversationUser2")
   documentsUploaded         Document[]          @relation("DocUploader")
   documentVersionsUploaded  DocumentVersion[]   @relation("DocVersionUploader")
   issuesOwned               Issue[]             @relation("IssueOwner")
@@ -90,6 +92,7 @@ model Project {
   changeLogs       ChangeLogEntry[]
   chatMessages     ChatMessage[]
   chatReadStates   ChatReadState[]
+  chatConversations ChatConversation[]
   documents        Document[]
   issues           Issue[]
   milestones       Milestone[]
@@ -344,31 +347,57 @@ model StatusOverrideLog {
   @@index([overriddenBy])
 }
 
+model ChatConversation {
+  id         String          @id @default(cuid())
+  projectId  String
+  type       String          @default("GROUP") // "GROUP" | "DIRECT"
+  user1Id    String?
+  user2Id    String?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  project    Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user1      User?           @relation("ConversationUser1", fields: [user1Id], references: [id], onDelete: Cascade)
+  user2      User?           @relation("ConversationUser2", fields: [user2Id], references: [id], onDelete: Cascade)
+  messages   ChatMessage[]
+  readStates ChatReadState[]
+
+  @@unique([projectId, type, user1Id, user2Id])
+  @@index([projectId, type])
+  @@index([user1Id])
+  @@index([user2Id])
+}
+
 model ChatMessage {
-  id        String   @id @default(cuid())
-  projectId String
-  authorId  String
-  body      String
-  mentions  String   @default("[]")
-  sentAt    DateTime @default(now())
-  author    User     @relation("ChatAuthor", fields: [authorId], references: [id], onDelete: Cascade)
-  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  id             String            @id @default(cuid())
+  projectId      String
+  conversationId String?
+  authorId       String
+  body           String
+  mentions       String            @default("[]")
+  sentAt         DateTime          @default(now())
+  author         User              @relation("ChatAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  project        Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  conversation   ChatConversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([projectId, sentAt])
+  @@index([conversationId, sentAt])
   @@index([authorId])
 }
 
 model ChatReadState {
-  id         String   @id @default(cuid())
-  projectId  String
-  userId     String
-  lastReadAt DateTime @default(now())
-  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id             String            @id @default(cuid())
+  projectId      String
+  conversationId String?
+  userId         String
+  lastReadAt     DateTime          @default(now())
+  project        Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation   ChatConversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
-  @@unique([projectId, userId])
+  @@unique([projectId, userId, conversationId])
   @@index([userId])
   @@index([projectId])
+  @@index([conversationId])
 }
 
 model ApprovalRequest {

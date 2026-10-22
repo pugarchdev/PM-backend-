@@ -3,6 +3,7 @@ import { emitToUser } from '../socket.js';
 
 export type NotificationType =
   | 'chat_mention'
+  | 'chat_direct'
   | 'task_assignment'
   | 'task_blocked'
   | 'quality_check_assignment'
@@ -26,6 +27,7 @@ export interface CreateNotificationParams {
 // Types that are strictly marked as push notifications per business rules
 const PUSH_NOTIFICATION_TYPES = new Set([
   'chat_mention',
+  'chat_direct',
   'task_assignment',
   'approval_awaiting',
   'approval_decision',
