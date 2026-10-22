@@ -42,6 +42,7 @@ __export(authorizationService_exports, {
   canViewProject: () => canViewProject,
   canViewTask: () => canViewTask,
   canWithdrawLeaveRequest: () => canWithdrawLeaveRequest,
+  clearUserHierarchyCache: () => clearUserHierarchyCache,
   getLeaveApprover: () => getLeaveApprover,
   getSharedProjectUserIds: () => getSharedProjectUserIds,
   getUserHierarchyContext: () => getUserHierarchyContext,
@@ -50,114 +51,147 @@ __export(authorizationService_exports, {
   getVisibleWorkloadUserIds: () => getVisibleWorkloadUserIds,
   resolveLeaveNotificationRecipients: () => resolveLeaveNotificationRecipients
 });
-async function getUserHierarchyContext(userId) {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    include: {
-      roleDefinition: true,
-      memberships: { select: { projectId: true } }
-    }
-  });
-  if (!user) {
-    throw new Error(`User not found: ${userId}`);
-  }
-  let roleName = user.role;
-  let roleRank = 999;
-  let isExecutive = false;
-  let canManageUsers = false;
-  if (user.roleDefinition && user.roleDefinition.isActive) {
-    roleName = user.roleDefinition.name;
-    roleRank = user.roleDefinition.rank;
-    isExecutive = user.roleDefinition.isExecutive;
-    canManageUsers = user.roleDefinition.canManageUsers;
+function clearUserHierarchyCache(userId) {
+  if (userId) {
+    hierarchyCache.delete(userId);
+    inflightHierarchyPromises.delete(userId);
   } else {
-    const matchedRole = await prisma.role.findFirst({
-      where: { name: user.role, isActive: true }
-    });
-    if (matchedRole) {
-      roleName = matchedRole.name;
-      roleRank = matchedRole.rank;
-      isExecutive = matchedRole.isExecutive;
-      canManageUsers = matchedRole.canManageUsers;
-    } else if (user.role === "CEO") {
-      roleRank = 1;
-      isExecutive = true;
-      canManageUsers = true;
-    } else if (user.role === "CTO" || user.role === "ProjectOwner") {
-      roleRank = 2;
-    } else {
-      roleRank = 3;
-    }
+    hierarchyCache.clear();
+    inflightHierarchyPromises.clear();
   }
-  const directSubordinates = await prisma.user.findMany({
-    where: { managerId: user.id },
-    include: { roleDefinition: true }
-  });
-  const directSubordinateIds = [];
-  const allSubordinateIds = [];
-  const visited = /* @__PURE__ */ new Set([user.id]);
-  const queue = [];
-  for (const sub of directSubordinates) {
-    const subRank = sub.roleDefinition?.rank ?? (sub.role === "Intern" ? 4 : sub.role === "Employee" ? 3 : 2);
-    if (isExecutive || subRank > roleRank) {
-      directSubordinateIds.push(sub.id);
-      allSubordinateIds.push(sub.id);
-      visited.add(sub.id);
-      queue.push({ id: sub.id, roleRank: subRank });
-    }
+}
+async function getUserHierarchyContext(userId) {
+  const now = Date.now();
+  const cached = hierarchyCache.get(userId);
+  if (cached && cached.expiresAt > now) {
+    return cached.context;
   }
-  while (queue.length > 0) {
-    const current = queue.shift();
-    const nextLevel = await prisma.user.findMany({
-      where: { managerId: current.id },
-      include: { roleDefinition: true }
-    });
-    for (const sub of nextLevel) {
-      if (!visited.has(sub.id)) {
-        visited.add(sub.id);
-        const subRank = sub.roleDefinition?.rank ?? (sub.role === "Intern" ? 4 : 3);
+  const existingPromise = inflightHierarchyPromises.get(userId);
+  if (existingPromise) {
+    return existingPromise;
+  }
+  const queryPromise = (async () => {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        include: {
+          roleDefinition: true,
+          memberships: { select: { projectId: true } }
+        }
+      });
+      if (!user) {
+        throw new Error(`User not found: ${userId}`);
+      }
+      let roleName = user.role;
+      let roleRank = 999;
+      let isExecutive = false;
+      let canManageUsers = false;
+      if (user.roleDefinition && user.roleDefinition.isActive) {
+        roleName = user.roleDefinition.name;
+        roleRank = user.roleDefinition.rank;
+        isExecutive = user.roleDefinition.isExecutive;
+        canManageUsers = user.roleDefinition.canManageUsers;
+      } else {
+        const matchedRole = await prisma.role.findFirst({
+          where: { name: user.role, isActive: true }
+        });
+        if (matchedRole) {
+          roleName = matchedRole.name;
+          roleRank = matchedRole.rank;
+          isExecutive = matchedRole.isExecutive;
+          canManageUsers = matchedRole.canManageUsers;
+        } else if (user.role === "CEO") {
+          roleRank = 1;
+          isExecutive = true;
+          canManageUsers = true;
+        } else if (user.role === "CTO" || user.role === "ProjectOwner") {
+          roleRank = 2;
+        } else {
+          roleRank = 3;
+        }
+      }
+      const directSubordinatesPromise = prisma.user.findMany({
+        where: { managerId: user.id },
+        include: { roleDefinition: true }
+      });
+      let authorizedProjectsPromise;
+      if (isExecutive) {
+        authorizedProjectsPromise = prisma.project.findMany({ select: { id: true } }).then((allProjects) => allProjects.map((p) => p.id));
+      } else {
+        authorizedProjectsPromise = Promise.all([
+          prisma.project.findMany({
+            where: { ownerId: user.id },
+            select: { id: true }
+          }),
+          prisma.task.findMany({
+            where: { assigneeId: user.id },
+            select: { phase: { select: { projectId: true } } }
+          })
+        ]).then(([ownedProjects, taskProjects]) => {
+          const projectSet = /* @__PURE__ */ new Set();
+          ownedProjects.forEach((p) => projectSet.add(p.id));
+          user.memberships.forEach((m) => projectSet.add(m.projectId));
+          taskProjects.forEach((t) => {
+            if (t.phase?.projectId) projectSet.add(t.phase.projectId);
+          });
+          return Array.from(projectSet);
+        });
+      }
+      const [directSubordinates, authorizedProjectIds] = await Promise.all([
+        directSubordinatesPromise,
+        authorizedProjectsPromise
+      ]);
+      const directSubordinateIds = [];
+      const allSubordinateIds = [];
+      const visited = /* @__PURE__ */ new Set([user.id]);
+      const queue = [];
+      for (const sub of directSubordinates) {
+        const subRank = sub.roleDefinition?.rank ?? (sub.role === "Intern" ? 4 : sub.role === "Employee" ? 3 : 2);
         if (isExecutive || subRank > roleRank) {
+          directSubordinateIds.push(sub.id);
           allSubordinateIds.push(sub.id);
+          visited.add(sub.id);
           queue.push({ id: sub.id, roleRank: subRank });
         }
       }
+      while (queue.length > 0) {
+        const current = queue.shift();
+        const nextLevel = await prisma.user.findMany({
+          where: { managerId: current.id },
+          include: { roleDefinition: true }
+        });
+        for (const sub of nextLevel) {
+          if (!visited.has(sub.id)) {
+            visited.add(sub.id);
+            const subRank = sub.roleDefinition?.rank ?? (sub.role === "Intern" ? 4 : 3);
+            if (isExecutive || subRank > roleRank) {
+              allSubordinateIds.push(sub.id);
+              queue.push({ id: sub.id, roleRank: subRank });
+            }
+          }
+        }
+      }
+      const context = {
+        userId: user.id,
+        name: user.name,
+        email: user.email,
+        roleName,
+        roleRank,
+        isExecutive,
+        canManageUsers,
+        managerId: user.managerId,
+        directSubordinateIds,
+        allSubordinateIds,
+        authorizedProjectIds
+      };
+      hierarchyCache.set(userId, { context, expiresAt: Date.now() + HIERARCHY_CACHE_TTL_MS });
+      return context;
+    } finally {
+      inflightHierarchyPromises.delete(userId);
     }
-  }
-  let authorizedProjectIds = [];
-  if (isExecutive) {
-    const allProjects = await prisma.project.findMany({ select: { id: true } });
-    authorizedProjectIds = allProjects.map((p) => p.id);
-  } else {
-    const ownedProjects = await prisma.project.findMany({
-      where: { ownerId: user.id },
-      select: { id: true }
-    });
-    const membershipProjects = user.memberships.map((m) => m.projectId);
-    const taskProjects = await prisma.task.findMany({
-      where: { assigneeId: user.id },
-      select: { phase: { select: { projectId: true } } }
-    });
-    const projectSet = /* @__PURE__ */ new Set();
-    ownedProjects.forEach((p) => projectSet.add(p.id));
-    membershipProjects.forEach((id) => projectSet.add(id));
-    taskProjects.forEach((t) => {
-      if (t.phase?.projectId) projectSet.add(t.phase.projectId);
-    });
-    authorizedProjectIds = Array.from(projectSet);
-  }
-  return {
-    userId: user.id,
-    name: user.name,
-    email: user.email,
-    roleName,
-    roleRank,
-    isExecutive,
-    canManageUsers,
-    managerId: user.managerId,
-    directSubordinateIds,
-    allSubordinateIds,
-    authorizedProjectIds
-  };
+  })();
+  inflightHierarchyPromises.set(userId, queryPromise);
+  return queryPromise;
 }
 function canViewProject(ctx, projectId) {
   if (ctx.isExecutive) return true;
@@ -411,9 +445,13 @@ async function getSharedProjectUserIds(ctx) {
   });
   return Array.from(set);
 }
+var hierarchyCache, inflightHierarchyPromises, HIERARCHY_CACHE_TTL_MS;
 var init_authorizationService = __esm({
   "server/services/authorizationService.ts"() {
     init_prisma();
+    hierarchyCache = /* @__PURE__ */ new Map();
+    inflightHierarchyPromises = /* @__PURE__ */ new Map();
+    HIERARCHY_CACHE_TTL_MS = 3e4;
   }
 });
 
@@ -506,6 +544,7 @@ function parseIdentifier(identifier) {
   }
   return { type: "phone", value: normalizePhone(raw) };
 }
+var authUserCache = /* @__PURE__ */ new Map();
 async function authenticate(req, res, next) {
   let userId;
   const authHeader = req.headers.authorization;
@@ -524,36 +563,43 @@ async function authenticate(req, res, next) {
     }
   }
   try {
-    let user = null;
     if (userId) {
-      user = await prisma.user.findUnique({
+      const now = Date.now();
+      const cached = authUserCache.get(userId);
+      if (cached && cached.expiresAt > now) {
+        req.user = cached.user;
+        return next();
+      }
+      const user = await prisma.user.findUnique({
         where: { id: userId },
         include: { roleDefinition: true }
       });
-    }
-    if (user) {
-      const roleDef = user.roleDefinition;
-      const roleName = roleDef?.name || user.role;
-      const roleRank = roleDef?.rank ?? (user.role === "CEO" ? 1 : user.role === "CTO" || user.role === "ProjectOwner" ? 2 : user.role === "Intern" ? 4 : 3);
-      const isExecutive = roleDef?.isExecutive ?? user.role === "CEO";
-      const canManageUsers = roleDef?.canManageUsers ?? user.role === "CEO";
-      req.user = {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone || null,
-        role: roleName,
-        roleId: user.roleId || roleDef?.id || null,
-        roleRank,
-        isExecutive,
-        canManageUsers,
-        managerId: user.managerId || null,
-        department: user.department,
-        avatarUrl: user.avatarUrl,
-        isSignupCompleted: user.isSignupCompleted ?? true,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt
-      };
+      if (user) {
+        const roleDef = user.roleDefinition;
+        const roleName = roleDef?.name || user.role;
+        const roleRank = roleDef?.rank ?? (user.role === "CEO" ? 1 : user.role === "CTO" || user.role === "ProjectOwner" ? 2 : user.role === "Intern" ? 4 : 3);
+        const isExecutive = roleDef?.isExecutive ?? user.role === "CEO";
+        const canManageUsers = roleDef?.canManageUsers ?? user.role === "CEO";
+        const authUser = {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone || null,
+          role: roleName,
+          roleId: user.roleId || roleDef?.id || null,
+          roleRank,
+          isExecutive,
+          canManageUsers,
+          managerId: user.managerId || null,
+          department: user.department,
+          avatarUrl: user.avatarUrl,
+          isSignupCompleted: user.isSignupCompleted ?? true,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt
+        };
+        authUserCache.set(user.id, { user: authUser, expiresAt: Date.now() + 3e4 });
+        req.user = authUser;
+      }
     }
     next();
   } catch (error) {
@@ -2537,6 +2583,19 @@ var auth_default = router2;
 init_prisma();
 import { Router as Router3 } from "express";
 
+// lib/currency.ts
+var CURRENCY_CODE = "INR";
+var CURRENCY_LOCALE = "en-IN";
+var formatCurrency = (amount, options) => {
+  const numericAmount = typeof amount === "number" ? amount : Number(amount) || 0;
+  return new Intl.NumberFormat(CURRENCY_LOCALE, {
+    style: "currency",
+    currency: CURRENCY_CODE,
+    maximumFractionDigits: options?.maximumFractionDigits ?? 2,
+    ...options?.minimumFractionDigits !== void 0 ? { minimumFractionDigits: options.minimumFractionDigits } : {}
+  }).format(numericAmount);
+};
+
 // lib/calculations.ts
 function calculateProgress(tasks) {
   if (!tasks || tasks.length === 0) {
@@ -2656,7 +2715,7 @@ function determineApprovalRoute(input) {
     if (isOver50k || exceedsContingency) {
       targetRole = "CEO";
       designatedId = ceoId;
-      escalation = isOver50k ? "Budget change exceeds \xA350,000 threshold (CEO approval required)." : "Budget change exceeds project contingency (CEO approval required).";
+      escalation = isOver50k ? `Budget change exceeds ${formatCurrency(5e4, { maximumFractionDigits: 0, minimumFractionDigits: 0 })} threshold (CEO approval required).` : "Budget change exceeds project contingency (CEO approval required).";
     } else {
       targetRole = "ProjectOwner";
       designatedId = projectOwnerId;
@@ -2905,36 +2964,129 @@ router3.get("/", requireAuth, async (req, res) => {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
     const whereClause = ctx.isExecutive ? {} : { id: { in: ctx.authorizedProjectIds } };
+    if (req.query.minimal === "true") {
+      const minimalProjects = await prisma.project.findMany({
+        where: whereClause,
+        select: {
+          id: true,
+          name: true,
+          ownerId: true,
+          startDate: true,
+          endDate: true,
+          statusOverride: true
+        },
+        orderBy: { name: "asc" }
+      });
+      return res.json(minimalProjects);
+    }
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    if (search) {
+      whereClause.AND = [
+        ...whereClause.AND || [],
+        {
+          OR: [
+            { name: { contains: search, mode: "insensitive" } },
+            { goal: { contains: search, mode: "insensitive" } },
+            { sponsor: { contains: search, mode: "insensitive" } },
+            { owner: { name: { contains: search, mode: "insensitive" } } }
+          ]
+        }
+      ];
+    }
+    const sortBy = typeof req.query.sortBy === "string" ? req.query.sortBy : "startDate";
+    const sortOrder = req.query.sortOrder === "desc" ? "desc" : "asc";
+    const allowedSortFields = {
+      startDate: { startDate: sortOrder },
+      endDate: { endDate: sortOrder },
+      name: { name: sortOrder },
+      createdAt: { createdAt: sortOrder }
+    };
+    const orderBy = allowedSortFields[sortBy] || { startDate: "asc" };
+    const now = /* @__PURE__ */ new Date();
     const projects = await prisma.project.findMany({
       where: whereClause,
-      include: {
+      select: {
+        id: true,
+        name: true,
+        goal: true,
+        sponsor: true,
+        startDate: true,
+        endDate: true,
+        plannedBudget: true,
+        contingency: true,
+        spendToDate: true,
+        statusOverride: true,
+        ownerId: true,
         owner: {
           select: { id: true, name: true, email: true, role: true, avatarUrl: true }
         },
-        memberships: {
-          include: {
-            user: { select: { id: true, name: true, email: true, role: true, avatarUrl: true } }
-          }
-        },
         phases: {
           where: { isArchived: false },
-          include: {
-            tasks: true
+          select: {
+            id: true,
+            plannedStart: true,
+            plannedEnd: true,
+            order: true,
+            tasks: {
+              select: {
+                id: true,
+                state: true,
+                plannedHours: true
+              }
+            }
           },
           orderBy: { plannedStart: "asc" }
         },
-        issues: true,
-        risks: true,
+        issues: {
+          where: { severity: "Critical", state: { not: "Closed" } },
+          select: { id: true, severity: true, state: true },
+          take: 1
+        },
+        risks: {
+          where: { severity: "High", closedAt: null },
+          select: { id: true, severity: true, closedAt: true },
+          take: 1
+        },
         milestones: {
-          orderBy: { forecastDate: "asc" }
+          where: { actualDate: null, forecastDate: { gte: now } },
+          select: {
+            id: true,
+            title: true,
+            forecastDate: true,
+            actualDate: true
+          },
+          orderBy: { forecastDate: "asc" },
+          take: 1
         }
       },
-      orderBy: { startDate: "asc" }
+      orderBy
     });
     const enriched = await Promise.all(projects.map(enrichProject));
-    const sanitized = enriched.map(
+    const statusParam = typeof req.query.status === "string" ? req.query.status.toUpperCase() : "ALL";
+    let filtered = enriched;
+    if (statusParam && statusParam !== "ALL") {
+      filtered = enriched.filter((p) => p.metrics?.status === statusParam);
+    }
+    const totalCount = filtered.length;
+    res.setHeader("X-Total-Count", String(totalCount));
+    const isPaginated = req.query.page !== void 0 || req.query.limit !== void 0;
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.max(1, parseInt(String(req.query.limit || "10"), 10) || 10);
+    const paginatedItems = isPaginated ? filtered.slice((page - 1) * limit, page * limit) : filtered;
+    const sanitized = paginatedItems.map(
       (p) => sanitizeProjectForRole(p, ctx.roleRank, ctx.isExecutive, p.ownerId === user.id)
     );
+    if (isPaginated) {
+      return res.json({
+        projects: sanitized,
+        pagination: {
+          total: totalCount,
+          page,
+          limit,
+          totalPages: Math.ceil(totalCount / limit) || 1
+        }
+      });
+    }
     res.json(sanitized);
   } catch (error) {
     console.error("Failed to fetch projects:", error);
@@ -3004,7 +3156,7 @@ router3.post("/", requireAuth, async (req, res) => {
           actorId: user.id,
           sourceType: "PROJECT",
           sourceId: p.id,
-          details: `Project "${name}" chartered by ${user.name} with \xA3${plannedBudget.toLocaleString()} budget and \xA3${contingency.toLocaleString()} contingency.`,
+          details: `Project "${name}" chartered by ${user.name} with ${formatCurrency(plannedBudget)} budget and ${formatCurrency(contingency)} contingency.`,
           changedBy: user.name
         }
       });
@@ -3118,13 +3270,8 @@ router3.get("/:id", requireAuth, async (req, res) => {
           include: {
             user: { select: { id: true, name: true } }
           },
-          orderBy: { createdAt: "desc" }
-        },
-        changeLogs: {
-          orderBy: { at: "desc" }
-        },
-        baselines: {
-          orderBy: { createdAt: "desc" }
+          orderBy: { createdAt: "desc" },
+          take: 20
         }
       }
     });
@@ -3137,6 +3284,105 @@ router3.get("/:id", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Failed to fetch project details:", error);
     res.status(500).json({ error: "Failed to retrieve project details" });
+  }
+});
+router3.get("/:id/summary", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: "Forbidden: You do not have access to this project" });
+    }
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      select: {
+        id: true,
+        name: true,
+        startDate: true,
+        endDate: true,
+        statusOverride: true,
+        plannedBudget: true,
+        contingency: true,
+        spendToDate: true,
+        phases: {
+          where: { isArchived: false },
+          select: {
+            id: true,
+            plannedStart: true,
+            plannedEnd: true,
+            tasks: {
+              select: {
+                id: true,
+                state: true,
+                priority: true,
+                plannedHours: true,
+                actualHours: true,
+                assigneeId: true
+              }
+            }
+          }
+        },
+        issues: {
+          select: { id: true, severity: true, state: true }
+        },
+        risks: {
+          select: { id: true, severity: true, closedAt: true }
+        }
+      }
+    });
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    const tasks = project.phases.flatMap((ph) => ph.tasks);
+    const totalTasks = tasks.length;
+    const completedTasks = tasks.filter((t) => t.state === "Completed").length;
+    const inProgressTasks = tasks.filter((t) => t.state === "In progress").length;
+    const notStartedTasks = tasks.filter((t) => t.state === "Not started").length;
+    const blockedTasks = tasks.filter((t) => t.state === "Blocked").length;
+    const highPriorityTasks = tasks.filter((t) => t.priority === "High").length;
+    const totalPlannedHours = tasks.reduce((sum, t) => sum + (t.plannedHours || 0), 0);
+    const totalActualHours = tasks.reduce((sum, t) => sum + (t.actualHours || 0), 0);
+    const progress = calculateProgress(tasks);
+    const plan = calculatePlanPercentage(project.startDate, project.endDate, project.phases);
+    const hasCriticalIssueOpen = project.issues.some((i) => i.severity === "Critical" && i.state !== "Closed");
+    const hasHighRiskOpen = project.risks.some((r) => r.severity === "High" && !r.closedAt);
+    const status = calculateProjectStatus({
+      progress,
+      plan,
+      hasCriticalIssueOpen,
+      hasHighRiskOpen,
+      statusOverride: project.statusOverride
+    });
+    res.json({
+      projectId: project.id,
+      name: project.name,
+      status,
+      isOverridden: !!project.statusOverride,
+      progress,
+      plan,
+      tasks: {
+        total: totalTasks,
+        completed: completedTasks,
+        inProgress: inProgressTasks,
+        notStarted: notStartedTasks,
+        blocked: blockedTasks,
+        highPriority: highPriorityTasks
+      },
+      hours: {
+        planned: totalPlannedHours,
+        actual: totalActualHours,
+        variance: totalActualHours - totalPlannedHours
+      },
+      issues: {
+        total: project.issues.length,
+        openCritical: project.issues.filter((i) => i.severity === "Critical" && i.state !== "Closed").length
+      },
+      risks: {
+        total: project.risks.length,
+        openHigh: project.risks.filter((r) => r.severity === "High" && !r.closedAt).length
+      }
+    });
+  } catch (error) {
+    console.error("Failed to fetch project summary:", error);
+    res.status(500).json({ error: "Failed to retrieve project summary" });
   }
 });
 router3.patch("/:id", requireAuth, async (req, res) => {
@@ -3621,7 +3867,140 @@ init_prisma();
 import { Router as Router5 } from "express";
 init_authorizationService();
 var router5 = Router5();
+var taskListSelect = {
+  id: true,
+  phaseId: true,
+  title: true,
+  assigneeId: true,
+  priority: true,
+  plannedStart: true,
+  plannedEnd: true,
+  plannedHours: true,
+  actualHours: true,
+  state: true,
+  dependsOn: true,
+  isBaselined: true,
+  hasRiskFlag: true,
+  riskFlagReason: true,
+  createdAt: true,
+  updatedAt: true,
+  assignee: {
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      avatarUrl: true,
+      role: true,
+      roleDefinition: {
+        select: { id: true, name: true, rank: true, isExecutive: true }
+      }
+    }
+  },
+  qualityChecks: {
+    select: {
+      id: true,
+      label: true,
+      mandatory: true,
+      checkedAt: true,
+      checkedBy: true
+    }
+  },
+  phase: {
+    select: {
+      id: true,
+      name: true,
+      projectId: true,
+      project: { select: { id: true, name: true } }
+    }
+  }
+};
 router5.get("/", async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId, phaseId, assigneeId, scope, state, priority, hasRiskFlag, search, sortBy, sortOrder } = req.query;
+    const where = {};
+    if (projectId) {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: "Forbidden: You do not have access to this project." });
+      }
+      where.phase = { projectId: pId };
+    } else if (!ctx.isExecutive) {
+      where.phase = { projectId: { in: ctx.authorizedProjectIds } };
+    }
+    if (phaseId) {
+      where.phaseId = String(phaseId);
+    }
+    if (scope === "mine") {
+      where.assigneeId = user.id;
+    } else if (scope === "subordinates") {
+      if (ctx.isExecutive) {
+      } else if (ctx.allSubordinateIds.length > 0) {
+        where.assigneeId = { in: ctx.allSubordinateIds };
+      } else {
+        where.assigneeId = "__none__";
+      }
+    } else if (assigneeId) {
+      where.assigneeId = String(assigneeId);
+    }
+    if (state && typeof state === "string" && state !== "ALL") {
+      where.state = state;
+    }
+    if (priority && typeof priority === "string" && priority !== "ALL") {
+      where.priority = priority;
+    }
+    if (hasRiskFlag !== void 0) {
+      where.hasRiskFlag = String(hasRiskFlag).toLowerCase() === "true";
+    }
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { title: { contains: term, mode: "insensitive" } },
+        { riskFlagReason: { contains: term, mode: "insensitive" } }
+      ];
+    }
+    const validSortFields = ["plannedStart", "plannedEnd", "priority", "state", "title", "plannedHours", "actualHours", "createdAt"];
+    const sortField = typeof sortBy === "string" && validSortFields.includes(sortBy) ? sortBy : "plannedStart";
+    const order = sortOrder === "desc" ? "desc" : "asc";
+    const orderBy = { [sortField]: order };
+    const isPaginated = req.query.page !== void 0 || req.query.limit !== void 0;
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.max(1, parseInt(String(req.query.limit || "10"), 10) || 10);
+    const skip = isPaginated ? (page - 1) * limit : void 0;
+    const take = isPaginated ? limit : void 0;
+    const [tasks, totalCount] = await Promise.all([
+      prisma.task.findMany({
+        where,
+        select: taskListSelect,
+        orderBy,
+        skip,
+        take
+      }),
+      prisma.task.count({ where })
+    ]);
+    res.setHeader("X-Total-Count", String(totalCount));
+    if (isPaginated) {
+      return res.json({
+        tasks,
+        pagination: {
+          total: totalCount,
+          page,
+          limit,
+          totalPages: Math.ceil(totalCount / limit) || 1
+        }
+      });
+    }
+    res.json(tasks);
+  } catch (error) {
+    console.error("Failed to fetch tasks:", error);
+    res.status(500).json({ error: "Failed to fetch tasks" });
+  }
+});
+router5.get("/summary", async (req, res) => {
   try {
     const user = req.user;
     if (!user) {
@@ -3651,29 +4030,52 @@ router5.get("/", async (req, res) => {
     } else if (assigneeId) {
       where.assigneeId = String(assigneeId);
     }
-    const tasks = await prisma.task.findMany({
-      where,
-      include: {
-        assignee: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            avatarUrl: true,
-            role: true,
-            roleDefinition: {
-              select: { id: true, name: true, rank: true, isExecutive: true }
-            }
-          }
-        },
-        qualityChecks: true,
-        phase: { select: { id: true, name: true, projectId: true } }
-      },
-      orderBy: { plannedStart: "asc" }
+    const [stateGrouping, priorityGrouping, hoursAggregate, riskFlaggedCount, totalCount] = await Promise.all([
+      prisma.task.groupBy({
+        by: ["state"],
+        where,
+        _count: { id: true }
+      }),
+      prisma.task.groupBy({
+        by: ["priority"],
+        where,
+        _count: { id: true }
+      }),
+      prisma.task.aggregate({
+        where,
+        _sum: {
+          plannedHours: true,
+          actualHours: true
+        }
+      }),
+      prisma.task.count({
+        where: { ...where, hasRiskFlag: true }
+      }),
+      prisma.task.count({ where })
+    ]);
+    const byState = {
+      notStarted: stateGrouping.find((s) => s.state === "Not started")?._count.id || 0,
+      inProgress: stateGrouping.find((s) => s.state === "In progress")?._count.id || 0,
+      blocked: stateGrouping.find((s) => s.state === "Blocked")?._count.id || 0,
+      completed: stateGrouping.find((s) => s.state === "Completed")?._count.id || 0
+    };
+    const byPriority = {
+      low: priorityGrouping.find((p) => p.priority === "Low")?._count.id || 0,
+      normal: priorityGrouping.find((p) => p.priority === "Normal")?._count.id || 0,
+      high: priorityGrouping.find((p) => p.priority === "High")?._count.id || 0
+    };
+    res.json({
+      total: totalCount,
+      byState,
+      byPriority,
+      plannedHoursTotal: hoursAggregate._sum.plannedHours || 0,
+      actualHoursTotal: hoursAggregate._sum.actualHours || 0,
+      riskFlaggedCount,
+      completionRate: totalCount > 0 ? Math.round(byState.completed / totalCount * 100) : 0
     });
-    res.json(tasks);
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch tasks" });
+    console.error("Failed to fetch task summary:", error);
+    res.status(500).json({ error: "Failed to fetch task summary" });
   }
 });
 router5.get("/:id", async (req, res) => {
@@ -3685,9 +4087,28 @@ router5.get("/:id", async (req, res) => {
     const ctx = await getUserHierarchyContext(user.id);
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
-      include: {
+      select: {
+        id: true,
+        phaseId: true,
+        title: true,
+        assigneeId: true,
+        priority: true,
+        plannedStart: true,
+        plannedEnd: true,
+        plannedHours: true,
+        actualHours: true,
+        state: true,
+        dependsOn: true,
+        isBaselined: true,
+        hasRiskFlag: true,
+        riskFlagReason: true,
+        createdAt: true,
+        updatedAt: true,
         phase: {
-          include: {
+          select: {
+            id: true,
+            name: true,
+            projectId: true,
             project: {
               select: { id: true, name: true, ownerId: true }
             }
@@ -3706,12 +4127,35 @@ router5.get("/:id", async (req, res) => {
           }
         },
         qualityChecks: {
-          include: {
+          select: {
+            id: true,
+            taskId: true,
+            label: true,
+            mandatory: true,
+            checkedAt: true,
+            checkedBy: true,
             checker: { select: { id: true, name: true } }
           }
         },
-        issues: true,
-        risks: true
+        issues: {
+          select: {
+            id: true,
+            title: true,
+            severity: true,
+            state: true,
+            raisedBy: true,
+            closedAt: true
+          }
+        },
+        risks: {
+          select: {
+            id: true,
+            description: true,
+            severity: true,
+            mitigation: true,
+            closedAt: true
+          }
+        }
       }
     });
     if (!task) {
@@ -4484,13 +4928,13 @@ var upload = multer({
     files: MAX_EVIDENCE_ATTACHMENTS
   }
 });
-router6.get("/", requireAuth, async (req, res) => {
+router6.get("/summary", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
-    const { projectId, severity, state } = req.query;
+    const { projectId } = req.query;
     const where = {};
-    if (projectId) {
+    if (projectId && projectId !== "ALL") {
       const pId = String(projectId);
       if (!canViewProject(ctx, pId)) {
         return res.status(403).json({ error: "You do not have access to issues for this project." });
@@ -4501,30 +4945,166 @@ router6.get("/", requireAuth, async (req, res) => {
         where.projectId = { in: ctx.authorizedProjectIds };
       }
     }
-    if (severity) where.severity = String(severity);
-    if (state) where.state = String(state);
+    const [stateGroups, severityGroups, total] = await Promise.all([
+      prisma.issue.groupBy({
+        by: ["state"],
+        where,
+        _count: { id: true }
+      }),
+      prisma.issue.groupBy({
+        by: ["severity"],
+        where,
+        _count: { id: true }
+      }),
+      prisma.issue.count({ where })
+    ]);
+    const stateCounts = {};
+    stateGroups.forEach((g) => {
+      stateCounts[g.state] = g._count.id;
+    });
+    const severityCounts = {
+      Minor: 0,
+      Major: 0,
+      Critical: 0
+    };
+    severityGroups.forEach((g) => {
+      severityCounts[g.severity] = g._count.id;
+    });
+    const closedCount = stateCounts["Closed"] || 0;
+    const openCount = total - closedCount;
+    res.json({
+      total,
+      openCount,
+      closedCount,
+      byState: stateCounts,
+      bySeverity: severityCounts,
+      criticalCount: severityCounts["Critical"] || 0,
+      majorCount: severityCounts["Major"] || 0,
+      minorCount: severityCounts["Minor"] || 0
+    });
+  } catch (error) {
+    console.error("Failed to get issues summary:", error);
+    res.status(500).json({ error: "Failed to retrieve issues summary" });
+  }
+});
+router6.get("/", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const {
+      projectId,
+      severity,
+      state,
+      search,
+      page,
+      limit,
+      sortBy = "raisedAt",
+      sortOrder = "desc"
+    } = req.query;
+    const where = {};
+    if (projectId && projectId !== "ALL") {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: "You do not have access to issues for this project." });
+      }
+      where.projectId = pId;
+    } else {
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
+      }
+    }
+    if (severity && severity !== "ALL") {
+      where.severity = String(severity);
+    }
+    if (state && state !== "ALL") {
+      const s = String(state);
+      if (s === "OPEN" || s === "Open") {
+        where.state = { not: "Closed" };
+      } else if (s === "CLOSED" || s === "Closed") {
+        where.state = "Closed";
+      } else {
+        where.state = s;
+      }
+    }
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { title: { contains: term, mode: "insensitive" } },
+        { detail: { contains: term, mode: "insensitive" } },
+        { project: { name: { contains: term, mode: "insensitive" } } }
+      ];
+    }
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      taskId: true,
+      title: true,
+      severity: true,
+      detail: true,
+      stepsToReproduce: true,
+      state: true,
+      ownerId: true,
+      raisedBy: true,
+      raisedAt: true,
+      closedAt: true,
+      reopenComment: true,
+      createdAt: true,
+      updatedAt: true,
+      project: { select: { id: true, name: true, ownerId: true } },
+      task: { select: { id: true, title: true } },
+      owner: { select: { id: true, name: true, avatarUrl: true } },
+      raiser: { select: { id: true, name: true, avatarUrl: true } },
+      attachments: {
+        select: {
+          id: true,
+          fileName: true,
+          fileSize: true,
+          mimeType: true,
+          fileType: true,
+          createdAt: true
+        }
+      }
+    };
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const validSortFields = ["raisedAt", "severity", "state", "title"];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : "raisedAt";
+    const order = String(sortOrder).toLowerCase() === "asc" ? "asc" : "desc";
+    const orderBy = [{ [field]: order }];
+    if (isPaginated) {
+      const [total, issues2] = await Promise.all([
+        prisma.issue.count({ where }),
+        prisma.issue.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take
+        })
+      ]);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader("X-Total-Count", String(total));
+      return res.json({
+        issues: issues2,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
     const issues = await prisma.issue.findMany({
       where,
-      include: {
-        project: { select: { id: true, name: true, ownerId: true } },
-        task: { select: { id: true, title: true } },
-        owner: { select: { id: true, name: true, avatarUrl: true } },
-        raiser: { select: { id: true, name: true, avatarUrl: true } },
-        attachments: {
-          select: {
-            id: true,
-            fileName: true,
-            fileSize: true,
-            mimeType: true,
-            fileType: true,
-            createdAt: true
-          }
-        }
-      },
+      select: selectProjection,
       orderBy: { raisedAt: "desc" }
     });
+    res.setHeader("X-Total-Count", String(issues.length));
     res.json(issues);
   } catch (error) {
+    console.error("Failed to fetch issues:", error);
     res.status(500).json({ error: "Failed to fetch issues" });
   }
 });
@@ -4840,6 +5420,7 @@ var issues_default = router6;
 // server/routes/risks.ts
 init_prisma();
 import { Router as Router7 } from "express";
+init_authorizationService();
 var router7 = Router7();
 function checkRiskStale(risk) {
   const lastReviewed = new Date(risk.lastReviewedAt).getTime();
@@ -4851,57 +5432,167 @@ function checkRiskStale(risk) {
     mitigation: risk.mitigation && risk.mitigation.trim() ? risk.mitigation : "No mitigation recorded yet."
   };
 }
+router7.get("/summary", async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId, includeClosed } = req.query;
+    const where = {};
+    if (projectId && projectId !== "ALL") {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: "You do not have access to risks for this project." });
+      }
+      where.projectId = pId;
+    } else {
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
+      }
+    }
+    if (includeClosed !== "true") {
+      where.closedAt = null;
+    }
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1e3);
+    const [severityGroups, total, staleCount] = await Promise.all([
+      prisma.risk.groupBy({
+        by: ["severity"],
+        where,
+        _count: { id: true }
+      }),
+      prisma.risk.count({ where }),
+      prisma.risk.count({
+        where: {
+          ...where,
+          closedAt: null,
+          lastReviewedAt: { lt: thirtyDaysAgo }
+        }
+      })
+    ]);
+    const bySeverity = {
+      Low: 0,
+      Medium: 0,
+      High: 0
+    };
+    severityGroups.forEach((g) => {
+      bySeverity[g.severity] = g._count.id;
+    });
+    res.json({
+      total,
+      bySeverity,
+      highRiskCount: bySeverity["High"] || 0,
+      mediumRiskCount: bySeverity["Medium"] || 0,
+      lowRiskCount: bySeverity["Low"] || 0,
+      staleCount
+    });
+  } catch (error) {
+    console.error("Failed to get risks summary:", error);
+    res.status(500).json({ error: "Failed to retrieve risks summary" });
+  }
+});
 router7.get("/", async (req, res) => {
   try {
     const user = req.user;
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    const { projectId, severity, includeClosed } = req.query;
+    const ctx = await getUserHierarchyContext(user.id);
+    const {
+      projectId,
+      severity,
+      includeClosed,
+      search,
+      page,
+      limit,
+      sortBy = "severity",
+      sortOrder = "desc"
+    } = req.query;
     const where = {};
-    if (projectId) {
+    if (projectId && projectId !== "ALL") {
       const pId = String(projectId);
-      if (user.role !== "CEO") {
-        const isOwner = await prisma.project.findFirst({ where: { id: pId, ownerId: user.id } });
-        const isMember = await prisma.projectMembership.findUnique({
-          where: { projectId_userId: { projectId: pId, userId: user.id } }
-        });
-        const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-          where: { assigneeId: user.id, phase: { projectId: pId } }
-        });
-        if (!isOwner && !isMember && !hasTask) {
-          return res.status(403).json({ error: "You do not have access to risks for this project." });
-        }
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: "You do not have access to risks for this project." });
       }
       where.projectId = pId;
     } else {
-      if (user.role !== "CEO") {
-        where.project = {
-          OR: [
-            { ownerId: user.id },
-            { memberships: { some: { userId: user.id } } },
-            // Also include projects where employee has an assigned task (safety net)
-            { phases: { some: { tasks: { some: { assigneeId: user.id } } } } }
-          ]
-        };
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
       }
     }
-    if (severity) where.severity = String(severity);
+    if (severity && severity !== "ALL") {
+      where.severity = String(severity);
+    }
     if (includeClosed !== "true") {
       where.closedAt = null;
     }
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { description: { contains: term, mode: "insensitive" } },
+        { mitigation: { contains: term, mode: "insensitive" } },
+        { project: { name: { contains: term, mode: "insensitive" } } }
+      ];
+    }
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      taskId: true,
+      description: true,
+      severity: true,
+      mitigation: true,
+      ownerId: true,
+      lastReviewedAt: true,
+      closedAt: true,
+      createdAt: true,
+      updatedAt: true,
+      project: { select: { id: true, name: true, ownerId: true } },
+      task: { select: { id: true, title: true } },
+      owner: { select: { id: true, name: true, avatarUrl: true } }
+    };
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const validSortFields = ["severity", "lastReviewedAt", "createdAt"];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : "lastReviewedAt";
+    const order = String(sortOrder).toLowerCase() === "asc" ? "asc" : "desc";
+    const orderBy = [{ [field]: order }];
+    if (isPaginated) {
+      const [total, risks2] = await Promise.all([
+        prisma.risk.count({ where }),
+        prisma.risk.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take
+        })
+      ]);
+      const enriched2 = risks2.map(checkRiskStale);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader("X-Total-Count", String(total));
+      return res.json({
+        risks: enriched2,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
     const risks = await prisma.risk.findMany({
       where,
-      include: {
-        project: { select: { id: true, name: true, ownerId: true } },
-        task: { select: { id: true, title: true } },
-        owner: { select: { id: true, name: true, avatarUrl: true } }
-      },
+      select: selectProjection,
       orderBy: [{ severity: "desc" }, { lastReviewedAt: "desc" }]
     });
     const enriched = risks.map(checkRiskStale);
+    res.setHeader("X-Total-Count", String(enriched.length));
     res.json(enriched);
   } catch (error) {
+    console.error("Failed to fetch risks:", error);
     res.status(500).json({ error: "Failed to fetch risks" });
   }
 });
@@ -5174,7 +5865,453 @@ init_prisma();
 init_authorizationService();
 import { Router as Router9 } from "express";
 var router9 = Router9();
+var alertsCache = /* @__PURE__ */ new Map();
+var inflightAlerts = /* @__PURE__ */ new Map();
 router9.get("/", async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const now = Date.now();
+    const cached = alertsCache.get(user.id);
+    if (cached && cached.expiresAt > now) {
+      return res.json(cached.data);
+    }
+    if (inflightAlerts.has(user.id)) {
+      const data = await inflightAlerts.get(user.id);
+      return res.json(data);
+    }
+    const compilePromise = (async () => {
+      const ctx = await getUserHierarchyContext(user.id);
+      const visibleProjectIds = ctx.authorizedProjectIds;
+      const [
+        notifications,
+        pendingQualityChecks,
+        projects,
+        visibleWorkloadUserIds
+      ] = await Promise.all([
+        // 1. Direct Notifications for user
+        prisma.notification.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: "desc" },
+          take: 20
+        }),
+        // 2. Incomplete Mandatory Quality Checks for user
+        prisma.qualityCheck.findMany({
+          where: {
+            mandatory: true,
+            checkedAt: null,
+            task: {
+              assigneeId: user.id,
+              state: { not: "Completed" }
+            }
+          },
+          include: {
+            task: {
+              include: {
+                phase: { include: { project: { select: { id: true, name: true } } } }
+              }
+            }
+          }
+        }),
+        // 3. Consolidated projects query containing tasks, phases, issues, risks, and memberships
+        prisma.project.findMany({
+          where: { id: { in: visibleProjectIds } },
+          include: {
+            owner: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                avatarUrl: true
+              }
+            },
+            phases: {
+              orderBy: { order: "asc" },
+              include: {
+                tasks: {
+                  select: {
+                    id: true,
+                    title: true,
+                    state: true,
+                    priority: true,
+                    plannedHours: true,
+                    plannedStart: true,
+                    plannedEnd: true,
+                    assigneeId: true,
+                    hasRiskFlag: true,
+                    riskFlagReason: true,
+                    updatedAt: true,
+                    assignee: {
+                      select: {
+                        id: true,
+                        name: true,
+                        role: true,
+                        roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                        avatarUrl: true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            memberships: {
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                    role: true,
+                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                    avatarUrl: true,
+                    department: true
+                  }
+                }
+              }
+            },
+            issues: {
+              where: { state: { in: ["Open", "In progress"] } },
+              select: {
+                id: true,
+                severity: true,
+                title: true,
+                detail: true,
+                raisedAt: true
+              }
+            },
+            risks: {
+              where: { closedAt: null },
+              select: {
+                id: true,
+                severity: true,
+                description: true,
+                mitigation: true,
+                lastReviewedAt: true
+              }
+            }
+          },
+          orderBy: { name: "asc" }
+        }),
+        // 4. Determine visible workload user IDs
+        getVisibleWorkloadUserIds(ctx)
+      ]);
+      const criticalIssues = projects.flatMap(
+        (p) => p.issues.filter((i) => i.severity === "Critical").map((i) => ({ ...i, project: { id: p.id, name: p.name } }))
+      );
+      const highRisks = projects.flatMap(
+        (p) => p.risks.filter((r) => r.severity === "High").map((r) => ({ ...r, project: { id: p.id, name: p.name } }))
+      );
+      const allAuthorizedTasks = projects.flatMap(
+        (p) => p.phases.flatMap(
+          (ph) => ph.tasks.map((t) => ({
+            ...t,
+            phase: { project: { id: p.id, name: p.name } }
+          }))
+        )
+      );
+      const flaggedTasks = allAuthorizedTasks.filter(
+        (t) => t.hasRiskFlag && t.state !== "Completed"
+      );
+      const blockedTasks = allAuthorizedTasks.filter((t) => t.state === "Blocked");
+      const myTasks = allAuthorizedTasks.filter((t) => t.assigneeId === user.id && t.state !== "Completed").sort((a, b) => new Date(a.plannedEnd).getTime() - new Date(b.plannedEnd).getTime());
+      const alertItems = [];
+      for (const issue of criticalIssues) {
+        alertItems.push({
+          id: `issue-${issue.id}`,
+          category: "CRITICAL_ISSUE",
+          title: issue.title,
+          subtitle: `Critical issue open: ${issue.detail.slice(0, 90)}...`,
+          projectId: issue.project.id,
+          projectName: issue.project.name,
+          severity: "Critical",
+          timestamp: issue.raisedAt,
+          linkUrl: `/projects/${issue.project.id}?tab=issues&issue=${issue.id}`
+        });
+      }
+      for (const risk of highRisks) {
+        alertItems.push({
+          id: `risk-${risk.id}`,
+          category: "HIGH_RISK",
+          title: `High Risk: ${risk.description.slice(0, 60)}...`,
+          subtitle: `Mitigation: ${risk.mitigation || "No mitigation recorded yet."}`,
+          projectId: risk.project.id,
+          projectName: risk.project.name,
+          severity: "High",
+          timestamp: risk.lastReviewedAt,
+          linkUrl: `/projects/${risk.project.id}?tab=risks`
+        });
+      }
+      for (const task of flaggedTasks) {
+        alertItems.push({
+          id: `flag-${task.id}`,
+          category: "RISK_FLAG",
+          title: `Task Risk Flagged: ${task.title}`,
+          subtitle: task.riskFlagReason || "Execution risk noted by team",
+          projectId: task.phase.project.id,
+          projectName: task.phase.project.name,
+          severity: "High",
+          timestamp: task.updatedAt,
+          linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`
+        });
+      }
+      for (const task of blockedTasks) {
+        alertItems.push({
+          id: `blocked-${task.id}`,
+          category: "BLOCKED",
+          title: `Task Blocked: ${task.title}`,
+          subtitle: `Assigned to ${task.assignee?.name || "Unassigned"}`,
+          projectId: task.phase.project.id,
+          projectName: task.phase.project.name,
+          severity: "Critical",
+          timestamp: task.updatedAt,
+          linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`
+        });
+      }
+      for (const check of pendingQualityChecks) {
+        alertItems.push({
+          id: `qc-${check.id}`,
+          category: "QUALITY_CHECK",
+          title: `Mandatory Quality Check: ${check.label}`,
+          subtitle: `Required for completion of "${check.task.title}"`,
+          projectId: check.task.phase.project.id,
+          projectName: check.task.phase.project.name,
+          severity: "Normal",
+          timestamp: check.createdAt,
+          linkUrl: `/projects/${check.task.phase.project.id}?tab=tasks&task=${check.task.id}`
+        });
+      }
+      alertItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      let onTrackCount = 0;
+      let atRiskCount = 0;
+      let offTrackCount = 0;
+      const dashboardProjects = projects.map((p) => {
+        const allTasks = p.phases.flatMap((ph) => ph.tasks);
+        const progress = calculateProgress(
+          allTasks.map((t) => ({ state: t.state, plannedHours: t.plannedHours }))
+        );
+        const plan = calculatePlanPercentage(
+          p.startDate,
+          p.endDate,
+          p.phases.map((ph) => ({
+            plannedStart: ph.plannedStart,
+            plannedEnd: ph.plannedEnd,
+            order: ph.order
+          }))
+        );
+        const hasCritical = p.issues.some((i) => i.severity === "Critical");
+        const hasHighRisk = p.risks.some((r) => r.severity === "High");
+        const status = calculateProjectStatus({
+          progress,
+          plan,
+          hasCriticalIssueOpen: hasCritical,
+          hasHighRiskOpen: hasHighRisk,
+          statusOverride: p.statusOverride
+        });
+        if (status === "ON_TRACK") onTrackCount++;
+        else if (status === "AT_RISK") atRiskCount++;
+        else if (status === "OFF_TRACK") offTrackCount++;
+        const membersMap = /* @__PURE__ */ new Map();
+        if (p.owner) {
+          membersMap.set(p.owner.id, {
+            id: p.owner.id,
+            name: p.owner.name,
+            email: p.owner.email,
+            role: p.owner.roleDefinition?.name || p.owner.role,
+            roleRank: p.owner.roleDefinition?.rank ?? 2,
+            isExecutive: p.owner.roleDefinition?.isExecutive ?? false,
+            isIntern: p.owner.roleDefinition?.rank === 4 || p.owner.role === "Intern",
+            membershipType: "Project Owner",
+            avatarUrl: p.owner.avatarUrl,
+            assignedTasksCount: 0,
+            activeTasks: []
+          });
+        }
+        for (const m of p.memberships) {
+          if (!membersMap.has(m.user.id)) {
+            const rank = m.user.roleDefinition?.rank ?? (m.user.role === "Intern" ? 4 : 3);
+            membersMap.set(m.user.id, {
+              id: m.user.id,
+              name: m.user.name,
+              email: m.user.email,
+              role: m.user.roleDefinition?.name || m.user.role,
+              roleRank: rank,
+              isExecutive: m.user.roleDefinition?.isExecutive ?? false,
+              isIntern: rank === 4 || m.user.role === "Intern",
+              membershipType: m.role || "Member",
+              avatarUrl: m.user.avatarUrl,
+              department: m.user.department,
+              assignedTasksCount: 0,
+              activeTasks: []
+            });
+          }
+        }
+        for (const t of allTasks) {
+          if (t.assignee) {
+            if (!membersMap.has(t.assignee.id)) {
+              const rank = t.assignee.roleDefinition?.rank ?? (t.assignee.role === "Intern" ? 4 : 3);
+              membersMap.set(t.assignee.id, {
+                id: t.assignee.id,
+                name: t.assignee.name,
+                role: t.assignee.roleDefinition?.name || t.assignee.role,
+                roleRank: rank,
+                isExecutive: t.assignee.roleDefinition?.isExecutive ?? false,
+                isIntern: rank === 4 || t.assignee.role === "Intern",
+                membershipType: "Contributor",
+                avatarUrl: t.assignee.avatarUrl,
+                assignedTasksCount: 0,
+                activeTasks: []
+              });
+            }
+            const memberEntry = membersMap.get(t.assignee.id);
+            memberEntry.assignedTasksCount++;
+            if (t.state !== "Completed") {
+              memberEntry.activeTasks.push(t.title);
+            }
+          }
+        }
+        return {
+          id: p.id,
+          name: p.name,
+          goal: p.goal,
+          status,
+          progress,
+          plan,
+          owner: p.owner,
+          totalTasksCount: allTasks.length,
+          completedTasksCount: allTasks.filter((t) => t.state === "Completed").length,
+          activeTasksCount: allTasks.filter((t) => t.state !== "Completed").length,
+          members: Array.from(membersMap.values())
+        };
+      });
+      let scopedTasks = allAuthorizedTasks;
+      if (!ctx.isExecutive) {
+        if (ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0) {
+          const allowedAssigneeIds = /* @__PURE__ */ new Set([user.id, ...ctx.allSubordinateIds]);
+          scopedTasks = allAuthorizedTasks.filter(
+            (t) => !t.assigneeId || allowedAssigneeIds.has(t.assigneeId)
+          );
+        } else {
+          scopedTasks = allAuthorizedTasks.filter((t) => t.assigneeId === user.id);
+        }
+      }
+      const taskDistribution = {
+        total: scopedTasks.length,
+        completed: scopedTasks.filter((t) => t.state === "Completed").length,
+        inProgress: scopedTasks.filter((t) => t.state === "In progress").length,
+        blocked: scopedTasks.filter((t) => t.state === "Blocked").length,
+        notStarted: scopedTasks.filter((t) => t.state === "Not started").length
+      };
+      let subordinateTasks = [];
+      if (ctx.roleRank <= 2 && ctx.allSubordinateIds.length > 0) {
+        subordinateTasks = allAuthorizedTasks.filter((t) => t.assigneeId && ctx.allSubordinateIds.includes(t.assigneeId) && t.state !== "Completed").map((t) => ({
+          id: t.id,
+          title: t.title,
+          state: t.state,
+          priority: t.priority,
+          plannedEnd: t.plannedEnd,
+          plannedHours: t.plannedHours,
+          assignee: t.assignee
+        }));
+      }
+      const workloadAllocations = await prisma.allocation.findMany({
+        where: {
+          userId: { in: visibleWorkloadUserIds },
+          weekStartDate: /* @__PURE__ */ new Date("2026-09-14T00:00:00Z"),
+          ...ctx.isExecutive ? {} : { projectId: { in: visibleProjectIds } }
+        }
+      });
+      const userHoursMap = /* @__PURE__ */ new Map();
+      visibleWorkloadUserIds.forEach((id) => userHoursMap.set(id, 0));
+      workloadAllocations.forEach((a) => {
+        userHoursMap.set(a.userId, (userHoursMap.get(a.userId) || 0) + a.allocatedHours);
+      });
+      let overallocatedCount = 0;
+      let balancedCount = 0;
+      let availableCount = 0;
+      for (const hours of userHoursMap.values()) {
+        const metrics = calculateWorkload(hours, 37);
+        if (metrics.status === "OVER") overallocatedCount++;
+        else if (metrics.status === "BALANCED") balancedCount++;
+        else availableCount++;
+      }
+      const myAllocatedHours = userHoursMap.get(user.id) || 0;
+      const myWorkloadMetrics = calculateWorkload(myAllocatedHours, 37);
+      const groupedByProject = {};
+      for (const alert of alertItems) {
+        if (!groupedByProject[alert.projectId]) {
+          groupedByProject[alert.projectId] = {
+            projectName: alert.projectName,
+            alerts: []
+          };
+        }
+        groupedByProject[alert.projectId].alerts.push(alert);
+      }
+      return {
+        summary: {
+          criticalIssuesCount: criticalIssues.length,
+          highRisksCount: highRisks.length,
+          blockedTasksCount: blockedTasks.length,
+          myTasksCount: myTasks.length,
+          pendingQualityChecksCount: pendingQualityChecks.length,
+          totalProjectsCount: projects.length,
+          onTrackCount,
+          atRiskCount,
+          offTrackCount
+        },
+        dashboardScope: {
+          roleRank: ctx.roleRank,
+          isExecutive: ctx.isExecutive,
+          canManageUsers: ctx.canManageUsers,
+          isManager: ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0,
+          visibleProjectsCount: projects.length,
+          visibleTeamCount: visibleWorkloadUserIds.length
+        },
+        dashboardProjects,
+        taskDistribution,
+        subordinateTasks,
+        workloadMetrics: {
+          teamDistribution: ctx.isExecutive || ctx.roleRank <= 2 ? {
+            totalTeam: visibleWorkloadUserIds.length,
+            overallocatedCount,
+            balancedCount,
+            availableCount
+          } : null,
+          myWorkload: {
+            allocatedHours: myAllocatedHours,
+            referenceHours: 37,
+            percentage: myWorkloadMetrics.percentage,
+            status: myWorkloadMetrics.status,
+            statusLabel: myWorkloadMetrics.statusLabel
+          }
+        },
+        groupedByProject,
+        alerts: alertItems,
+        myTasks,
+        notifications
+      };
+    })();
+    inflightAlerts.set(user.id, compilePromise);
+    try {
+      const data = await compilePromise;
+      alertsCache.set(user.id, {
+        data,
+        expiresAt: Date.now() + 15e3
+        // 15s TTL
+      });
+      res.json(data);
+    } finally {
+      inflightAlerts.delete(user.id);
+    }
+  } catch (error) {
+    console.error("Failed to compile alerts:", error);
+    res.status(500).json({ error: "Failed to retrieve alerts" });
+  }
+});
+router9.get("/badges", async (req, res) => {
   try {
     const user = req.user;
     if (!user) {
@@ -5182,435 +6319,59 @@ router9.get("/", async (req, res) => {
     }
     const ctx = await getUserHierarchyContext(user.id);
     const visibleProjectIds = ctx.authorizedProjectIds;
-    const notifications = await prisma.notification.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: "desc" },
-      take: 20
-    });
-    const criticalIssues = await prisma.issue.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        severity: "Critical",
-        state: { not: "Closed" }
-      },
-      include: {
-        project: { select: { id: true, name: true } },
-        owner: { select: { id: true, name: true } },
-        raiser: { select: { id: true, name: true } }
-      },
-      orderBy: { raisedAt: "desc" }
-    });
-    const highRisks = await prisma.risk.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        severity: "High",
-        closedAt: null
-      },
-      include: {
-        project: { select: { id: true, name: true } }
-      },
-      orderBy: { lastReviewedAt: "desc" }
-    });
-    const flaggedTasks = await prisma.task.findMany({
-      where: {
-        hasRiskFlag: true,
-        phase: { projectId: { in: visibleProjectIds } },
-        state: { not: "Completed" }
-      },
-      include: {
-        phase: {
-          include: { project: { select: { id: true, name: true } } }
-        },
-        assignee: { select: { id: true, name: true } }
-      }
-    });
-    const blockedTasks = await prisma.task.findMany({
-      where: {
-        state: "Blocked",
-        phase: { projectId: { in: visibleProjectIds } }
-      },
-      include: {
-        phase: {
-          include: { project: { select: { id: true, name: true } } }
-        },
-        assignee: { select: { id: true, name: true } }
-      }
-    });
-    const myTasks = await prisma.task.findMany({
-      where: {
-        assigneeId: user.id,
-        state: { not: "Completed" }
-      },
-      include: {
-        phase: {
-          include: { project: { select: { id: true, name: true } } }
-        },
-        qualityChecks: true
-      },
-      orderBy: { plannedEnd: "asc" }
-    });
-    const pendingQualityChecks = await prisma.qualityCheck.findMany({
-      where: {
-        mandatory: true,
-        checkedAt: null,
-        task: {
-          assigneeId: user.id,
+    const [
+      criticalIssuesCount,
+      highRisksCount,
+      flaggedTasksCount,
+      blockedTasksCount,
+      pendingQualityChecksCount
+    ] = await Promise.all([
+      prisma.issue.count({
+        where: {
+          projectId: { in: visibleProjectIds },
+          severity: "Critical",
+          state: { not: "Closed" }
+        }
+      }),
+      prisma.risk.count({
+        where: {
+          projectId: { in: visibleProjectIds },
+          severity: "High",
+          closedAt: null
+        }
+      }),
+      prisma.task.count({
+        where: {
+          hasRiskFlag: true,
+          phase: { projectId: { in: visibleProjectIds } },
           state: { not: "Completed" }
         }
-      },
-      include: {
-        task: {
-          include: {
-            phase: { include: { project: { select: { id: true, name: true } } } }
+      }),
+      prisma.task.count({
+        where: {
+          state: "Blocked",
+          phase: { projectId: { in: visibleProjectIds } }
+        }
+      }),
+      prisma.qualityCheck.count({
+        where: {
+          mandatory: true,
+          checkedAt: null,
+          task: {
+            assigneeId: user.id,
+            state: { not: "Completed" }
           }
         }
-      }
-    });
-    const alertItems = [];
-    for (const issue of criticalIssues) {
-      alertItems.push({
-        id: `issue-${issue.id}`,
-        category: "CRITICAL_ISSUE",
-        title: issue.title,
-        subtitle: `Critical issue open: ${issue.detail.slice(0, 90)}...`,
-        projectId: issue.project.id,
-        projectName: issue.project.name,
-        severity: "Critical",
-        timestamp: issue.raisedAt,
-        linkUrl: `/projects/${issue.project.id}?tab=issues&issue=${issue.id}`
-      });
-    }
-    for (const risk of highRisks) {
-      alertItems.push({
-        id: `risk-${risk.id}`,
-        category: "HIGH_RISK",
-        title: `High Risk: ${risk.description.slice(0, 60)}...`,
-        subtitle: `Mitigation: ${risk.mitigation || "No mitigation recorded yet."}`,
-        projectId: risk.project.id,
-        projectName: risk.project.name,
-        severity: "High",
-        timestamp: risk.lastReviewedAt,
-        linkUrl: `/projects/${risk.project.id}?tab=risks`
-      });
-    }
-    for (const task of flaggedTasks) {
-      alertItems.push({
-        id: `flag-${task.id}`,
-        category: "RISK_FLAG",
-        title: `Task Risk Flagged: ${task.title}`,
-        subtitle: task.riskFlagReason || "Execution risk noted by team",
-        projectId: task.phase.project.id,
-        projectName: task.phase.project.name,
-        severity: "High",
-        timestamp: task.updatedAt,
-        linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`
-      });
-    }
-    for (const task of blockedTasks) {
-      alertItems.push({
-        id: `blocked-${task.id}`,
-        category: "BLOCKED",
-        title: `Task Blocked: ${task.title}`,
-        subtitle: `Assigned to ${task.assignee?.name || "Unassigned"}`,
-        projectId: task.phase.project.id,
-        projectName: task.phase.project.name,
-        severity: "Critical",
-        timestamp: task.updatedAt,
-        linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`
-      });
-    }
-    for (const check of pendingQualityChecks) {
-      alertItems.push({
-        id: `qc-${check.id}`,
-        category: "QUALITY_CHECK",
-        title: `Mandatory Quality Check: ${check.label}`,
-        subtitle: `Required for completion of "${check.task.title}"`,
-        projectId: check.task.phase.project.id,
-        projectName: check.task.phase.project.name,
-        severity: "Normal",
-        timestamp: check.createdAt,
-        linkUrl: `/projects/${check.task.phase.project.id}?tab=tasks&task=${check.task.id}`
-      });
-    }
-    alertItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    const projects = await prisma.project.findMany({
-      where: { id: { in: visibleProjectIds } },
-      include: {
-        owner: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            role: true,
-            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-            avatarUrl: true
-          }
-        },
-        phases: {
-          orderBy: { order: "asc" },
-          include: {
-            tasks: {
-              select: {
-                id: true,
-                title: true,
-                state: true,
-                priority: true,
-                plannedHours: true,
-                plannedStart: true,
-                plannedEnd: true,
-                assigneeId: true,
-                assignee: {
-                  select: {
-                    id: true,
-                    name: true,
-                    role: true,
-                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-                    avatarUrl: true
-                  }
-                }
-              }
-            }
-          }
-        },
-        memberships: {
-          include: {
-            user: {
-              select: {
-                id: true,
-                name: true,
-                email: true,
-                role: true,
-                roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-                avatarUrl: true,
-                department: true
-              }
-            }
-          }
-        },
-        issues: {
-          where: { state: { in: ["Open", "In progress"] } },
-          select: { id: true, severity: true }
-        },
-        risks: {
-          where: { closedAt: null },
-          select: { id: true, severity: true }
-        }
-      },
-      orderBy: { name: "asc" }
-    });
-    let onTrackCount = 0;
-    let atRiskCount = 0;
-    let offTrackCount = 0;
-    const dashboardProjects = projects.map((p) => {
-      const allTasks = p.phases.flatMap((ph) => ph.tasks);
-      const progress = calculateProgress(
-        allTasks.map((t) => ({ state: t.state, plannedHours: t.plannedHours }))
-      );
-      const plan = calculatePlanPercentage(
-        p.startDate,
-        p.endDate,
-        p.phases.map((ph) => ({
-          plannedStart: ph.plannedStart,
-          plannedEnd: ph.plannedEnd,
-          order: ph.order
-        }))
-      );
-      const hasCritical = p.issues.some((i) => i.severity === "Critical");
-      const hasHighRisk = p.risks.some((r) => r.severity === "High");
-      const status = calculateProjectStatus({
-        progress,
-        plan,
-        hasCriticalIssueOpen: hasCritical,
-        hasHighRiskOpen: hasHighRisk,
-        statusOverride: p.statusOverride
-      });
-      if (status === "ON_TRACK") onTrackCount++;
-      else if (status === "AT_RISK") atRiskCount++;
-      else if (status === "OFF_TRACK") offTrackCount++;
-      const membersMap = /* @__PURE__ */ new Map();
-      if (p.owner) {
-        membersMap.set(p.owner.id, {
-          id: p.owner.id,
-          name: p.owner.name,
-          email: p.owner.email,
-          role: p.owner.roleDefinition?.name || p.owner.role,
-          roleRank: p.owner.roleDefinition?.rank ?? 2,
-          isExecutive: p.owner.roleDefinition?.isExecutive ?? false,
-          isIntern: p.owner.roleDefinition?.rank === 4 || p.owner.role === "Intern",
-          membershipType: "Project Owner",
-          avatarUrl: p.owner.avatarUrl,
-          assignedTasksCount: 0,
-          activeTasks: []
-        });
-      }
-      for (const m of p.memberships) {
-        if (!membersMap.has(m.user.id)) {
-          const rank = m.user.roleDefinition?.rank ?? (m.user.role === "Intern" ? 4 : 3);
-          membersMap.set(m.user.id, {
-            id: m.user.id,
-            name: m.user.name,
-            email: m.user.email,
-            role: m.user.roleDefinition?.name || m.user.role,
-            roleRank: rank,
-            isExecutive: m.user.roleDefinition?.isExecutive ?? false,
-            isIntern: rank === 4 || m.user.role === "Intern",
-            membershipType: m.role || "Member",
-            avatarUrl: m.user.avatarUrl,
-            department: m.user.department,
-            assignedTasksCount: 0,
-            activeTasks: []
-          });
-        }
-      }
-      for (const t of allTasks) {
-        if (t.assignee) {
-          if (!membersMap.has(t.assignee.id)) {
-            const rank = t.assignee.roleDefinition?.rank ?? (t.assignee.role === "Intern" ? 4 : 3);
-            membersMap.set(t.assignee.id, {
-              id: t.assignee.id,
-              name: t.assignee.name,
-              role: t.assignee.roleDefinition?.name || t.assignee.role,
-              roleRank: rank,
-              isExecutive: t.assignee.roleDefinition?.isExecutive ?? false,
-              isIntern: rank === 4 || t.assignee.role === "Intern",
-              membershipType: "Contributor",
-              avatarUrl: t.assignee.avatarUrl,
-              assignedTasksCount: 0,
-              activeTasks: []
-            });
-          }
-          const memberEntry = membersMap.get(t.assignee.id);
-          memberEntry.assignedTasksCount++;
-          if (t.state !== "Completed") {
-            memberEntry.activeTasks.push(t.title);
-          }
-        }
-      }
-      return {
-        id: p.id,
-        name: p.name,
-        goal: p.goal,
-        status,
-        progress,
-        plan,
-        owner: p.owner,
-        totalTasksCount: allTasks.length,
-        completedTasksCount: allTasks.filter((t) => t.state === "Completed").length,
-        activeTasksCount: allTasks.filter((t) => t.state !== "Completed").length,
-        members: Array.from(membersMap.values())
-      };
-    });
-    const allAuthorizedTasks = projects.flatMap((p) => p.phases.flatMap((ph) => ph.tasks));
-    let scopedTasks = allAuthorizedTasks;
-    if (!ctx.isExecutive) {
-      if (ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0) {
-        const allowedAssigneeIds = /* @__PURE__ */ new Set([user.id, ...ctx.allSubordinateIds]);
-        scopedTasks = allAuthorizedTasks.filter(
-          (t) => !t.assigneeId || allowedAssigneeIds.has(t.assigneeId)
-        );
-      } else {
-        scopedTasks = allAuthorizedTasks.filter((t) => t.assigneeId === user.id);
-      }
-    }
-    const taskDistribution = {
-      total: scopedTasks.length,
-      completed: scopedTasks.filter((t) => t.state === "Completed").length,
-      inProgress: scopedTasks.filter((t) => t.state === "In progress").length,
-      blocked: scopedTasks.filter((t) => t.state === "Blocked").length,
-      notStarted: scopedTasks.filter((t) => t.state === "Not started").length
-    };
-    let subordinateTasks = [];
-    if (ctx.roleRank <= 2 && ctx.allSubordinateIds.length > 0) {
-      subordinateTasks = allAuthorizedTasks.filter((t) => t.assigneeId && ctx.allSubordinateIds.includes(t.assigneeId) && t.state !== "Completed").map((t) => ({
-        id: t.id,
-        title: t.title,
-        state: t.state,
-        priority: t.priority,
-        plannedEnd: t.plannedEnd,
-        plannedHours: t.plannedHours,
-        assignee: t.assignee
-      }));
-    }
-    const visibleWorkloadUserIds = await getVisibleWorkloadUserIds(ctx);
-    const workloadAllocations = await prisma.allocation.findMany({
-      where: {
-        userId: { in: visibleWorkloadUserIds },
-        weekStartDate: /* @__PURE__ */ new Date("2026-09-14T00:00:00Z"),
-        ...ctx.isExecutive ? {} : { projectId: { in: visibleProjectIds } }
-      }
-    });
-    const userHoursMap = /* @__PURE__ */ new Map();
-    visibleWorkloadUserIds.forEach((id) => userHoursMap.set(id, 0));
-    workloadAllocations.forEach((a) => {
-      userHoursMap.set(a.userId, (userHoursMap.get(a.userId) || 0) + a.allocatedHours);
-    });
-    let overallocatedCount = 0;
-    let balancedCount = 0;
-    let availableCount = 0;
-    for (const hours of userHoursMap.values()) {
-      const metrics = calculateWorkload(hours, 37);
-      if (metrics.status === "OVER") overallocatedCount++;
-      else if (metrics.status === "BALANCED") balancedCount++;
-      else availableCount++;
-    }
-    const myAllocatedHours = userHoursMap.get(user.id) || 0;
-    const myWorkloadMetrics = calculateWorkload(myAllocatedHours, 37);
-    const groupedByProject = {};
-    for (const alert of alertItems) {
-      if (!groupedByProject[alert.projectId]) {
-        groupedByProject[alert.projectId] = {
-          projectName: alert.projectName,
-          alerts: []
-        };
-      }
-      groupedByProject[alert.projectId].alerts.push(alert);
-    }
+      })
+    ]);
+    const alertsCount = criticalIssuesCount + highRisksCount + flaggedTasksCount + blockedTasksCount + pendingQualityChecksCount;
     res.json({
-      summary: {
-        criticalIssuesCount: criticalIssues.length,
-        highRisksCount: highRisks.length,
-        blockedTasksCount: blockedTasks.length,
-        myTasksCount: myTasks.length,
-        pendingQualityChecksCount: pendingQualityChecks.length,
-        totalProjectsCount: projects.length,
-        onTrackCount,
-        atRiskCount,
-        offTrackCount
-      },
-      dashboardScope: {
-        roleRank: ctx.roleRank,
-        isExecutive: ctx.isExecutive,
-        canManageUsers: ctx.canManageUsers,
-        isManager: ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0,
-        visibleProjectsCount: projects.length,
-        visibleTeamCount: visibleWorkloadUserIds.length
-      },
-      dashboardProjects,
-      taskDistribution,
-      subordinateTasks,
-      workloadMetrics: {
-        teamDistribution: ctx.isExecutive || ctx.roleRank <= 2 ? {
-          totalTeam: visibleWorkloadUserIds.length,
-          overallocatedCount,
-          balancedCount,
-          availableCount
-        } : null,
-        myWorkload: {
-          allocatedHours: myAllocatedHours,
-          referenceHours: 37,
-          percentage: myWorkloadMetrics.percentage,
-          status: myWorkloadMetrics.status,
-          statusLabel: myWorkloadMetrics.statusLabel
-        }
-      },
-      groupedByProject,
-      alerts: alertItems,
-      myTasks,
-      notifications
+      alertsBadge: alertsCount,
+      criticalIssuesBadge: criticalIssuesCount
     });
   } catch (error) {
-    console.error("Failed to compile alerts:", error);
-    res.status(500).json({ error: "Failed to retrieve alerts" });
+    console.error("Failed to get alert badges:", error);
+    res.status(500).json({ error: "Failed to retrieve alert badges" });
   }
 });
 router9.post("/notifications/:id/read", async (req, res) => {
@@ -5641,7 +6402,7 @@ init_prisma();
 import { Router as Router10 } from "express";
 init_authorizationService();
 var router10 = Router10();
-router10.get("/", requireAuth, async (req, res) => {
+router10.get("/summary", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
@@ -5653,46 +6414,191 @@ router10.get("/", requireAuth, async (req, res) => {
       weekDate = /* @__PURE__ */ new Date("2026-09-14T00:00:00Z");
     }
     const visibleUserIds = await getVisibleWorkloadUserIds(ctx);
-    const projectScopeFilter = ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } };
-    const users = await prisma.user.findMany({
-      where: {
-        id: { in: visibleUserIds },
-        isSignupCompleted: true
-      },
-      include: {
-        allocations: {
-          where: {
-            weekStartDate: weekDate,
-            ...ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
-          },
-          include: {
-            project: { select: { id: true, name: true } }
-          }
+    const weekStart = weekDate;
+    const weekEnd = new Date(weekDate.getTime() + 7 * 24 * 60 * 60 * 1e3 - 1);
+    const [users, approvedLeaves] = await Promise.all([
+      prisma.user.findMany({
+        where: {
+          id: { in: visibleUserIds },
+          isSignupCompleted: true
         },
-        tasks: {
-          where: {
-            state: { not: "Completed" },
-            ...ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
+        select: {
+          id: true,
+          allocations: {
+            where: {
+              weekStartDate: weekDate,
+              ...ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
+            },
+            select: {
+              allocatedHours: true
+            }
           },
-          include: {
-            phase: {
-              include: { project: { select: { id: true, name: true } } }
+          tasks: {
+            where: {
+              state: { not: "Completed" },
+              ...ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
+            },
+            select: {
+              id: true,
+              plannedStart: true,
+              plannedEnd: true
             }
           }
         }
+      }),
+      prisma.leaveRequest.findMany({
+        where: {
+          requestedBy: { in: visibleUserIds },
+          status: "Approved",
+          startDate: { lte: weekEnd },
+          endDate: { gte: weekStart }
+        },
+        select: {
+          id: true,
+          requestedBy: true,
+          dayType: true,
+          startDate: true,
+          endDate: true
+        }
+      })
+    ]);
+    let overallocatedCount = 0;
+    let balancedCount = 0;
+    let availableCount = 0;
+    let teamOnLeaveCount = 0;
+    let schedulingConflictsCount = 0;
+    for (const u of users) {
+      const userLeaves = approvedLeaves.filter((l) => l.requestedBy === u.id);
+      if (userLeaves.length > 0) teamOnLeaveCount++;
+      let leaveDeductionHours = 0;
+      for (const l of userLeaves) {
+        const lStart = Math.max(new Date(l.startDate).getTime(), weekStart.getTime());
+        const lEnd = Math.min(new Date(l.endDate).getTime(), weekEnd.getTime());
+        const days = Math.max(1, Math.round((lEnd - lStart) / (1e3 * 60 * 60 * 24)) + 1);
+        const dayHours = l.dayType === "Half day" ? 3.7 : 7.4;
+        leaveDeductionHours += days * dayHours;
+      }
+      leaveDeductionHours = Math.min(37, Math.round(leaveDeductionHours * 10) / 10);
+      const effectiveReferenceHours = Math.max(0, 37 - leaveDeductionHours);
+      const totalAllocatedHours = u.allocations.reduce((sum, a) => sum + a.allocatedHours, 0);
+      const metrics = calculateWorkload(totalAllocatedHours, effectiveReferenceHours > 0 ? effectiveReferenceHours : 1);
+      let status = metrics.status;
+      if (effectiveReferenceHours === 0) {
+        status = totalAllocatedHours > 0 ? "OVER" : "AVAILABLE";
+      }
+      if (status === "OVER") overallocatedCount++;
+      else if (status === "BALANCED") balancedCount++;
+      else availableCount++;
+      let hasConflict = false;
+      for (const t of u.tasks) {
+        for (const l of userLeaves) {
+          const tStart = t.plannedStart ? new Date(t.plannedStart).getTime() : weekStart.getTime();
+          const tEnd = t.plannedEnd ? new Date(t.plannedEnd).getTime() : weekEnd.getTime();
+          const lStart = new Date(l.startDate).getTime();
+          const lEnd = new Date(l.endDate).getTime();
+          if (tStart <= lEnd && tEnd >= lStart) {
+            hasConflict = true;
+            break;
+          }
+        }
+        if (hasConflict) break;
+      }
+      if (hasConflict) schedulingConflictsCount++;
+    }
+    res.json({
+      weekStartDate: weekDate.toISOString(),
+      summary: {
+        totalTeam: users.length,
+        overallocatedCount,
+        balancedCount,
+        availableCount,
+        teamOnLeaveCount,
+        schedulingConflictsCount
       },
-      orderBy: [{ role: "asc" }, { name: "asc" }]
-    });
-    const weekStart = weekDate;
-    const weekEnd = new Date(weekDate.getTime() + 7 * 24 * 60 * 60 * 1e3 - 1);
-    const approvedLeaves = await prisma.leaveRequest.findMany({
-      where: {
-        requestedBy: { in: visibleUserIds },
-        status: "Approved",
-        startDate: { lte: weekEnd },
-        endDate: { gte: weekStart }
+      scope: {
+        isExecutive: ctx.isExecutive,
+        subordinatesCount: ctx.allSubordinateIds.length,
+        visibleUserCount: users.length
       }
     });
+  } catch (error) {
+    console.error("Failed to calculate workload summary:", error);
+    res.status(500).json({ error: "Failed to retrieve workload summary" });
+  }
+});
+router10.get("/", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { weekStart: queryWeekStart, search, status: statusFilter } = req.query;
+    let weekDate;
+    if (queryWeekStart) {
+      weekDate = new Date(String(queryWeekStart));
+    } else {
+      weekDate = /* @__PURE__ */ new Date("2026-09-14T00:00:00Z");
+    }
+    const visibleUserIds = await getVisibleWorkloadUserIds(ctx);
+    const weekStart = weekDate;
+    const weekEnd = new Date(weekDate.getTime() + 7 * 24 * 60 * 60 * 1e3 - 1);
+    const [users, approvedLeaves] = await Promise.all([
+      prisma.user.findMany({
+        where: {
+          id: { in: visibleUserIds },
+          isSignupCompleted: true
+        },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          role: true,
+          department: true,
+          avatarUrl: true,
+          allocations: {
+            where: {
+              weekStartDate: weekDate,
+              ...ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
+            },
+            select: {
+              id: true,
+              allocatedHours: true,
+              projectId: true,
+              project: { select: { id: true, name: true } }
+            }
+          },
+          tasks: {
+            where: {
+              state: { not: "Completed" },
+              ...ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
+            },
+            select: {
+              id: true,
+              title: true,
+              plannedStart: true,
+              plannedEnd: true
+            }
+          }
+        },
+        orderBy: [{ role: "asc" }, { name: "asc" }]
+      }),
+      // Query APPROVED leaves for visible users during active week (pending requests are never treated as approved absences)
+      prisma.leaveRequest.findMany({
+        where: {
+          requestedBy: { in: visibleUserIds },
+          status: "Approved",
+          startDate: { lte: weekEnd },
+          endDate: { gte: weekStart }
+        },
+        select: {
+          id: true,
+          requestedBy: true,
+          leaveType: true,
+          dayType: true,
+          startDate: true,
+          endDate: true,
+          reason: true
+        }
+      })
+    ]);
     const workloadData = users.map((u) => {
       const userLeaves = approvedLeaves.filter((l) => l.requestedBy === u.id);
       let leaveDeductionHours = 0;
@@ -5772,7 +6678,28 @@ router10.get("/", requireAuth, async (req, res) => {
     const availableCount = workloadData.filter((w) => w.status === "AVAILABLE").length;
     const teamOnLeaveCount = workloadData.filter((w) => w.approvedLeaves.length > 0).length;
     const schedulingConflictsCount = workloadData.filter((w) => w.hasSchedulingConflict).length;
-    res.json({
+    let filteredWorkload = workloadData;
+    if (search && typeof search === "string" && search.trim()) {
+      const q = search.trim().toLowerCase();
+      filteredWorkload = filteredWorkload.filter(
+        (m) => m.user.name.toLowerCase().includes(q) || m.user.email.toLowerCase().includes(q) || m.user.department && m.user.department.toLowerCase().includes(q)
+      );
+    }
+    if (statusFilter && typeof statusFilter === "string" && statusFilter !== "ALL") {
+      const sf = statusFilter.toUpperCase();
+      if (sf === "ON_LEAVE") {
+        filteredWorkload = filteredWorkload.filter((m) => m.approvedLeaves.length > 0);
+      } else {
+        filteredWorkload = filteredWorkload.filter((m) => m.status === sf);
+      }
+    }
+    const totalCount = filteredWorkload.length;
+    res.setHeader("X-Total-Count", String(totalCount));
+    const isPaginated = req.query.page !== void 0 || req.query.limit !== void 0;
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.max(1, parseInt(String(req.query.limit || "10"), 10) || 10);
+    const paginatedItems = isPaginated ? filteredWorkload.slice((page - 1) * limit, page * limit) : filteredWorkload;
+    const responsePayload = {
       weekStartDate: weekDate.toISOString(),
       summary: {
         totalTeam: users.length,
@@ -5782,13 +6709,22 @@ router10.get("/", requireAuth, async (req, res) => {
         teamOnLeaveCount,
         schedulingConflictsCount
       },
-      workload: workloadData,
+      workload: paginatedItems,
       scope: {
         isExecutive: ctx.isExecutive,
         subordinatesCount: ctx.allSubordinateIds.length,
         visibleUserCount: users.length
       }
-    });
+    };
+    if (isPaginated) {
+      responsePayload.pagination = {
+        total: totalCount,
+        page,
+        limit,
+        totalPages: Math.ceil(totalCount / limit) || 1
+      };
+    }
+    res.json(responsePayload);
   } catch (error) {
     console.error("Failed to calculate workload:", error);
     res.status(500).json({ error: "Failed to retrieve workload data" });
@@ -5865,17 +6801,55 @@ var workload_default = router10;
 init_prisma();
 import { Router as Router11 } from "express";
 var router11 = Router11();
-router11.get("/", requireAuth, async (req, res) => {
+router11.get("/unread-count", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const notifications = await prisma.notification.findMany({
-      where: { userId },
-      orderBy: { createdAt: "desc" },
-      take: 50
-    });
     const unreadCount = await prisma.notification.count({
       where: { userId, isRead: false }
     });
+    res.json({ unreadCount });
+  } catch (error) {
+    console.error("Failed to get notification unread count:", error);
+    res.status(500).json({ error: "Failed to retrieve notification count" });
+  }
+});
+router11.get("/", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { page, limit, unreadOnly } = req.query;
+    const where = { userId };
+    if (unreadOnly === "true" || unreadOnly === "1") {
+      where.isRead = false;
+    }
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const [notifications, total, unreadCount] = await Promise.all([
+      prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        ...isPaginated ? { skip, take } : { take: 50 }
+      }),
+      prisma.notification.count({ where }),
+      prisma.notification.count({
+        where: { userId, isRead: false }
+      })
+    ]);
+    res.setHeader("X-Total-Count", String(total));
+    if (isPaginated) {
+      const totalPages = Math.ceil(total / take) || 1;
+      return res.json({
+        notifications,
+        unreadCount,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
     res.json({ notifications, unreadCount });
   } catch (error) {
     console.error("Failed to get notifications:", error);
@@ -5925,10 +6899,71 @@ init_prisma();
 import { Router as Router12 } from "express";
 init_authorizationService();
 var router12 = Router12();
+router12.get("/summary", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId } = req.query;
+    let whereClause = {};
+    if (projectId && projectId !== "ALL") {
+      whereClause.projectId = String(projectId);
+    } else if (!ctx.isExecutive) {
+      whereClause = {
+        OR: [
+          { approverId: user.id },
+          { requestedBy: user.id },
+          { projectId: { in: ctx.authorizedProjectIds } },
+          ...ctx.allSubordinateIds.length > 0 ? [{ requestedBy: { in: ctx.allSubordinateIds } }] : []
+        ]
+      };
+    }
+    const [stateGroups, actionableCount, total] = await Promise.all([
+      prisma.approvalRequest.groupBy({
+        by: ["state"],
+        where: whereClause,
+        _count: { id: true }
+      }),
+      prisma.approvalRequest.count({
+        where: {
+          ...whereClause,
+          approverId: user.id,
+          state: "Pending"
+        }
+      }),
+      prisma.approvalRequest.count({ where: whereClause })
+    ]);
+    const byState = {
+      Pending: 0,
+      Approved: 0,
+      Rejected: 0
+    };
+    stateGroups.forEach((g) => {
+      byState[g.state] = g._count.id;
+    });
+    res.json({
+      total,
+      pendingCount: byState["Pending"] || 0,
+      approvedCount: byState["Approved"] || 0,
+      rejectedCount: byState["Rejected"] || 0,
+      actionableCount
+    });
+  } catch (error) {
+    console.error("Failed to get approvals summary:", error);
+    res.status(500).json({ error: "Failed to retrieve approvals summary" });
+  }
+});
 router12.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
-    const filter = req.query.filter;
+    const {
+      filter,
+      // 'actionable' | 'all' | 'mine'
+      projectId,
+      type,
+      state,
+      page,
+      limit
+    } = req.query;
     const ctx = await getUserHierarchyContext(user.id);
     let whereClause = {};
     if (filter === "actionable") {
@@ -5947,15 +6982,68 @@ router12.get("/", requireAuth, async (req, res) => {
         ]
       };
     }
+    if (projectId && projectId !== "ALL") {
+      whereClause.projectId = String(projectId);
+    }
+    if (type && type !== "ALL") {
+      whereClause.type = String(type);
+    }
+    if (state && state !== "ALL") {
+      whereClause.state = String(state);
+    }
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      type: true,
+      summary: true,
+      detail: true,
+      impact: true,
+      requestedBy: true,
+      requestedAt: true,
+      approverId: true,
+      state: true,
+      decidedAt: true,
+      decisionNote: true,
+      payload: true,
+      version: true,
+      previousRequestId: true,
+      project: { select: { id: true, name: true, ownerId: true, sponsor: true } },
+      requester: { select: { id: true, name: true, role: true, avatarUrl: true } },
+      approver: { select: { id: true, name: true, role: true, avatarUrl: true } }
+    };
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    if (isPaginated) {
+      const [total, approvals2] = await Promise.all([
+        prisma.approvalRequest.count({ where: whereClause }),
+        prisma.approvalRequest.findMany({
+          where: whereClause,
+          select: selectProjection,
+          orderBy: { requestedAt: "desc" },
+          skip,
+          take
+        })
+      ]);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader("X-Total-Count", String(total));
+      return res.json({
+        approvals: approvals2,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
     const approvals = await prisma.approvalRequest.findMany({
       where: whereClause,
-      orderBy: { requestedAt: "desc" },
-      include: {
-        project: { select: { id: true, name: true, ownerId: true, sponsor: true } },
-        requester: { select: { id: true, name: true, role: true, avatarUrl: true } },
-        approver: { select: { id: true, name: true, role: true, avatarUrl: true } }
-      }
+      select: selectProjection,
+      orderBy: { requestedAt: "desc" }
     });
+    res.setHeader("X-Total-Count", String(approvals.length));
     res.json(approvals);
   } catch (error) {
     console.error("Failed to get approvals:", error);
@@ -5966,7 +7054,8 @@ router12.get("/project/:projectId", requireAuth, async (req, res) => {
   try {
     const { projectId } = req.params;
     const user = req.user;
-    if (user.role !== "CEO") {
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!ctx.isExecutive) {
       const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
       const isMember = await prisma.projectMembership.findUnique({
         where: { projectId_userId: { projectId, userId: user.id } }
@@ -6014,7 +7103,8 @@ router12.post("/", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO") {
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!ctx.isExecutive) {
       const isOwner = project.ownerId === user.id;
       const isMember = await prisma.projectMembership.findUnique({
         where: { projectId_userId: { projectId, userId: user.id } }
@@ -6157,7 +7247,7 @@ router12.post("/:id/decide", requireAuth, async (req, res) => {
             contingency: { increment: contingencyDelta }
           }
         });
-        changeLogDetails += ` (Planned Budget +\xA3${budgetDelta}, Contingency +\xA3${contingencyDelta})`;
+        changeLogDetails += ` (Planned Budget +${formatCurrency(budgetDelta)}, Contingency +${formatCurrency(contingencyDelta)})`;
       }
     } else if (approval.type === "Timeline") {
       if (payloadData.milestoneId && payloadData.newForecastDate) {
@@ -6668,7 +7758,7 @@ router15.post("/:id/budget/spend", requireAuth, async (req, res) => {
     }
     if (project.plannedBudget > 0 && newProjectSpend / project.plannedBudget >= 0.9) {
       const ceo = await prisma.user.findFirst({ where: { role: "CEO" } });
-      const alertMsg = `Project "${project.name}" spend (\xA3${newProjectSpend.toLocaleString()}) has reached ${Math.round(newProjectSpend / project.plannedBudget * 100)}% of planned budget (\xA3${project.plannedBudget.toLocaleString()}).`;
+      const alertMsg = `Project "${project.name}" spend (${formatCurrency(newProjectSpend)}) has reached ${Math.round(newProjectSpend / project.plannedBudget * 100)}% of planned budget (${formatCurrency(project.plannedBudget)}).`;
       await createNotification({
         userId: project.ownerId,
         projectId,
@@ -6694,12 +7784,12 @@ router15.post("/:id/budget/spend", requireAuth, async (req, res) => {
       data: {
         projectId,
         what: "Budget Spend Recorded",
-        fromValue: `\xA3${project.spendToDate}`,
-        toValue: `\xA3${newProjectSpend}`,
+        fromValue: formatCurrency(project.spendToDate),
+        toValue: formatCurrency(newProjectSpend),
         actorId: user.id,
         sourceType: "BUDGET",
         action: "SPEND_RECORDED",
-        details: `Spend of \xA3${spendDelta} recorded by ${user.name}${description ? ` (${description})` : ""}`,
+        details: `Spend of ${formatCurrency(spendDelta)} recorded by ${user.name}${description ? ` (${description})` : ""}`,
         changedBy: user.name
       }
     });
@@ -6716,7 +7806,7 @@ init_prisma();
 import { Router as Router16 } from "express";
 init_authorizationService();
 var router16 = Router16();
-router16.get(["/", "/ceo"], requireAuth, async (req, res) => {
+router16.get("/summary", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
@@ -6731,19 +7821,139 @@ router16.get(["/", "/ceo"], requireAuth, async (req, res) => {
     }
     const projects = await prisma.project.findMany({
       where,
+      select: {
+        id: true,
+        startDate: true,
+        endDate: true,
+        statusOverride: true,
+        plannedBudget: true,
+        contingency: true,
+        spendToDate: true,
+        phases: {
+          select: {
+            plannedStart: true,
+            plannedEnd: true,
+            order: true,
+            tasks: {
+              select: {
+                state: true,
+                plannedHours: true
+              }
+            }
+          }
+        },
+        issues: {
+          where: { state: { in: ["Open", "In progress"] } },
+          select: { severity: true }
+        },
+        risks: {
+          where: { closedAt: null },
+          select: { severity: true }
+        }
+      }
+    });
+    let totalBudget = 0;
+    let totalContingency = 0;
+    let totalSpend = 0;
+    let onTrackCount = 0;
+    let atRiskCount = 0;
+    let offTrackCount = 0;
+    let totalCriticalIssues = 0;
+    let totalHighRisks = 0;
+    projects.forEach((p) => {
+      const allTasks = p.phases.flatMap((ph) => ph.tasks);
+      const progress = calculateProgress(
+        allTasks.map((t) => ({ state: t.state, plannedHours: t.plannedHours }))
+      );
+      const plan = calculatePlanPercentage(
+        p.startDate,
+        p.endDate,
+        p.phases.map((ph) => ({
+          plannedStart: ph.plannedStart,
+          plannedEnd: ph.plannedEnd,
+          order: ph.order
+        }))
+      );
+      const hasCritical = p.issues.some((i) => i.severity === "Critical");
+      const hasHighRisk = p.risks.some((r) => r.severity === "High");
+      const status = calculateProjectStatus({
+        progress,
+        plan,
+        hasCriticalIssueOpen: hasCritical,
+        hasHighRiskOpen: hasHighRisk,
+        statusOverride: p.statusOverride
+      });
+      if (status === "ON_TRACK") onTrackCount++;
+      else if (status === "AT_RISK") atRiskCount++;
+      else if (status === "OFF_TRACK") offTrackCount++;
+      totalCriticalIssues += p.issues.filter((i) => i.severity === "Critical").length;
+      totalHighRisks += p.risks.filter((r) => r.severity === "High").length;
+      totalBudget += p.plannedBudget;
+      totalContingency += p.contingency;
+      totalSpend += p.spendToDate;
+    });
+    const totalPortfolioFunds = totalBudget + totalContingency;
+    const portfolioRemaining = Math.max(0, totalPortfolioFunds - totalSpend);
+    const overallSpendPercent = totalBudget > 0 ? Math.round(totalSpend / totalBudget * 1e3) / 10 : 0;
+    res.json({
+      kpis: {
+        totalProjects: projects.length,
+        onTrackCount,
+        atRiskCount,
+        offTrackCount,
+        totalBudget,
+        totalContingency,
+        totalPortfolioFunds,
+        totalSpend,
+        portfolioRemaining,
+        overallSpendPercent,
+        totalCriticalIssues,
+        totalHighRisks
+      }
+    });
+  } catch (error) {
+    console.error("Failed to get portfolio summary:", error);
+    res.status(500).json({ error: "Failed to retrieve portfolio summary" });
+  }
+});
+router16.get(["/", "/ceo"], requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { page, limit, filter } = req.query;
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({
+        error: "Forbidden: Portfolio dashboard is restricted to executive leadership and management."
+      });
+    }
+    const where = {};
+    if (!ctx.isExecutive) {
+      where.id = { in: ctx.authorizedProjectIds };
+    }
+    const projects = await prisma.project.findMany({
+      where,
       include: {
         owner: { select: { id: true, name: true, avatarUrl: true } },
         phases: {
-          include: {
-            tasks: true
+          select: {
+            plannedStart: true,
+            plannedEnd: true,
+            order: true,
+            tasks: {
+              select: {
+                state: true,
+                plannedHours: true
+              }
+            }
           }
         },
-        milestones: true,
         issues: {
-          where: { state: { in: ["Open", "In progress"] } }
+          where: { state: { in: ["Open", "In progress"] } },
+          select: { severity: true }
         },
         risks: {
-          where: { closedAt: null }
+          where: { closedAt: null },
+          select: { severity: true }
         }
       },
       orderBy: { name: "asc" }
@@ -6756,7 +7966,7 @@ router16.get(["/", "/ceo"], requireAuth, async (req, res) => {
     let offTrackCount = 0;
     let totalCriticalIssues = 0;
     let totalHighRisks = 0;
-    const projectSummaries = projects.map((p) => {
+    let projectSummaries = projects.map((p) => {
       const allTasks = p.phases.flatMap((ph) => ph.tasks);
       const progress = calculateProgress(
         allTasks.map((t) => ({ state: t.state, plannedHours: t.plannedHours }))
@@ -6820,9 +8030,52 @@ router16.get(["/", "/ceo"], requireAuth, async (req, res) => {
         openRisksCount: p.risks.length
       };
     });
+    if (filter && typeof filter === "string" && filter !== "ALL") {
+      projectSummaries = projectSummaries.filter((p) => {
+        if (filter === "ON_TRACK") return p.status === "ON_TRACK";
+        if (filter === "AT_RISK") return p.status === "AT_RISK";
+        if (filter === "OFF_TRACK") return p.status === "OFF_TRACK";
+        if (filter === "FINANCIAL_CONCERN") return p.isWarning90Percent || p.isOverBudget;
+        if (filter === "CRITICAL") return p.criticalIssuesCount > 0;
+        return true;
+      });
+    }
     const totalPortfolioFunds = totalBudget + totalContingency;
     const portfolioRemaining = Math.max(0, totalPortfolioFunds - totalSpend);
     const overallSpendPercent = totalBudget > 0 ? Math.round(totalSpend / totalBudget * 1e3) / 10 : 0;
+    const total = projectSummaries.length;
+    res.setHeader("X-Total-Count", String(total));
+    const isPaginated = page !== void 0 || limit !== void 0;
+    if (isPaginated) {
+      const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+      const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 20)) : 20;
+      const skip = (pageNum - 1) * take;
+      const paginatedProjects = projectSummaries.slice(skip, skip + take);
+      const totalPages = Math.ceil(total / take) || 1;
+      return res.json({
+        kpis: {
+          totalProjects: projects.length,
+          onTrackCount,
+          atRiskCount,
+          offTrackCount,
+          totalBudget,
+          totalContingency,
+          totalPortfolioFunds,
+          totalSpend,
+          portfolioRemaining,
+          overallSpendPercent,
+          totalCriticalIssues,
+          totalHighRisks
+        },
+        projects: paginatedProjects,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
     res.json({
       kpis: {
         totalProjects: projects.length,
@@ -6851,6 +8104,7 @@ var portfolio_default = router16;
 init_prisma();
 import { Router as Router17 } from "express";
 import multer2 from "multer";
+init_authorizationService();
 var router17 = Router17();
 var upload2 = multer2({
   storage: multer2.memoryStorage(),
@@ -6860,7 +8114,9 @@ var upload2 = multer2({
   }
 });
 async function canAccessDocuments(userId, userRole, projectId) {
-  if (userRole === "CEO") return true;
+  const ctx = await getUserHierarchyContext(userId);
+  if (ctx.isExecutive) return true;
+  if (canViewProject(ctx, projectId)) return true;
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     select: { ownerId: true }
@@ -6880,23 +8136,70 @@ router17.get("/projects/:id/documents", requireAuth, async (req, res) => {
   try {
     const { id: projectId } = req.params;
     const user = req.user;
+    const { search, page, limit } = req.query;
     const hasAccess = await canAccessDocuments(user.id, user.role, projectId);
     if (!hasAccess) {
       return res.status(403).json({ error: "You are not a member of this project and cannot access its documents." });
     }
-    const documents = await prisma.document.findMany({
-      where: { projectId },
-      orderBy: { updatedAt: "desc" },
-      include: {
-        uploader: { select: { id: true, name: true, role: true } },
-        versions: {
-          orderBy: { version: "desc" },
-          include: {
-            uploader: { select: { id: true, name: true } }
-          }
+    const where = { projectId };
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { title: { contains: term, mode: "insensitive" } },
+        { description: { contains: term, mode: "insensitive" } }
+      ];
+    }
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      title: true,
+      description: true,
+      fileType: true,
+      currentVersion: true,
+      uploadedBy: true,
+      createdAt: true,
+      updatedAt: true,
+      uploader: { select: { id: true, name: true, role: true } },
+      versions: {
+        orderBy: { version: "desc" },
+        include: {
+          uploader: { select: { id: true, name: true } }
         }
       }
+    };
+    if (isPaginated) {
+      const [total, documents2] = await Promise.all([
+        prisma.document.count({ where }),
+        prisma.document.findMany({
+          where,
+          orderBy: { updatedAt: "desc" },
+          select: selectProjection,
+          skip,
+          take
+        })
+      ]);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader("X-Total-Count", String(total));
+      return res.json({
+        documents: documents2,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
+    const documents = await prisma.document.findMany({
+      where,
+      orderBy: { updatedAt: "desc" },
+      select: selectProjection
     });
+    res.setHeader("X-Total-Count", String(documents.length));
     res.json(documents);
   } catch (error) {
     console.error("Failed to get documents:", error);
@@ -7082,28 +8385,104 @@ async function getCalendarEvents(user, startDate, endDate) {
   const ctx = await getUserHierarchyContext(user.id);
   const visibleProjectIds = ctx.authorizedProjectIds;
   const events = [];
-  const tasks = await prisma.task.findMany({
-    where: {
-      phase: {
-        projectId: { in: visibleProjectIds }
+  const [tasks, milestones, approvals, risks, issues, reminders] = await Promise.all([
+    // 1. Tasks (as date spans)
+    prisma.task.findMany({
+      where: {
+        phase: {
+          projectId: { in: visibleProjectIds }
+        },
+        OR: [
+          { plannedStart: { lte: endDate }, plannedEnd: { gte: startDate } }
+        ]
       },
-      OR: [
-        { plannedStart: { lte: endDate }, plannedEnd: { gte: startDate } }
-      ]
-    },
-    include: {
-      phase: {
-        include: {
-          project: {
-            select: { id: true, name: true }
+      include: {
+        phase: {
+          include: {
+            project: {
+              select: { id: true, name: true }
+            }
           }
+        },
+        assignee: {
+          select: { id: true, name: true, avatarUrl: true }
         }
-      },
-      assignee: {
-        select: { id: true, name: true, avatarUrl: true }
       }
-    }
-  });
+    }),
+    // 2. Milestones (single-day events)
+    prisma.milestone.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        OR: [
+          { baselineDate: { gte: startDate, lte: endDate } },
+          { forecastDate: { gte: startDate, lte: endDate } }
+        ]
+      },
+      include: {
+        project: {
+          select: { id: true, name: true }
+        }
+      }
+    }),
+    // 3. Approval Requests (single-day events)
+    prisma.approvalRequest.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        requestedAt: { gte: startDate, lte: endDate },
+        state: "Pending"
+      },
+      include: {
+        project: {
+          select: { id: true, name: true }
+        },
+        requester: {
+          select: { id: true, name: true }
+        }
+      }
+    }),
+    // 4. Risks (single-day events - last reviewed date)
+    prisma.risk.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        lastReviewedAt: { gte: startDate, lte: endDate },
+        closedAt: null
+        // Only open risks
+      },
+      include: {
+        project: {
+          select: { id: true, name: true }
+        },
+        owner: {
+          select: { id: true, name: true }
+        }
+      }
+    }),
+    // 5. Issues (single-day events - raised date)
+    prisma.issue.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        raisedAt: { gte: startDate, lte: endDate },
+        state: { not: "Closed" }
+        // Only open issues
+      },
+      include: {
+        project: {
+          select: { id: true, name: true }
+        },
+        owner: {
+          select: { id: true, name: true }
+        }
+      }
+    }),
+    // 6. Personal Reminders (single-day events)
+    prisma.reminder.findMany({
+      where: {
+        userId: user.id,
+        reminderDate: { gte: startDate, lte: endDate },
+        isCompleted: false
+      }
+    })
+  ]);
   for (const task of tasks) {
     events.push({
       id: `task-${task.id}`,
@@ -7125,20 +8504,6 @@ async function getCalendarEvents(user, startDate, endDate) {
       }
     });
   }
-  const milestones = await prisma.milestone.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      OR: [
-        { baselineDate: { gte: startDate, lte: endDate } },
-        { forecastDate: { gte: startDate, lte: endDate } }
-      ]
-    },
-    include: {
-      project: {
-        select: { id: true, name: true }
-      }
-    }
-  });
   for (const milestone of milestones) {
     events.push({
       id: `milestone-baseline-${milestone.id}`,
@@ -7172,21 +8537,6 @@ async function getCalendarEvents(user, startDate, endDate) {
       });
     }
   }
-  const approvals = await prisma.approvalRequest.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      requestedAt: { gte: startDate, lte: endDate },
-      state: "Pending"
-    },
-    include: {
-      project: {
-        select: { id: true, name: true }
-      },
-      requester: {
-        select: { id: true, name: true }
-      }
-    }
-  });
   for (const approval of approvals) {
     events.push({
       id: `approval-${approval.id}`,
@@ -7206,22 +8556,6 @@ async function getCalendarEvents(user, startDate, endDate) {
       }
     });
   }
-  const risks = await prisma.risk.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      lastReviewedAt: { gte: startDate, lte: endDate },
-      closedAt: null
-      // Only open risks
-    },
-    include: {
-      project: {
-        select: { id: true, name: true }
-      },
-      owner: {
-        select: { id: true, name: true }
-      }
-    }
-  });
   for (const risk of risks) {
     events.push({
       id: `risk-${risk.id}`,
@@ -7240,22 +8574,6 @@ async function getCalendarEvents(user, startDate, endDate) {
       }
     });
   }
-  const issues = await prisma.issue.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      raisedAt: { gte: startDate, lte: endDate },
-      state: { not: "Closed" }
-      // Only open issues
-    },
-    include: {
-      project: {
-        select: { id: true, name: true }
-      },
-      owner: {
-        select: { id: true, name: true }
-      }
-    }
-  });
   for (const issue of issues) {
     events.push({
       id: `issue-${issue.id}`,
@@ -7275,13 +8593,6 @@ async function getCalendarEvents(user, startDate, endDate) {
       }
     });
   }
-  const reminders = await prisma.reminder.findMany({
-    where: {
-      userId: user.id,
-      reminderDate: { gte: startDate, lte: endDate },
-      isCompleted: false
-    }
-  });
   for (const reminder of reminders) {
     events.push({
       id: `reminder-${reminder.id}`,
@@ -7423,34 +8734,121 @@ init_prisma();
 import { Router as Router19 } from "express";
 init_authorizationService();
 var router19 = Router19();
+router19.get("/summary", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({ error: "Forbidden: Insufficient privileges to view user summary metrics." });
+    }
+    const [totalUsers, activeUsers, pendingUsers, departmentGroups] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { isSignupCompleted: true } }),
+      prisma.user.count({ where: { isSignupCompleted: false } }),
+      prisma.user.groupBy({
+        by: ["department"],
+        _count: { id: true }
+      })
+    ]);
+    res.json({
+      totalUsers,
+      activeUsers,
+      pendingUsers,
+      departmentCounts: departmentGroups.map((d) => ({
+        department: d.department || "Unassigned",
+        count: d._count.id
+      }))
+    });
+  } catch (error) {
+    console.error("Failed to get user summary metrics:", error);
+    res.status(500).json({ error: "Failed to retrieve user summary metrics" });
+  }
+});
 router19.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
     const visibleIds = await getVisibleDirectoryUserIds(ctx);
-    const users = await prisma.user.findMany({
-      where: {
-        id: { in: visibleIds },
-        isSignupCompleted: true
+    const {
+      search,
+      department,
+      roleId,
+      page,
+      limit,
+      sortBy = "name",
+      sortOrder = "asc"
+    } = req.query;
+    const where = {
+      id: { in: visibleIds },
+      isSignupCompleted: true
+    };
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { name: { contains: term, mode: "insensitive" } },
+        { email: { contains: term, mode: "insensitive" } },
+        { department: { contains: term, mode: "insensitive" } }
+      ];
+    }
+    if (department && typeof department === "string" && department !== "ALL") {
+      where.department = department;
+    }
+    if (roleId && typeof roleId === "string" && roleId !== "ALL") {
+      where.roleId = roleId;
+    }
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const selectProjection = {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      roleId: true,
+      department: true,
+      avatarUrl: true,
+      managerId: true,
+      roleDefinition: {
+        select: { id: true, name: true, rank: true, isExecutive: true }
       },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        roleId: true,
-        department: true,
-        avatarUrl: true,
-        managerId: true,
-        roleDefinition: {
-          select: { id: true, name: true, rank: true, isExecutive: true }
-        },
-        manager: {
-          select: { id: true, name: true, role: true }
+      manager: {
+        select: { id: true, name: true, role: true }
+      }
+    };
+    const validSortFields = ["name", "email", "department", "role"];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : "name";
+    const order = String(sortOrder).toLowerCase() === "desc" ? "desc" : "asc";
+    const orderBy = [{ [field]: order }];
+    if (isPaginated) {
+      const [total, users2] = await Promise.all([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take
+        })
+      ]);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader("X-Total-Count", String(total));
+      return res.json({
+        users: users2,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
         }
-      },
+      });
+    }
+    const users = await prisma.user.findMany({
+      where,
+      select: selectProjection,
       orderBy: [{ role: "asc" }, { name: "asc" }]
     });
+    res.setHeader("X-Total-Count", String(users.length));
     res.json(users);
   } catch (error) {
     console.error("Failed to fetch users:", error);
@@ -7459,28 +8857,94 @@ router19.get("/", requireAuth, async (req, res) => {
 });
 router19.get("/management", requireAuth, requireCanManageUsers, async (req, res) => {
   try {
-    const users = await prisma.user.findMany({
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        roleId: true,
-        managerId: true,
-        department: true,
-        avatarUrl: true,
-        isSignupCompleted: true,
-        createdAt: true,
-        roleDefinition: {
-          select: { id: true, name: true, rank: true, isExecutive: true }
-        },
-        manager: {
-          select: { id: true, name: true, role: true }
-        }
+    const {
+      search,
+      status,
+      roleId,
+      department,
+      page,
+      limit,
+      sortBy = "name",
+      sortOrder = "asc"
+    } = req.query;
+    const where = {};
+    if (status === "pending") {
+      where.isSignupCompleted = false;
+    } else if (status === "completed") {
+      where.isSignupCompleted = true;
+    }
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { name: { contains: term, mode: "insensitive" } },
+        { email: { contains: term, mode: "insensitive" } },
+        { phone: { contains: term } },
+        { department: { contains: term, mode: "insensitive" } },
+        { role: { contains: term, mode: "insensitive" } }
+      ];
+    }
+    if (roleId && typeof roleId === "string" && roleId !== "ALL") {
+      where.roleId = roleId;
+    }
+    if (department && typeof department === "string" && department !== "ALL") {
+      where.department = department;
+    }
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const selectProjection = {
+      id: true,
+      name: true,
+      email: true,
+      phone: true,
+      role: true,
+      roleId: true,
+      managerId: true,
+      department: true,
+      avatarUrl: true,
+      isSignupCompleted: true,
+      createdAt: true,
+      roleDefinition: {
+        select: { id: true, name: true, rank: true, isExecutive: true }
       },
+      manager: {
+        select: { id: true, name: true, role: true }
+      }
+    };
+    const validSortFields = ["name", "email", "department", "role", "createdAt", "isSignupCompleted"];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : "name";
+    const order = String(sortOrder).toLowerCase() === "desc" ? "desc" : "asc";
+    const orderBy = [{ isSignupCompleted: "asc" }, { [field]: order }];
+    if (isPaginated) {
+      const [total, users2] = await Promise.all([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take
+        })
+      ]);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader("X-Total-Count", String(total));
+      return res.json({
+        users: users2,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
+    const users = await prisma.user.findMany({
+      where,
+      select: selectProjection,
       orderBy: [{ isSignupCompleted: "asc" }, { name: "asc" }]
     });
+    res.setHeader("X-Total-Count", String(users.length));
     res.json(users);
   } catch (error) {
     console.error("Failed to fetch user directory for management:", error);
@@ -8058,42 +9522,34 @@ router21.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
-    const { status, scope, startDate, endDate } = req.query;
-    let targetUserIds = [];
+    const { status, scope, startDate, endDate, search, page, limit } = req.query;
+    const where = {};
     if (scope === "mine") {
-      targetUserIds = [user.id];
+      where.requestedBy = user.id;
     } else if (scope === "subordinates" || scope === "pending_review") {
-      if (ctx.isExecutive) {
-        const allUsers = await prisma.user.findMany({ select: { id: true } });
-        targetUserIds = allUsers.map((u) => u.id);
-      } else if (ctx.allSubordinateIds.length > 0) {
-        targetUserIds = ctx.allSubordinateIds;
-      } else {
-        targetUserIds = [];
+      if (!ctx.isExecutive) {
+        if (ctx.allSubordinateIds.length > 0) {
+          where.requestedBy = { in: ctx.allSubordinateIds };
+        } else {
+          where.requestedBy = { in: [] };
+        }
       }
     } else if (scope === "team" || scope === "availability") {
-      if (ctx.isExecutive) {
-        const allUsers = await prisma.user.findMany({ select: { id: true } });
-        targetUserIds = allUsers.map((u) => u.id);
-      } else {
+      if (!ctx.isExecutive) {
         const sharedIds = await getSharedProjectUserIds(ctx);
         const subordinateSet = /* @__PURE__ */ new Set([user.id, ...ctx.allSubordinateIds, ...sharedIds]);
-        targetUserIds = Array.from(subordinateSet);
+        where.requestedBy = { in: Array.from(subordinateSet) };
       }
     } else {
-      if (ctx.isExecutive) {
-        const allUsers = await prisma.user.findMany({ select: { id: true } });
-        targetUserIds = allUsers.map((u) => u.id);
-      } else if (ctx.allSubordinateIds.length > 0) {
-        targetUserIds = [user.id, ...ctx.allSubordinateIds];
-      } else {
-        targetUserIds = [user.id];
+      if (!ctx.isExecutive) {
+        if (ctx.allSubordinateIds.length > 0) {
+          where.requestedBy = { in: [user.id, ...ctx.allSubordinateIds] };
+        } else {
+          where.requestedBy = user.id;
+        }
       }
     }
-    const where = {
-      requestedBy: { in: targetUserIds }
-    };
-    if (status && typeof status === "string") {
+    if (status && typeof status === "string" && status !== "ALL") {
       where.status = status;
     } else if (scope === "pending_review") {
       where.status = "Pending";
@@ -8102,30 +9558,60 @@ router21.get("/", requireAuth, async (req, res) => {
       if (startDate) where.endDate = { gte: new Date(String(startDate)) };
       if (endDate) where.startDate = { lte: new Date(String(endDate)) };
     }
-    const requests = await prisma.leaveRequest.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      include: {
-        requester: {
-          select: {
-            id: true,
-            name: true,
-            role: true,
-            department: true,
-            avatarUrl: true,
-            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
-          }
-        },
-        reviewer: {
-          select: {
-            id: true,
-            name: true,
-            role: true,
-            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
-          }
+    if (search && typeof search === "string" && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { reason: { contains: term, mode: "insensitive" } },
+        { leaveType: { contains: term, mode: "insensitive" } },
+        { requester: { name: { contains: term, mode: "insensitive" } } }
+      ];
+    }
+    const selectProjection = {
+      id: true,
+      requestedBy: true,
+      startDate: true,
+      endDate: true,
+      dayType: true,
+      leaveType: true,
+      reason: true,
+      status: true,
+      reviewedBy: true,
+      reviewedAt: true,
+      reviewNote: true,
+      createdAt: true,
+      updatedAt: true,
+      requester: {
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          department: true,
+          avatarUrl: true,
+          roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
+        }
+      },
+      reviewer: {
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } }
         }
       }
-    });
+    };
+    const isPaginated = page !== void 0 || limit !== void 0;
+    const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+    const [total, requests] = await Promise.all([
+      prisma.leaveRequest.count({ where }),
+      prisma.leaveRequest.findMany({
+        where,
+        select: selectProjection,
+        orderBy: { createdAt: "desc" },
+        ...isPaginated ? { skip, take } : {}
+      })
+    ]);
     const sanitizedRequests = requests.filter((reqItem) => {
       const isSelf = reqItem.requestedBy === ctx.userId;
       const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
@@ -8147,6 +9633,19 @@ router21.get("/", requireAuth, async (req, res) => {
       }
       return reqItem;
     });
+    res.setHeader("X-Total-Count", String(total));
+    if (isPaginated) {
+      const totalPages = Math.ceil(total / take) || 1;
+      return res.json({
+        leaveRequests: sanitizedRequests,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages
+        }
+      });
+    }
     res.json(sanitizedRequests);
   } catch (error) {
     console.error("Failed to get leave requests:", error);
@@ -8167,23 +9666,31 @@ router21.get("/summary", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
-    const myLeaves = await prisma.leaveRequest.findMany({
-      where: { requestedBy: user.id }
-    });
+    const now = /* @__PURE__ */ new Date();
+    const [myLeaves, teamLeavesData] = await Promise.all([
+      prisma.leaveRequest.findMany({
+        where: { requestedBy: user.id },
+        select: { status: true, startDate: true, endDate: true }
+      }),
+      ctx.isExecutive || ctx.allSubordinateIds.length > 0 ? (async () => {
+        const subordinateIds = ctx.isExecutive ? (await prisma.user.findMany({ select: { id: true } })).map((u) => u.id).filter((id) => id !== user.id) : ctx.allSubordinateIds;
+        const leaves = await prisma.leaveRequest.findMany({
+          where: { requestedBy: { in: subordinateIds } },
+          select: { status: true, startDate: true, endDate: true }
+        });
+        return { subordinateIds, leaves };
+      })() : Promise.resolve(null)
+    ]);
     const myApproved = myLeaves.filter((l) => l.status === "Approved");
     const myPending = myLeaves.filter((l) => l.status === "Pending");
-    const now = /* @__PURE__ */ new Date();
     const currentlyOnLeave = myApproved.some(
       (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
     );
     let teamSummary = null;
-    if (ctx.isExecutive || ctx.allSubordinateIds.length > 0) {
-      const subordinateIds = ctx.isExecutive ? (await prisma.user.findMany({ select: { id: true } })).map((u) => u.id).filter((id) => id !== user.id) : ctx.allSubordinateIds;
-      const teamLeaves = await prisma.leaveRequest.findMany({
-        where: { requestedBy: { in: subordinateIds } }
-      });
-      const teamPending = teamLeaves.filter((l) => l.status === "Pending");
-      const teamApproved = teamLeaves.filter((l) => l.status === "Approved");
+    if (teamLeavesData) {
+      const { subordinateIds, leaves } = teamLeavesData;
+      const teamPending = leaves.filter((l) => l.status === "Pending");
+      const teamApproved = leaves.filter((l) => l.status === "Approved");
       const teamCurrentlyOnLeave = teamApproved.filter(
         (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
       );

@@ -12,8 +12,162 @@ import {
 
 const router = Router();
 
-// GET /api/tasks - List tasks filtered by project and hierarchy authorization
+// Lean task select projections for optimal query performance
+const taskListSelect = {
+  id: true,
+  phaseId: true,
+  title: true,
+  assigneeId: true,
+  priority: true,
+  plannedStart: true,
+  plannedEnd: true,
+  plannedHours: true,
+  actualHours: true,
+  state: true,
+  dependsOn: true,
+  isBaselined: true,
+  hasRiskFlag: true,
+  riskFlagReason: true,
+  createdAt: true,
+  updatedAt: true,
+  assignee: {
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      avatarUrl: true,
+      role: true,
+      roleDefinition: {
+        select: { id: true, name: true, rank: true, isExecutive: true },
+      },
+    },
+  },
+  qualityChecks: {
+    select: {
+      id: true,
+      label: true,
+      mandatory: true,
+      checkedAt: true,
+      checkedBy: true,
+    },
+  },
+  phase: {
+    select: {
+      id: true,
+      name: true,
+      projectId: true,
+      project: { select: { id: true, name: true } },
+    },
+  },
+};
+
+// GET /api/tasks - List tasks filtered by project, search, state, priority, and hierarchy authorization
 router.get('/', async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId, phaseId, assigneeId, scope, state, priority, hasRiskFlag, search, sortBy, sortOrder } = req.query;
+
+    const where: any = {};
+    if (projectId) {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: 'Forbidden: You do not have access to this project.' });
+      }
+      where.phase = { projectId: pId };
+    } else if (!ctx.isExecutive) {
+      where.phase = { projectId: { in: ctx.authorizedProjectIds } };
+    }
+
+    if (phaseId) {
+      where.phaseId = String(phaseId);
+    }
+
+    if (scope === 'mine') {
+      where.assigneeId = user.id;
+    } else if (scope === 'subordinates') {
+      if (ctx.isExecutive) {
+        // Executive sees all subordinate tasks across organization
+      } else if (ctx.allSubordinateIds.length > 0) {
+        where.assigneeId = { in: ctx.allSubordinateIds };
+      } else {
+        where.assigneeId = '__none__';
+      }
+    } else if (assigneeId) {
+      where.assigneeId = String(assigneeId);
+    }
+
+    if (state && typeof state === 'string' && state !== 'ALL') {
+      where.state = state;
+    }
+
+    if (priority && typeof priority === 'string' && priority !== 'ALL') {
+      where.priority = priority;
+    }
+
+    if (hasRiskFlag !== undefined) {
+      where.hasRiskFlag = String(hasRiskFlag).toLowerCase() === 'true';
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { title: { contains: term, mode: 'insensitive' } },
+        { riskFlagReason: { contains: term, mode: 'insensitive' } },
+      ];
+    }
+
+    // Dynamic sorting
+    const validSortFields = ['plannedStart', 'plannedEnd', 'priority', 'state', 'title', 'plannedHours', 'actualHours', 'createdAt'];
+    const sortField = typeof sortBy === 'string' && validSortFields.includes(sortBy) ? sortBy : 'plannedStart';
+    const order = sortOrder === 'desc' ? 'desc' : 'asc';
+    const orderBy = { [sortField]: order };
+
+    // Server-side pagination
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limit = Math.max(1, parseInt(String(req.query.limit || '10'), 10) || 10);
+    const skip = isPaginated ? (page - 1) * limit : undefined;
+    const take = isPaginated ? limit : undefined;
+
+    const [tasks, totalCount] = await Promise.all([
+      prisma.task.findMany({
+        where,
+        select: taskListSelect,
+        orderBy,
+        skip,
+        take,
+      }),
+      prisma.task.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(totalCount));
+
+    if (isPaginated) {
+      return res.json({
+        tasks,
+        pagination: {
+          total: totalCount,
+          page,
+          limit,
+          totalPages: Math.ceil(totalCount / limit) || 1,
+        },
+      });
+    }
+
+    res.json(tasks);
+  } catch (error: any) {
+    console.error('Failed to fetch tasks:', error);
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
+});
+
+// GET /api/tasks/summary - Database aggregation summary for tasks
+router.get('/summary', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
     if (!user) {
@@ -48,34 +202,59 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       where.assigneeId = String(assigneeId);
     }
 
-    const tasks = await prisma.task.findMany({
-      where,
-      include: {
-        assignee: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            avatarUrl: true,
-            role: true,
-            roleDefinition: {
-              select: { id: true, name: true, rank: true, isExecutive: true },
-            },
-          },
+    const [stateGrouping, priorityGrouping, hoursAggregate, riskFlaggedCount, totalCount] = await Promise.all([
+      prisma.task.groupBy({
+        by: ['state'],
+        where,
+        _count: { id: true },
+      }),
+      prisma.task.groupBy({
+        by: ['priority'],
+        where,
+        _count: { id: true },
+      }),
+      prisma.task.aggregate({
+        where,
+        _sum: {
+          plannedHours: true,
+          actualHours: true,
         },
-        qualityChecks: true,
-        phase: { select: { id: true, name: true, projectId: true } },
-      },
-      orderBy: { plannedStart: 'asc' },
-    });
+      }),
+      prisma.task.count({
+        where: { ...where, hasRiskFlag: true },
+      }),
+      prisma.task.count({ where }),
+    ]);
 
-    res.json(tasks);
+    const byState = {
+      notStarted: stateGrouping.find((s) => s.state === 'Not started')?._count.id || 0,
+      inProgress: stateGrouping.find((s) => s.state === 'In progress')?._count.id || 0,
+      blocked: stateGrouping.find((s) => s.state === 'Blocked')?._count.id || 0,
+      completed: stateGrouping.find((s) => s.state === 'Completed')?._count.id || 0,
+    };
+
+    const byPriority = {
+      low: priorityGrouping.find((p) => p.priority === 'Low')?._count.id || 0,
+      normal: priorityGrouping.find((p) => p.priority === 'Normal')?._count.id || 0,
+      high: priorityGrouping.find((p) => p.priority === 'High')?._count.id || 0,
+    };
+
+    res.json({
+      total: totalCount,
+      byState,
+      byPriority,
+      plannedHoursTotal: hoursAggregate._sum.plannedHours || 0,
+      actualHoursTotal: hoursAggregate._sum.actualHours || 0,
+      riskFlaggedCount,
+      completionRate: totalCount > 0 ? Math.round((byState.completed / totalCount) * 100) : 0,
+    });
   } catch (error: any) {
-    res.status(500).json({ error: 'Failed to fetch tasks' });
+    console.error('Failed to fetch task summary:', error);
+    res.status(500).json({ error: 'Failed to fetch task summary' });
   }
 });
 
-// GET /api/tasks/:id - View task with checks and relations
+// GET /api/tasks/:id - View task with lean relations
 router.get('/:id', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -87,9 +266,28 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
 
     const task = await prisma.task.findUnique({
       where: { id: req.params.id },
-      include: {
+      select: {
+        id: true,
+        phaseId: true,
+        title: true,
+        assigneeId: true,
+        priority: true,
+        plannedStart: true,
+        plannedEnd: true,
+        plannedHours: true,
+        actualHours: true,
+        state: true,
+        dependsOn: true,
+        isBaselined: true,
+        hasRiskFlag: true,
+        riskFlagReason: true,
+        createdAt: true,
+        updatedAt: true,
         phase: {
-          include: {
+          select: {
+            id: true,
+            name: true,
+            projectId: true,
             project: {
               select: { id: true, name: true, ownerId: true },
             },
@@ -108,12 +306,35 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
           },
         },
         qualityChecks: {
-          include: {
+          select: {
+            id: true,
+            taskId: true,
+            label: true,
+            mandatory: true,
+            checkedAt: true,
+            checkedBy: true,
             checker: { select: { id: true, name: true } },
           },
         },
-        issues: true,
-        risks: true,
+        issues: {
+          select: {
+            id: true,
+            title: true,
+            severity: true,
+            state: true,
+            raisedBy: true,
+            closedAt: true,
+          },
+        },
+        risks: {
+          select: {
+            id: true,
+            description: true,
+            severity: true,
+            mitigation: true,
+            closedAt: true,
+          },
+        },
       },
     });
 

@@ -12,6 +12,21 @@ import {
 
 const router = Router();
 
+interface CachedAlerts {
+  data: any;
+  expiresAt: number;
+}
+const alertsCache = new Map<string, CachedAlerts>();
+const inflightAlerts = new Map<string, Promise<any>>();
+
+export function clearAlertsCache(userId?: string) {
+  if (userId) {
+    alertsCache.delete(userId);
+  } else {
+    alertsCache.clear();
+  }
+}
+
 // GET /api/alerts - Home screen attention engine
 router.get('/', async (req: AuthRequest, res: Response) => {
   try {
@@ -20,243 +35,57 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const ctx = await getUserHierarchyContext(user.id);
-    const visibleProjectIds = ctx.authorizedProjectIds;
+    const now = Date.now();
+    const cached = alertsCache.get(user.id);
+    if (cached && cached.expiresAt > now) {
+      return res.json(cached.data);
+    }
 
-    // 1. Direct Notifications for user
-    const notifications = await prisma.notification.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      take: 20,
-    });
+    if (inflightAlerts.has(user.id)) {
+      const data = await inflightAlerts.get(user.id)!;
+      return res.json(data);
+    }
 
-    // 2. Open Critical Issues on visible projects
-    const criticalIssues = await prisma.issue.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        severity: 'Critical',
-        state: { not: 'Closed' },
-      },
-      include: {
-        project: { select: { id: true, name: true } },
-        owner: { select: { id: true, name: true } },
-        raiser: { select: { id: true, name: true } },
-      },
-      orderBy: { raisedAt: 'desc' },
-    });
+    const compilePromise = (async () => {
+      const ctx = await getUserHierarchyContext(user.id);
+      const visibleProjectIds = ctx.authorizedProjectIds;
 
-    // 3. Open High Risks
-    const highRisks = await prisma.risk.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        severity: 'High',
-        closedAt: null,
-      },
-      include: {
-        project: { select: { id: true, name: true } },
-      },
-      orderBy: { lastReviewedAt: 'desc' },
-    });
-
-    // 4. Tasks with Risk Flags
-    const flaggedTasks = await prisma.task.findMany({
-      where: {
-        hasRiskFlag: true,
-        phase: { projectId: { in: visibleProjectIds } },
-        state: { not: 'Completed' },
-      },
-      include: {
-        phase: {
-          include: { project: { select: { id: true, name: true } } },
-        },
-        assignee: { select: { id: true, name: true } },
-      },
-    });
-
-    // 5. Blocked Tasks
-    const blockedTasks = await prisma.task.findMany({
-      where: {
-        state: 'Blocked',
-        phase: { projectId: { in: visibleProjectIds } },
-      },
-      include: {
-        phase: {
-          include: { project: { select: { id: true, name: true } } },
-        },
-        assignee: { select: { id: true, name: true } },
-      },
-    });
-
-    // 6. User's Assigned Tasks (in progress or not started)
-    const myTasks = await prisma.task.findMany({
-      where: {
-        assigneeId: user.id,
-        state: { not: 'Completed' },
-      },
-      include: {
-        phase: {
-          include: { project: { select: { id: true, name: true } } },
-        },
-        qualityChecks: true,
-      },
-      orderBy: { plannedEnd: 'asc' },
-    });
-
-    // 7. Incomplete Mandatory Quality Checks for user
-    const pendingQualityChecks = await prisma.qualityCheck.findMany({
-      where: {
-        mandatory: true,
-        checkedAt: null,
-        task: {
-          assigneeId: user.id,
-          state: { not: 'Completed' },
-        },
-      },
-      include: {
-        task: {
-          include: {
-            phase: { include: { project: { select: { id: true, name: true } } } },
+      // Concurrently fetch independent root data: notifications, pending quality checks, projects tree, and workload user IDs
+      const [
+        notifications,
+        pendingQualityChecks,
+        projects,
+        visibleWorkloadUserIds,
+      ] = await Promise.all([
+        // 1. Direct Notifications for user
+        prisma.notification.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        }),
+        // 2. Incomplete Mandatory Quality Checks for user
+        prisma.qualityCheck.findMany({
+          where: {
+            mandatory: true,
+            checkedAt: null,
+            task: {
+              assigneeId: user.id,
+              state: { not: 'Completed' },
+            },
           },
-        },
-      },
-    });
-
-    // Synthesize structured Alert Items
-    type AlertItem = {
-      id: string;
-      category: 'CRITICAL_ISSUE' | 'HIGH_RISK' | 'RISK_FLAG' | 'BLOCKED' | 'QUALITY_CHECK' | 'TASK' | 'NOTIFICATION';
-      title: string;
-      subtitle: string;
-      projectId: string;
-      projectName: string;
-      severity?: 'Critical' | 'High' | 'Normal';
-      timestamp: Date;
-      linkUrl: string;
-    };
-
-    const alertItems: AlertItem[] = [];
-
-    // Critical issues
-    for (const issue of criticalIssues) {
-      alertItems.push({
-        id: `issue-${issue.id}`,
-        category: 'CRITICAL_ISSUE',
-        title: issue.title,
-        subtitle: `Critical issue open: ${issue.detail.slice(0, 90)}...`,
-        projectId: issue.project.id,
-        projectName: issue.project.name,
-        severity: 'Critical',
-        timestamp: issue.raisedAt,
-        linkUrl: `/projects/${issue.project.id}?tab=issues&issue=${issue.id}`,
-      });
-    }
-
-    // High risks
-    for (const risk of highRisks) {
-      alertItems.push({
-        id: `risk-${risk.id}`,
-        category: 'HIGH_RISK',
-        title: `High Risk: ${risk.description.slice(0, 60)}...`,
-        subtitle: `Mitigation: ${risk.mitigation || 'No mitigation recorded yet.'}`,
-        projectId: risk.project.id,
-        projectName: risk.project.name,
-        severity: 'High',
-        timestamp: risk.lastReviewedAt,
-        linkUrl: `/projects/${risk.project.id}?tab=risks`,
-      });
-    }
-
-    // Flagged tasks
-    for (const task of flaggedTasks) {
-      alertItems.push({
-        id: `flag-${task.id}`,
-        category: 'RISK_FLAG',
-        title: `Task Risk Flagged: ${task.title}`,
-        subtitle: task.riskFlagReason || 'Execution risk noted by team',
-        projectId: task.phase.project.id,
-        projectName: task.phase.project.name,
-        severity: 'High',
-        timestamp: task.updatedAt,
-        linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`,
-      });
-    }
-
-    // Blocked tasks
-    for (const task of blockedTasks) {
-      alertItems.push({
-        id: `blocked-${task.id}`,
-        category: 'BLOCKED',
-        title: `Task Blocked: ${task.title}`,
-        subtitle: `Assigned to ${task.assignee?.name || 'Unassigned'}`,
-        projectId: task.phase.project.id,
-        projectName: task.phase.project.name,
-        severity: 'Critical',
-        timestamp: task.updatedAt,
-        linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`,
-      });
-    }
-
-    // Pending quality checks
-    for (const check of pendingQualityChecks) {
-      alertItems.push({
-        id: `qc-${check.id}`,
-        category: 'QUALITY_CHECK',
-        title: `Mandatory Quality Check: ${check.label}`,
-        subtitle: `Required for completion of "${check.task.title}"`,
-        projectId: check.task.phase.project.id,
-        projectName: check.task.phase.project.name,
-        severity: 'Normal',
-        timestamp: check.createdAt,
-        linkUrl: `/projects/${check.task.phase.project.id}?tab=tasks&task=${check.task.id}`,
-      });
-    }
-
-    // Sort newest first
-    alertItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-
-    // 8. Query projects within visible scope to compute dashboard analytics
-    const projects = await prisma.project.findMany({
-      where: { id: { in: visibleProjectIds } },
-      include: {
-        owner: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            role: true,
-            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-            avatarUrl: true,
-          },
-        },
-        phases: {
-          orderBy: { order: 'asc' },
           include: {
-            tasks: {
-              select: {
-                id: true,
-                title: true,
-                state: true,
-                priority: true,
-                plannedHours: true,
-                plannedStart: true,
-                plannedEnd: true,
-                assigneeId: true,
-                assignee: {
-                  select: {
-                    id: true,
-                    name: true,
-                    role: true,
-                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-                    avatarUrl: true,
-                  },
-                },
+            task: {
+              include: {
+                phase: { include: { project: { select: { id: true, name: true } } } },
               },
             },
           },
-        },
-        memberships: {
+        }),
+        // 3. Consolidated projects query containing tasks, phases, issues, risks, and memberships
+        prisma.project.findMany({
+          where: { id: { in: visibleProjectIds } },
           include: {
-            user: {
+            owner: {
               select: {
                 id: true,
                 name: true,
@@ -264,22 +93,203 @@ router.get('/', async (req: AuthRequest, res: Response) => {
                 role: true,
                 roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
                 avatarUrl: true,
-                department: true,
+              },
+            },
+            phases: {
+              orderBy: { order: 'asc' },
+              include: {
+                tasks: {
+                  select: {
+                    id: true,
+                    title: true,
+                    state: true,
+                    priority: true,
+                    plannedHours: true,
+                    plannedStart: true,
+                    plannedEnd: true,
+                    assigneeId: true,
+                    hasRiskFlag: true,
+                    riskFlagReason: true,
+                    updatedAt: true,
+                    assignee: {
+                      select: {
+                        id: true,
+                        name: true,
+                        role: true,
+                        roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                        avatarUrl: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            memberships: {
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                    role: true,
+                    roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+                    avatarUrl: true,
+                    department: true,
+                  },
+                },
+              },
+            },
+            issues: {
+              where: { state: { in: ['Open', 'In progress'] } },
+              select: {
+                id: true,
+                severity: true,
+                title: true,
+                detail: true,
+                raisedAt: true,
+              },
+            },
+            risks: {
+              where: { closedAt: null },
+              select: {
+                id: true,
+                severity: true,
+                description: true,
+                mitigation: true,
+                lastReviewedAt: true,
               },
             },
           },
-        },
-        issues: {
-          where: { state: { in: ['Open', 'In progress'] } },
-          select: { id: true, severity: true },
-        },
-        risks: {
-          where: { closedAt: null },
-          select: { id: true, severity: true },
-        },
-      },
-      orderBy: { name: 'asc' },
-    });
+          orderBy: { name: 'asc' },
+        }),
+        // 4. Determine visible workload user IDs
+        getVisibleWorkloadUserIds(ctx),
+      ]);
+
+      // Derive issues, risks, and tasks from the consolidated projects tree without redundant database round-trips
+      const criticalIssues = projects.flatMap((p) =>
+        p.issues
+          .filter((i) => i.severity === 'Critical')
+          .map((i) => ({ ...i, project: { id: p.id, name: p.name } }))
+      );
+
+      const highRisks = projects.flatMap((p) =>
+        p.risks
+          .filter((r) => r.severity === 'High')
+          .map((r) => ({ ...r, project: { id: p.id, name: p.name } }))
+      );
+
+      const allAuthorizedTasks = projects.flatMap((p) =>
+        p.phases.flatMap((ph) =>
+          ph.tasks.map((t) => ({
+            ...t,
+            phase: { project: { id: p.id, name: p.name } },
+          }))
+        )
+      );
+
+      const flaggedTasks = allAuthorizedTasks.filter(
+        (t) => t.hasRiskFlag && t.state !== 'Completed'
+      );
+
+      const blockedTasks = allAuthorizedTasks.filter((t) => t.state === 'Blocked');
+
+      const myTasks = allAuthorizedTasks
+        .filter((t) => t.assigneeId === user.id && t.state !== 'Completed')
+        .sort((a, b) => new Date(a.plannedEnd).getTime() - new Date(b.plannedEnd).getTime());
+
+      // Synthesize structured Alert Items
+      type AlertItem = {
+        id: string;
+        category: 'CRITICAL_ISSUE' | 'HIGH_RISK' | 'RISK_FLAG' | 'BLOCKED' | 'QUALITY_CHECK' | 'TASK' | 'NOTIFICATION';
+        title: string;
+        subtitle: string;
+        projectId: string;
+        projectName: string;
+        severity?: 'Critical' | 'High' | 'Normal';
+        timestamp: Date;
+        linkUrl: string;
+      };
+
+      const alertItems: AlertItem[] = [];
+
+      // Critical issues
+      for (const issue of criticalIssues) {
+        alertItems.push({
+          id: `issue-${issue.id}`,
+          category: 'CRITICAL_ISSUE',
+          title: issue.title,
+          subtitle: `Critical issue open: ${issue.detail.slice(0, 90)}...`,
+          projectId: issue.project.id,
+          projectName: issue.project.name,
+          severity: 'Critical',
+          timestamp: issue.raisedAt,
+          linkUrl: `/projects/${issue.project.id}?tab=issues&issue=${issue.id}`,
+        });
+      }
+
+      // High risks
+      for (const risk of highRisks) {
+        alertItems.push({
+          id: `risk-${risk.id}`,
+          category: 'HIGH_RISK',
+          title: `High Risk: ${risk.description.slice(0, 60)}...`,
+          subtitle: `Mitigation: ${risk.mitigation || 'No mitigation recorded yet.'}`,
+          projectId: risk.project.id,
+          projectName: risk.project.name,
+          severity: 'High',
+          timestamp: risk.lastReviewedAt,
+          linkUrl: `/projects/${risk.project.id}?tab=risks`,
+        });
+      }
+
+      // Flagged tasks
+      for (const task of flaggedTasks) {
+        alertItems.push({
+          id: `flag-${task.id}`,
+          category: 'RISK_FLAG',
+          title: `Task Risk Flagged: ${task.title}`,
+          subtitle: task.riskFlagReason || 'Execution risk noted by team',
+          projectId: task.phase.project.id,
+          projectName: task.phase.project.name,
+          severity: 'High',
+          timestamp: task.updatedAt,
+          linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`,
+        });
+      }
+
+      // Blocked tasks
+      for (const task of blockedTasks) {
+        alertItems.push({
+          id: `blocked-${task.id}`,
+          category: 'BLOCKED',
+          title: `Task Blocked: ${task.title}`,
+          subtitle: `Assigned to ${task.assignee?.name || 'Unassigned'}`,
+          projectId: task.phase.project.id,
+          projectName: task.phase.project.name,
+          severity: 'Critical',
+          timestamp: task.updatedAt,
+          linkUrl: `/projects/${task.phase.project.id}?tab=tasks&task=${task.id}`,
+        });
+      }
+
+      // Pending quality checks
+      for (const check of pendingQualityChecks) {
+        alertItems.push({
+          id: `qc-${check.id}`,
+          category: 'QUALITY_CHECK',
+          title: `Mandatory Quality Check: ${check.label}`,
+          subtitle: `Required for completion of "${check.task.title}"`,
+          projectId: check.task.phase.project.id,
+          projectName: check.task.phase.project.name,
+          severity: 'Normal',
+          timestamp: check.createdAt,
+          linkUrl: `/projects/${check.task.phase.project.id}?tab=tasks&task=${check.task.id}`,
+        });
+      }
+
+      // Sort newest first
+      alertItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
     let onTrackCount = 0;
     let atRiskCount = 0;
@@ -394,7 +404,6 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     });
 
     // 9. Compute task distribution scoped to hierarchy permissions
-    const allAuthorizedTasks = projects.flatMap((p) => p.phases.flatMap((ph) => ph.tasks));
     let scopedTasks = allAuthorizedTasks;
 
     if (!ctx.isExecutive) {
@@ -435,7 +444,6 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     }
 
     // 11. Workload summary calculation
-    const visibleWorkloadUserIds = await getVisibleWorkloadUserIds(ctx);
     const workloadAllocations = await prisma.allocation.findMany({
       where: {
         userId: { in: visibleWorkloadUserIds },
@@ -475,55 +483,142 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       groupedByProject[alert.projectId].alerts.push(alert);
     }
 
-    res.json({
-      summary: {
-        criticalIssuesCount: criticalIssues.length,
-        highRisksCount: highRisks.length,
-        blockedTasksCount: blockedTasks.length,
-        myTasksCount: myTasks.length,
-        pendingQualityChecksCount: pendingQualityChecks.length,
-        totalProjectsCount: projects.length,
-        onTrackCount,
-        atRiskCount,
-        offTrackCount,
-      },
-      dashboardScope: {
-        roleRank: ctx.roleRank,
-        isExecutive: ctx.isExecutive,
-        canManageUsers: ctx.canManageUsers,
-        isManager: ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0,
-        visibleProjectsCount: projects.length,
-        visibleTeamCount: visibleWorkloadUserIds.length,
-      },
-      dashboardProjects,
-      taskDistribution,
-      subordinateTasks,
-      workloadMetrics: {
-        teamDistribution:
-          ctx.isExecutive || ctx.roleRank <= 2
-            ? {
-                totalTeam: visibleWorkloadUserIds.length,
-                overallocatedCount,
-                balancedCount,
-                availableCount,
-              }
-            : null,
-        myWorkload: {
-          allocatedHours: myAllocatedHours,
-          referenceHours: 37,
-          percentage: myWorkloadMetrics.percentage,
-          status: myWorkloadMetrics.status,
-          statusLabel: myWorkloadMetrics.statusLabel,
+      return {
+        summary: {
+          criticalIssuesCount: criticalIssues.length,
+          highRisksCount: highRisks.length,
+          blockedTasksCount: blockedTasks.length,
+          myTasksCount: myTasks.length,
+          pendingQualityChecksCount: pendingQualityChecks.length,
+          totalProjectsCount: projects.length,
+          onTrackCount,
+          atRiskCount,
+          offTrackCount,
         },
-      },
-      groupedByProject,
-      alerts: alertItems,
-      myTasks,
-      notifications,
-    });
+        dashboardScope: {
+          roleRank: ctx.roleRank,
+          isExecutive: ctx.isExecutive,
+          canManageUsers: ctx.canManageUsers,
+          isManager: ctx.roleRank <= 2 || ctx.allSubordinateIds.length > 0,
+          visibleProjectsCount: projects.length,
+          visibleTeamCount: visibleWorkloadUserIds.length,
+        },
+        dashboardProjects,
+        taskDistribution,
+        subordinateTasks,
+        workloadMetrics: {
+          teamDistribution:
+            ctx.isExecutive || ctx.roleRank <= 2
+              ? {
+                  totalTeam: visibleWorkloadUserIds.length,
+                  overallocatedCount,
+                  balancedCount,
+                  availableCount,
+                }
+              : null,
+          myWorkload: {
+            allocatedHours: myAllocatedHours,
+            referenceHours: 37,
+            percentage: myWorkloadMetrics.percentage,
+            status: myWorkloadMetrics.status,
+            statusLabel: myWorkloadMetrics.statusLabel,
+          },
+        },
+        groupedByProject,
+        alerts: alertItems,
+        myTasks,
+        notifications,
+      };
+    })();
+
+    inflightAlerts.set(user.id, compilePromise);
+    try {
+      const data = await compilePromise;
+      alertsCache.set(user.id, {
+        data,
+        expiresAt: Date.now() + 15_000, // 15s TTL
+      });
+      res.json(data);
+    } finally {
+      inflightAlerts.delete(user.id);
+    }
   } catch (error: any) {
     console.error('Failed to compile alerts:', error);
     res.status(500).json({ error: 'Failed to retrieve alerts' });
+  }
+});
+
+// GET /api/alerts/badges - Lightweight count endpoint for navigation badges
+router.get('/badges', async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const visibleProjectIds = ctx.authorizedProjectIds;
+
+    const [
+      criticalIssuesCount,
+      highRisksCount,
+      flaggedTasksCount,
+      blockedTasksCount,
+      pendingQualityChecksCount,
+    ] = await Promise.all([
+      prisma.issue.count({
+        where: {
+          projectId: { in: visibleProjectIds },
+          severity: 'Critical',
+          state: { not: 'Closed' },
+        },
+      }),
+      prisma.risk.count({
+        where: {
+          projectId: { in: visibleProjectIds },
+          severity: 'High',
+          closedAt: null,
+        },
+      }),
+      prisma.task.count({
+        where: {
+          hasRiskFlag: true,
+          phase: { projectId: { in: visibleProjectIds } },
+          state: { not: 'Completed' },
+        },
+      }),
+      prisma.task.count({
+        where: {
+          state: 'Blocked',
+          phase: { projectId: { in: visibleProjectIds } },
+        },
+      }),
+      prisma.qualityCheck.count({
+        where: {
+          mandatory: true,
+          checkedAt: null,
+          task: {
+            assigneeId: user.id,
+            state: { not: 'Completed' },
+          },
+        },
+      }),
+    ]);
+
+    const alertsCount =
+      criticalIssuesCount +
+      highRisksCount +
+      flaggedTasksCount +
+      blockedTasksCount +
+      pendingQualityChecksCount;
+
+    res.json({
+      alertsBadge: alertsCount,
+      criticalIssuesBadge: criticalIssuesCount,
+    });
+  } catch (error: any) {
+    console.error('Failed to get alert badges:', error);
+    res.status(500).json({ error: 'Failed to retrieve alert badges' });
   }
 });
 

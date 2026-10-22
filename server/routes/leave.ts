@@ -28,47 +28,38 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
     const ctx = await getUserHierarchyContext(user.id);
-    const { status, scope, startDate, endDate } = req.query;
+    const { status, scope, startDate, endDate, search, page, limit } = req.query;
 
-    let targetUserIds: string[] = [];
+    const where: Prisma.LeaveRequestWhereInput = {};
 
     if (scope === 'mine') {
-      targetUserIds = [user.id];
+      where.requestedBy = user.id;
     } else if (scope === 'subordinates' || scope === 'pending_review') {
-      if (ctx.isExecutive) {
-        const allUsers = await prisma.user.findMany({ select: { id: true } });
-        targetUserIds = allUsers.map((u) => u.id);
-      } else if (ctx.allSubordinateIds.length > 0) {
-        targetUserIds = ctx.allSubordinateIds;
-      } else {
-        targetUserIds = [];
+      if (!ctx.isExecutive) {
+        if (ctx.allSubordinateIds.length > 0) {
+          where.requestedBy = { in: ctx.allSubordinateIds };
+        } else {
+          where.requestedBy = { in: [] };
+        }
       }
     } else if (scope === 'team' || scope === 'availability') {
-      if (ctx.isExecutive) {
-        const allUsers = await prisma.user.findMany({ select: { id: true } });
-        targetUserIds = allUsers.map((u) => u.id);
-      } else {
+      if (!ctx.isExecutive) {
         const sharedIds = await getSharedProjectUserIds(ctx);
         const subordinateSet = new Set([user.id, ...ctx.allSubordinateIds, ...sharedIds]);
-        targetUserIds = Array.from(subordinateSet);
+        where.requestedBy = { in: Array.from(subordinateSet) };
       }
     } else {
       // Default:
-      if (ctx.isExecutive) {
-        const allUsers = await prisma.user.findMany({ select: { id: true } });
-        targetUserIds = allUsers.map((u) => u.id);
-      } else if (ctx.allSubordinateIds.length > 0) {
-        targetUserIds = [user.id, ...ctx.allSubordinateIds];
-      } else {
-        targetUserIds = [user.id];
+      if (!ctx.isExecutive) {
+        if (ctx.allSubordinateIds.length > 0) {
+          where.requestedBy = { in: [user.id, ...ctx.allSubordinateIds] };
+        } else {
+          where.requestedBy = user.id;
+        }
       }
     }
 
-    const where: Prisma.LeaveRequestWhereInput = {
-      requestedBy: { in: targetUserIds },
-    };
-
-    if (status && typeof status === 'string') {
+    if (status && typeof status === 'string' && status !== 'ALL') {
       where.status = status;
     } else if (scope === 'pending_review') {
       where.status = 'Pending';
@@ -79,30 +70,63 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       if (endDate) where.startDate = { lte: new Date(String(endDate)) };
     }
 
-    const requests = await prisma.leaveRequest.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      include: {
-        requester: {
-          select: {
-            id: true,
-            name: true,
-            role: true,
-            department: true,
-            avatarUrl: true,
-            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-          },
-        },
-        reviewer: {
-          select: {
-            id: true,
-            name: true,
-            role: true,
-            roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
-          },
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { reason: { contains: term, mode: 'insensitive' } },
+        { leaveType: { contains: term, mode: 'insensitive' } },
+        { requester: { name: { contains: term, mode: 'insensitive' } } },
+      ];
+    }
+
+    const selectProjection = {
+      id: true,
+      requestedBy: true,
+      startDate: true,
+      endDate: true,
+      dayType: true,
+      leaveType: true,
+      reason: true,
+      status: true,
+      reviewedBy: true,
+      reviewedAt: true,
+      reviewNote: true,
+      createdAt: true,
+      updatedAt: true,
+      requester: {
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          department: true,
+          avatarUrl: true,
+          roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
         },
       },
-    });
+      reviewer: {
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          roleDefinition: { select: { id: true, name: true, rank: true, isExecutive: true } },
+        },
+      },
+    };
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    const [total, requests] = await Promise.all([
+      prisma.leaveRequest.count({ where }),
+      prisma.leaveRequest.findMany({
+        where,
+        select: selectProjection,
+        orderBy: { createdAt: 'desc' },
+        ...(isPaginated ? { skip, take } : {}),
+      }),
+    ]);
 
     // PRIVACY ENFORCEMENT:
     // If request belongs to a colleague who is NOT a subordinate and user is NOT an executive:
@@ -133,6 +157,21 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
         return reqItem;
       });
 
+    res.setHeader('X-Total-Count', String(total));
+
+    if (isPaginated) {
+      const totalPages = Math.ceil(total / take) || 1;
+      return res.json({
+        leaveRequests: sanitizedRequests,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
+
     res.json(sanitizedRequests);
   } catch (error) {
     console.error('Failed to get leave requests:', error);
@@ -160,31 +199,40 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
     const user = req.user!;
     const ctx = await getUserHierarchyContext(user.id);
 
-    const myLeaves = await prisma.leaveRequest.findMany({
-      where: { requestedBy: user.id },
-    });
+    const now = new Date();
+
+    const [myLeaves, teamLeavesData] = await Promise.all([
+      prisma.leaveRequest.findMany({
+        where: { requestedBy: user.id },
+        select: { status: true, startDate: true, endDate: true },
+      }),
+      (ctx.isExecutive || ctx.allSubordinateIds.length > 0)
+        ? (async () => {
+            const subordinateIds = ctx.isExecutive
+              ? (await prisma.user.findMany({ select: { id: true } })).map((u) => u.id).filter((id) => id !== user.id)
+              : ctx.allSubordinateIds;
+
+            const leaves = await prisma.leaveRequest.findMany({
+              where: { requestedBy: { in: subordinateIds } },
+              select: { status: true, startDate: true, endDate: true },
+            });
+
+            return { subordinateIds, leaves };
+          })()
+        : Promise.resolve(null),
+    ]);
 
     const myApproved = myLeaves.filter((l) => l.status === 'Approved');
     const myPending = myLeaves.filter((l) => l.status === 'Pending');
-
-    const now = new Date();
     const currentlyOnLeave = myApproved.some(
       (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
     );
 
     let teamSummary: any = null;
-
-    if (ctx.isExecutive || ctx.allSubordinateIds.length > 0) {
-      const subordinateIds = ctx.isExecutive
-        ? (await prisma.user.findMany({ select: { id: true } })).map((u) => u.id).filter((id) => id !== user.id)
-        : ctx.allSubordinateIds;
-
-      const teamLeaves = await prisma.leaveRequest.findMany({
-        where: { requestedBy: { in: subordinateIds } },
-      });
-
-      const teamPending = teamLeaves.filter((l) => l.status === 'Pending');
-      const teamApproved = teamLeaves.filter((l) => l.status === 'Approved');
+    if (teamLeavesData) {
+      const { subordinateIds, leaves } = teamLeavesData;
+      const teamPending = leaves.filter((l) => l.status === 'Pending');
+      const teamApproved = leaves.filter((l) => l.status === 'Approved');
       const teamCurrentlyOnLeave = teamApproved.filter(
         (l) => new Date(l.startDate) <= now && new Date(l.endDate) >= now
       );

@@ -15,6 +15,25 @@ export interface UserHierarchyContext {
   authorizedProjectIds: string[];
 }
 
+interface CachedHierarchyContext {
+  context: UserHierarchyContext;
+  expiresAt: number;
+}
+
+const hierarchyCache = new Map<string, CachedHierarchyContext>();
+const inflightHierarchyPromises = new Map<string, Promise<UserHierarchyContext>>();
+const HIERARCHY_CACHE_TTL_MS = 30_000; // 30 seconds TTL
+
+export function clearUserHierarchyCache(userId?: string): void {
+  if (userId) {
+    hierarchyCache.delete(userId);
+    inflightHierarchyPromises.delete(userId);
+  } else {
+    hierarchyCache.clear();
+    inflightHierarchyPromises.clear();
+  }
+}
+
 /**
  * Resolves full hierarchy context for a user, including:
  * - Configured role rank & capabilities
@@ -22,139 +41,163 @@ export interface UserHierarchyContext {
  * - Authorized project scope
  */
 export async function getUserHierarchyContext(userId: string): Promise<UserHierarchyContext> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    include: {
-      roleDefinition: true,
-      memberships: { select: { projectId: true } },
-    },
-  });
-
-  if (!user) {
-    throw new Error(`User not found: ${userId}`);
+  const now = Date.now();
+  const cached = hierarchyCache.get(userId);
+  if (cached && cached.expiresAt > now) {
+    return cached.context;
   }
 
-  // 1. Resolve role and capabilities
-  let roleName = user.role;
-  let roleRank = 999;
-  let isExecutive = false;
-  let canManageUsers = false;
-
-  if (user.roleDefinition && user.roleDefinition.isActive) {
-    roleName = user.roleDefinition.name;
-    roleRank = user.roleDefinition.rank;
-    isExecutive = user.roleDefinition.isExecutive;
-    canManageUsers = user.roleDefinition.canManageUsers;
-  } else {
-    // Fallback: look up Role by user.role string name
-    const matchedRole = await prisma.role.findFirst({
-      where: { name: user.role, isActive: true },
-    });
-    if (matchedRole) {
-      roleName = matchedRole.name;
-      roleRank = matchedRole.rank;
-      isExecutive = matchedRole.isExecutive;
-      canManageUsers = matchedRole.canManageUsers;
-    } else if (user.role === 'CEO') {
-      roleRank = 1;
-      isExecutive = true;
-      canManageUsers = true;
-    } else if (user.role === 'CTO' || user.role === 'ProjectOwner') {
-      roleRank = 2;
-    } else {
-      roleRank = 3;
-    }
+  // Deduplicate concurrent inflight queries for the same userId
+  const existingPromise = inflightHierarchyPromises.get(userId);
+  if (existingPromise) {
+    return existingPromise;
   }
 
-  // 2. Resolve reporting lines (direct and recursive subordinates)
-  const directSubordinates = await prisma.user.findMany({
-    where: { managerId: user.id },
-    include: { roleDefinition: true },
-  });
+  const queryPromise = (async () => {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        include: {
+          roleDefinition: true,
+          memberships: { select: { projectId: true } },
+        },
+      });
 
-  const directSubordinateIds: string[] = [];
-  const allSubordinateIds: string[] = [];
-  const visited = new Set<string>([user.id]);
+      if (!user) {
+        throw new Error(`User not found: ${userId}`);
+      }
 
-  const queue: { id: string; roleRank: number }[] = [];
+      // 1. Resolve role and capabilities
+      let roleName = user.role;
+      let roleRank = 999;
+      let isExecutive = false;
+      let canManageUsers = false;
 
-  for (const sub of directSubordinates) {
-    const subRank = sub.roleDefinition?.rank ?? (sub.role === 'Intern' ? 4 : sub.role === 'Employee' ? 3 : 2);
-    // Organizational rule: subordinates must be below the manager's rank in configured hierarchy
-    if (isExecutive || subRank > roleRank) {
-      directSubordinateIds.push(sub.id);
-      allSubordinateIds.push(sub.id);
-      visited.add(sub.id);
-      queue.push({ id: sub.id, roleRank: subRank });
-    }
-  }
+      if (user.roleDefinition && user.roleDefinition.isActive) {
+        roleName = user.roleDefinition.name;
+        roleRank = user.roleDefinition.rank;
+        isExecutive = user.roleDefinition.isExecutive;
+        canManageUsers = user.roleDefinition.canManageUsers;
+      } else {
+        // Fallback: look up Role by user.role string name
+        const matchedRole = await prisma.role.findFirst({
+          where: { name: user.role, isActive: true },
+        });
+        if (matchedRole) {
+          roleName = matchedRole.name;
+          roleRank = matchedRole.rank;
+          isExecutive = matchedRole.isExecutive;
+          canManageUsers = matchedRole.canManageUsers;
+        } else if (user.role === 'CEO') {
+          roleRank = 1;
+          isExecutive = true;
+          canManageUsers = true;
+        } else if (user.role === 'CTO' || user.role === 'ProjectOwner') {
+          roleRank = 2;
+        } else {
+          roleRank = 3;
+        }
+      }
 
-  // Breadth-first search for multi-level subordinate hierarchy
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    const nextLevel = await prisma.user.findMany({
-      where: { managerId: current.id },
-      include: { roleDefinition: true },
-    });
+      // 2 & 3. Run direct subordinates and authorized projects queries concurrently in parallel
+      const directSubordinatesPromise = prisma.user.findMany({
+        where: { managerId: user.id },
+        include: { roleDefinition: true },
+      });
 
-    for (const sub of nextLevel) {
-      if (!visited.has(sub.id)) {
-        visited.add(sub.id);
-        const subRank = sub.roleDefinition?.rank ?? (sub.role === 'Intern' ? 4 : 3);
+      let authorizedProjectsPromise: Promise<string[]>;
+      if (isExecutive) {
+        // Executive has organization-wide project visibility
+        authorizedProjectsPromise = prisma.project
+          .findMany({ select: { id: true } })
+          .then((allProjects) => allProjects.map((p) => p.id));
+      } else {
+        // Non-executive project access is determined by ownership, membership, or task assignment
+        authorizedProjectsPromise = Promise.all([
+          prisma.project.findMany({
+            where: { ownerId: user.id },
+            select: { id: true },
+          }),
+          prisma.task.findMany({
+            where: { assigneeId: user.id },
+            select: { phase: { select: { projectId: true } } },
+          }),
+        ]).then(([ownedProjects, taskProjects]) => {
+          const projectSet = new Set<string>();
+          ownedProjects.forEach((p) => projectSet.add(p.id));
+          user.memberships.forEach((m) => projectSet.add(m.projectId));
+          taskProjects.forEach((t) => {
+            if (t.phase?.projectId) projectSet.add(t.phase.projectId);
+          });
+          return Array.from(projectSet);
+        });
+      }
+
+      const [directSubordinates, authorizedProjectIds] = await Promise.all([
+        directSubordinatesPromise,
+        authorizedProjectsPromise,
+      ]);
+
+      const directSubordinateIds: string[] = [];
+      const allSubordinateIds: string[] = [];
+      const visited = new Set<string>([user.id]);
+
+      const queue: { id: string; roleRank: number }[] = [];
+
+      for (const sub of directSubordinates) {
+        const subRank = sub.roleDefinition?.rank ?? (sub.role === 'Intern' ? 4 : sub.role === 'Employee' ? 3 : 2);
+        // Organizational rule: subordinates must be below the manager's rank in configured hierarchy
         if (isExecutive || subRank > roleRank) {
+          directSubordinateIds.push(sub.id);
           allSubordinateIds.push(sub.id);
+          visited.add(sub.id);
           queue.push({ id: sub.id, roleRank: subRank });
         }
       }
+
+      // Breadth-first search for multi-level subordinate hierarchy
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        const nextLevel = await prisma.user.findMany({
+          where: { managerId: current.id },
+          include: { roleDefinition: true },
+        });
+
+        for (const sub of nextLevel) {
+          if (!visited.has(sub.id)) {
+            visited.add(sub.id);
+            const subRank = sub.roleDefinition?.rank ?? (sub.role === 'Intern' ? 4 : 3);
+            if (isExecutive || subRank > roleRank) {
+              allSubordinateIds.push(sub.id);
+              queue.push({ id: sub.id, roleRank: subRank });
+            }
+          }
+        }
+      }
+
+      const context: UserHierarchyContext = {
+        userId: user.id,
+        name: user.name,
+        email: user.email,
+        roleName,
+        roleRank,
+        isExecutive,
+        canManageUsers,
+        managerId: user.managerId,
+        directSubordinateIds,
+        allSubordinateIds,
+        authorizedProjectIds,
+      };
+
+      hierarchyCache.set(userId, { context, expiresAt: Date.now() + HIERARCHY_CACHE_TTL_MS });
+      return context;
+    } finally {
+      inflightHierarchyPromises.delete(userId);
     }
-  }
+  })();
 
-  // 3. Resolve authorized projects
-  let authorizedProjectIds: string[] = [];
-  if (isExecutive) {
-    // Executive has organization-wide project visibility
-    const allProjects = await prisma.project.findMany({ select: { id: true } });
-    authorizedProjectIds = allProjects.map((p) => p.id);
-  } else {
-    // Non-executive project access is determined by:
-    // - Project ownership
-    // - Project membership
-    // - Assigned task in the project
-    const ownedProjects = await prisma.project.findMany({
-      where: { ownerId: user.id },
-      select: { id: true },
-    });
-
-    const membershipProjects = user.memberships.map((m) => m.projectId);
-
-    const taskProjects = await prisma.task.findMany({
-      where: { assigneeId: user.id },
-      select: { phase: { select: { projectId: true } } },
-    });
-
-    const projectSet = new Set<string>();
-    ownedProjects.forEach((p) => projectSet.add(p.id));
-    membershipProjects.forEach((id) => projectSet.add(id));
-    taskProjects.forEach((t) => {
-      if (t.phase?.projectId) projectSet.add(t.phase.projectId);
-    });
-
-    authorizedProjectIds = Array.from(projectSet);
-  }
-
-  return {
-    userId: user.id,
-    name: user.name,
-    email: user.email,
-    roleName,
-    roleRank,
-    isExecutive,
-    canManageUsers,
-    managerId: user.managerId,
-    directSubordinateIds,
-    allSubordinateIds,
-    authorizedProjectIds,
-  };
+  inflightHierarchyPromises.set(userId, queryPromise);
+  return queryPromise;
 }
 
 /**

@@ -2,19 +2,87 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { determineApprovalRoute } from '../../lib/calculations.js';
+import { formatCurrency } from '../../lib/currency.js';
 import { createNotification } from '../services/notificationService.js';
 import { getUserHierarchyContext, canManageProject } from '../services/authorizationService.js';
 
 const router = Router();
 
+// GET /api/approvals/summary — Fast aggregation of approval metrics
+router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId } = req.query;
+
+    let whereClause: any = {};
+    if (projectId && projectId !== 'ALL') {
+      whereClause.projectId = String(projectId);
+    } else if (!ctx.isExecutive) {
+      whereClause = {
+        OR: [
+          { approverId: user.id },
+          { requestedBy: user.id },
+          { projectId: { in: ctx.authorizedProjectIds } },
+          ...(ctx.allSubordinateIds.length > 0 ? [{ requestedBy: { in: ctx.allSubordinateIds } }] : []),
+        ],
+      };
+    }
+
+    const [stateGroups, actionableCount, total] = await Promise.all([
+      prisma.approvalRequest.groupBy({
+        by: ['state'],
+        where: whereClause,
+        _count: { id: true },
+      }),
+      prisma.approvalRequest.count({
+        where: {
+          ...whereClause,
+          approverId: user.id,
+          state: 'Pending',
+        },
+      }),
+      prisma.approvalRequest.count({ where: whereClause }),
+    ]);
+
+    const byState: Record<string, number> = {
+      Pending: 0,
+      Approved: 0,
+      Rejected: 0,
+    };
+    stateGroups.forEach((g) => {
+      byState[g.state] = g._count.id;
+    });
+
+    res.json({
+      total,
+      pendingCount: byState['Pending'] || 0,
+      approvedCount: byState['Approved'] || 0,
+      rejectedCount: byState['Rejected'] || 0,
+      actionableCount,
+    });
+  } catch (error) {
+    console.error('Failed to get approvals summary:', error);
+    res.status(500).json({ error: 'Failed to retrieve approvals summary' });
+  }
+});
+
 // GET /api/approvals — List approvals awaiting current user or requested by user
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
-    const filter = req.query.filter as string; // 'actionable' | 'all' | 'mine'
+    const {
+      filter, // 'actionable' | 'all' | 'mine'
+      projectId,
+      type,
+      state,
+      page,
+      limit,
+    } = req.query;
 
     const ctx = await getUserHierarchyContext(user.id);
     let whereClause: any = {};
+
     if (filter === 'actionable') {
       whereClause = { approverId: user.id, state: 'Pending' };
     } else if (filter === 'mine') {
@@ -32,16 +100,74 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       };
     }
 
+    if (projectId && projectId !== 'ALL') {
+      whereClause.projectId = String(projectId);
+    }
+    if (type && type !== 'ALL') {
+      whereClause.type = String(type);
+    }
+    if (state && state !== 'ALL') {
+      whereClause.state = String(state);
+    }
+
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      type: true,
+      summary: true,
+      detail: true,
+      impact: true,
+      requestedBy: true,
+      requestedAt: true,
+      approverId: true,
+      state: true,
+      decidedAt: true,
+      decisionNote: true,
+      payload: true,
+      version: true,
+      previousRequestId: true,
+      project: { select: { id: true, name: true, ownerId: true, sponsor: true } },
+      requester: { select: { id: true, name: true, role: true, avatarUrl: true } },
+      approver: { select: { id: true, name: true, role: true, avatarUrl: true } },
+    };
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    if (isPaginated) {
+      const [total, approvals] = await Promise.all([
+        prisma.approvalRequest.count({ where: whereClause }),
+        prisma.approvalRequest.findMany({
+          where: whereClause,
+          select: selectProjection,
+          orderBy: { requestedAt: 'desc' },
+          skip,
+          take,
+        }),
+      ]);
+
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader('X-Total-Count', String(total));
+      return res.json({
+        approvals,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
+
     const approvals = await prisma.approvalRequest.findMany({
       where: whereClause,
+      select: selectProjection,
       orderBy: { requestedAt: 'desc' },
-      include: {
-        project: { select: { id: true, name: true, ownerId: true, sponsor: true } },
-        requester: { select: { id: true, name: true, role: true, avatarUrl: true } },
-        approver: { select: { id: true, name: true, role: true, avatarUrl: true } },
-      },
     });
 
+    res.setHeader('X-Total-Count', String(approvals.length));
     res.json(approvals);
   } catch (error) {
     console.error('Failed to get approvals:', error);
@@ -54,8 +180,9 @@ router.get('/project/:projectId', requireAuth, async (req: AuthRequest, res: Res
   try {
     const { projectId } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
 
-    if (user.role !== 'CEO') {
+    if (!ctx.isExecutive) {
       const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
       const isMember = await prisma.projectMembership.findUnique({
         where: { projectId_userId: { projectId, userId: user.id } },
@@ -110,7 +237,8 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    if (user.role !== 'CEO') {
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!ctx.isExecutive) {
       const isOwner = project.ownerId === user.id;
       const isMember = await prisma.projectMembership.findUnique({
         where: { projectId_userId: { projectId, userId: user.id } },
@@ -283,7 +411,7 @@ router.post('/:id/decide', requireAuth, async (req: AuthRequest, res: Response) 
             contingency: { increment: contingencyDelta },
           },
         });
-        changeLogDetails += ` (Planned Budget +£${budgetDelta}, Contingency +£${contingencyDelta})`;
+        changeLogDetails += ` (Planned Budget +${formatCurrency(budgetDelta)}, Contingency +${formatCurrency(contingencyDelta)})`;
       }
     } else if (approval.type === 'Timeline') {
       if (payloadData.milestoneId && payloadData.newForecastDate) {

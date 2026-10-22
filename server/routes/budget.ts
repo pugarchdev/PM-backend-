@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { calculatePlanPercentage, calculateBudgetHealth } from '../../lib/calculations.js';
+import { formatCurrency } from '../../lib/currency.js';
 import { createNotification } from '../services/notificationService.js';
 import { getUserHierarchyContext, canManageProject } from '../services/authorizationService.js';
 
@@ -138,7 +139,7 @@ router.post('/:id/budget/spend', requireAuth, async (req: AuthRequest, res: Resp
       // Find CEO
       const ceo = await prisma.user.findFirst({ where: { role: 'CEO' } });
 
-      const alertMsg = `Project "${project.name}" spend (£${newProjectSpend.toLocaleString()}) has reached ${Math.round((newProjectSpend / project.plannedBudget) * 100)}% of planned budget (£${project.plannedBudget.toLocaleString()}).`;
+      const alertMsg = `Project "${project.name}" spend (${formatCurrency(newProjectSpend)}) has reached ${Math.round((newProjectSpend / project.plannedBudget) * 100)}% of planned budget (${formatCurrency(project.plannedBudget)}).`;
 
       // Notify PO
       await createNotification({
@@ -170,12 +171,12 @@ router.post('/:id/budget/spend', requireAuth, async (req: AuthRequest, res: Resp
       data: {
         projectId,
         what: 'Budget Spend Recorded',
-        fromValue: `£${project.spendToDate}`,
-        toValue: `£${newProjectSpend}`,
+        fromValue: formatCurrency(project.spendToDate),
+        toValue: formatCurrency(newProjectSpend),
         actorId: user.id,
         sourceType: 'BUDGET',
         action: 'SPEND_RECORDED',
-        details: `Spend of £${spendDelta} recorded by ${user.name}${description ? ` (${description})` : ''}`,
+        details: `Spend of ${formatCurrency(spendDelta)} recorded by ${user.name}${description ? ` (${description})` : ''}`,
         changedBy: user.name,
       },
     });

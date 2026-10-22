@@ -157,6 +157,20 @@ export function parseIdentifier(identifier: string): { type: 'email' | 'phone'; 
   return { type: 'phone', value: normalizePhone(raw) };
 }
 
+interface CachedUserSession {
+  user: AuthenticatedUser;
+  expiresAt: number;
+}
+const authUserCache = new Map<string, CachedUserSession>();
+
+export function clearAuthCache(userId?: string): void {
+  if (userId) {
+    authUserCache.delete(userId);
+  } else {
+    authUserCache.clear();
+  }
+}
+
 /**
  * Server-side RBAC & Authentication Middleware
  * Reads user identifier from Authorization header (Bearer <userId>) or cookie (ff_user_id).
@@ -182,38 +196,47 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
   }
 
   try {
-    let user = null;
     if (userId) {
-      user = await prisma.user.findUnique({
+      const now = Date.now();
+      const cached = authUserCache.get(userId);
+      if (cached && cached.expiresAt > now) {
+        req.user = cached.user;
+        return next();
+      }
+
+      const user = await prisma.user.findUnique({
         where: { id: userId },
         include: { roleDefinition: true },
       });
-    }
 
-    if (user) {
-      const roleDef = user.roleDefinition;
-      const roleName = roleDef?.name || user.role;
-      const roleRank = roleDef?.rank ?? (user.role === 'CEO' ? 1 : user.role === 'CTO' || user.role === 'ProjectOwner' ? 2 : user.role === 'Intern' ? 4 : 3);
-      const isExecutive = roleDef?.isExecutive ?? (user.role === 'CEO');
-      const canManageUsers = roleDef?.canManageUsers ?? (user.role === 'CEO');
+      if (user) {
+        const roleDef = user.roleDefinition;
+        const roleName = roleDef?.name || user.role;
+        const roleRank = roleDef?.rank ?? (user.role === 'CEO' ? 1 : user.role === 'CTO' || user.role === 'ProjectOwner' ? 2 : user.role === 'Intern' ? 4 : 3);
+        const isExecutive = roleDef?.isExecutive ?? (user.role === 'CEO');
+        const canManageUsers = roleDef?.canManageUsers ?? (user.role === 'CEO');
 
-      req.user = {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: (user as any).phone || null,
-        role: roleName,
-        roleId: user.roleId || roleDef?.id || null,
-        roleRank,
-        isExecutive,
-        canManageUsers,
-        managerId: user.managerId || null,
-        department: user.department,
-        avatarUrl: user.avatarUrl,
-        isSignupCompleted: (user as any).isSignupCompleted ?? true,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-      };
+        const authUser: AuthenticatedUser = {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          phone: (user as any).phone || null,
+          role: roleName,
+          roleId: user.roleId || roleDef?.id || null,
+          roleRank,
+          isExecutive,
+          canManageUsers,
+          managerId: user.managerId || null,
+          department: user.department,
+          avatarUrl: user.avatarUrl,
+          isSignupCompleted: (user as any).isSignupCompleted ?? true,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt,
+        };
+
+        authUserCache.set(user.id, { user: authUser, expiresAt: Date.now() + 30_000 });
+        req.user = authUser;
+      }
     }
     next();
   } catch (error) {

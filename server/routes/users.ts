@@ -17,9 +17,48 @@ import {
 const router = Router();
 
 /**
+ * GET /api/users/summary
+ * Returns fast high-level user metrics without loading all user rows.
+ * Accessible to executive and management roles.
+ */
+router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!ctx.isExecutive && ctx.roleRank > 2) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient privileges to view user summary metrics.' });
+    }
+
+    const [totalUsers, activeUsers, pendingUsers, departmentGroups] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { isSignupCompleted: true } }),
+      prisma.user.count({ where: { isSignupCompleted: false } }),
+      prisma.user.groupBy({
+        by: ['department'],
+        _count: { id: true },
+      }),
+    ]);
+
+    res.json({
+      totalUsers,
+      activeUsers,
+      pendingUsers,
+      departmentCounts: departmentGroups.map((d) => ({
+        department: d.department || 'Unassigned',
+        count: d._count.id,
+      })),
+    });
+  } catch (error: any) {
+    console.error('Failed to get user summary metrics:', error);
+    res.status(500).json({ error: 'Failed to retrieve user summary metrics' });
+  }
+});
+
+/**
  * GET /api/users
  * Returns active users scoped by dynamic hierarchy and authorized project memberships.
- * Executives see all users; employees/interns see teammates on authorized projects.
+ * Supports search, department filter, role filter, dynamic sorting, and server pagination.
  */
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
@@ -29,30 +68,97 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     // Get list of user IDs visible within current user's authorized scope
     const visibleIds = await getVisibleDirectoryUserIds(ctx);
 
+    const {
+      search,
+      department,
+      roleId,
+      page,
+      limit,
+      sortBy = 'name',
+      sortOrder = 'asc',
+    } = req.query;
+
+    const where: any = {
+      id: { in: visibleIds },
+      isSignupCompleted: true,
+    };
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { name: { contains: term, mode: 'insensitive' } },
+        { email: { contains: term, mode: 'insensitive' } },
+        { department: { contains: term, mode: 'insensitive' } },
+      ];
+    }
+
+    if (department && typeof department === 'string' && department !== 'ALL') {
+      where.department = department;
+    }
+
+    if (roleId && typeof roleId === 'string' && roleId !== 'ALL') {
+      where.roleId = roleId;
+    }
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    const selectProjection = {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      roleId: true,
+      department: true,
+      avatarUrl: true,
+      managerId: true,
+      roleDefinition: {
+        select: { id: true, name: true, rank: true, isExecutive: true },
+      },
+      manager: {
+        select: { id: true, name: true, role: true },
+      },
+    };
+
+    const validSortFields = ['name', 'email', 'department', 'role'];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : 'name';
+    const order = String(sortOrder).toLowerCase() === 'desc' ? 'desc' : 'asc';
+    const orderBy = [{ [field]: order }];
+
+    if (isPaginated) {
+      const [total, users] = await Promise.all([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take,
+        }),
+      ]);
+
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader('X-Total-Count', String(total));
+      return res.json({
+        users,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
+
     const users = await prisma.user.findMany({
-      where: {
-        id: { in: visibleIds },
-        isSignupCompleted: true,
-      },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        roleId: true,
-        department: true,
-        avatarUrl: true,
-        managerId: true,
-        roleDefinition: {
-          select: { id: true, name: true, rank: true, isExecutive: true },
-        },
-        manager: {
-          select: { id: true, name: true, role: true },
-        },
-      },
+      where,
+      select: selectProjection,
       orderBy: [{ role: 'asc' }, { name: 'asc' }],
     });
 
+    res.setHeader('X-Total-Count', String(users.length));
     res.json(users);
   } catch (error: any) {
     console.error('Failed to fetch users:', error);
@@ -64,32 +170,110 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
  * GET /api/users/management
  * Returns all users in the system including their phone and signup completion status.
  * Restricted to executive / user management capability.
+ * Supports search, status filter, role filter, dynamic sorting, and server-side pagination.
  */
 router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
   try {
-    const users = await prisma.user.findMany({
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        roleId: true,
-        managerId: true,
-        department: true,
-        avatarUrl: true,
-        isSignupCompleted: true,
-        createdAt: true,
-        roleDefinition: {
-          select: { id: true, name: true, rank: true, isExecutive: true },
-        },
-        manager: {
-          select: { id: true, name: true, role: true },
-        },
+    const {
+      search,
+      status,
+      roleId,
+      department,
+      page,
+      limit,
+      sortBy = 'name',
+      sortOrder = 'asc',
+    } = req.query;
+
+    const where: any = {};
+
+    if (status === 'pending') {
+      where.isSignupCompleted = false;
+    } else if (status === 'completed') {
+      where.isSignupCompleted = true;
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { name: { contains: term, mode: 'insensitive' } },
+        { email: { contains: term, mode: 'insensitive' } },
+        { phone: { contains: term } },
+        { department: { contains: term, mode: 'insensitive' } },
+        { role: { contains: term, mode: 'insensitive' } },
+      ];
+    }
+
+    if (roleId && typeof roleId === 'string' && roleId !== 'ALL') {
+      where.roleId = roleId;
+    }
+
+    if (department && typeof department === 'string' && department !== 'ALL') {
+      where.department = department;
+    }
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    const selectProjection = {
+      id: true,
+      name: true,
+      email: true,
+      phone: true,
+      role: true,
+      roleId: true,
+      managerId: true,
+      department: true,
+      avatarUrl: true,
+      isSignupCompleted: true,
+      createdAt: true,
+      roleDefinition: {
+        select: { id: true, name: true, rank: true, isExecutive: true },
       },
+      manager: {
+        select: { id: true, name: true, role: true },
+      },
+    };
+
+    const validSortFields = ['name', 'email', 'department', 'role', 'createdAt', 'isSignupCompleted'];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : 'name';
+    const order = String(sortOrder).toLowerCase() === 'desc' ? 'desc' : 'asc';
+    const orderBy = [{ isSignupCompleted: 'asc' as const }, { [field]: order }];
+
+    if (isPaginated) {
+      const [total, users] = await Promise.all([
+        prisma.user.count({ where }),
+        prisma.user.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take,
+        }),
+      ]);
+
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader('X-Total-Count', String(total));
+      return res.json({
+        users,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
+
+    const users = await prisma.user.findMany({
+      where,
+      select: selectProjection,
       orderBy: [{ isSignupCompleted: 'asc' }, { name: 'asc' }],
     });
 
+    res.setHeader('X-Total-Count', String(users.length));
     res.json(users);
   } catch (error: any) {
     console.error('Failed to fetch user directory for management:', error);

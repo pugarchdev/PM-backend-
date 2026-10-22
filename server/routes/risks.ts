@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest } from '../auth.js';
 import { RiskCreateSchema, RiskUpdateSchema } from '../../lib/validators.js';
+import { getUserHierarchyContext, canViewProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -17,6 +18,75 @@ function checkRiskStale(risk: any) {
   };
 }
 
+// GET /api/risks/summary - Fast aggregation of risk metrics
+router.get('/summary', async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const { projectId, includeClosed } = req.query;
+    const where: any = {};
+
+    if (projectId && projectId !== 'ALL') {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: 'You do not have access to risks for this project.' });
+      }
+      where.projectId = pId;
+    } else {
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
+      }
+    }
+
+    if (includeClosed !== 'true') {
+      where.closedAt = null;
+    }
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [severityGroups, total, staleCount] = await Promise.all([
+      prisma.risk.groupBy({
+        by: ['severity'],
+        where,
+        _count: { id: true },
+      }),
+      prisma.risk.count({ where }),
+      prisma.risk.count({
+        where: {
+          ...where,
+          closedAt: null,
+          lastReviewedAt: { lt: thirtyDaysAgo },
+        },
+      }),
+    ]);
+
+    const bySeverity: Record<string, number> = {
+      Low: 0,
+      Medium: 0,
+      High: 0,
+    };
+    severityGroups.forEach((g) => {
+      bySeverity[g.severity] = g._count.id;
+    });
+
+    res.json({
+      total,
+      bySeverity,
+      highRiskCount: bySeverity['High'] || 0,
+      mediumRiskCount: bySeverity['Medium'] || 0,
+      lowRiskCount: bySeverity['Low'] || 0,
+      staleCount,
+    });
+  } catch (error: any) {
+    console.error('Failed to get risks summary:', error);
+    res.status(500).json({ error: 'Failed to retrieve risks summary' });
+  }
+});
+
 // GET /api/risks - List risks across projects or by project
 router.get('/', async (req: AuthRequest, res: Response) => {
   try {
@@ -25,56 +95,111 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { projectId, severity, includeClosed } = req.query;
+    const ctx = await getUserHierarchyContext(user.id);
+    const {
+      projectId,
+      severity,
+      includeClosed,
+      search,
+      page,
+      limit,
+      sortBy = 'severity',
+      sortOrder = 'desc',
+    } = req.query;
     const where: any = {};
 
-    if (projectId) {
+    if (projectId && projectId !== 'ALL') {
       const pId = String(projectId);
-      if (user.role !== 'CEO') {
-        const isOwner = await prisma.project.findFirst({ where: { id: pId, ownerId: user.id } });
-        const isMember = await prisma.projectMembership.findUnique({
-          where: { projectId_userId: { projectId: pId, userId: user.id } },
-        });
-        // Also allow if they have an assigned task in this project
-        const hasTask = !isOwner && !isMember && await prisma.task.findFirst({
-          where: { assigneeId: user.id, phase: { projectId: pId } },
-        });
-        if (!isOwner && !isMember && !hasTask) {
-          return res.status(403).json({ error: 'You do not have access to risks for this project.' });
-        }
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: 'You do not have access to risks for this project.' });
       }
       where.projectId = pId;
     } else {
-      if (user.role !== 'CEO') {
-        where.project = {
-          OR: [
-            { ownerId: user.id },
-            { memberships: { some: { userId: user.id } } },
-            // Also include projects where employee has an assigned task (safety net)
-            { phases: { some: { tasks: { some: { assigneeId: user.id } } } } },
-          ],
-        };
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
       }
     }
 
-    if (severity) where.severity = String(severity);
+    if (severity && severity !== 'ALL') {
+      where.severity = String(severity);
+    }
     if (includeClosed !== 'true') {
       where.closedAt = null;
     }
 
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { description: { contains: term, mode: 'insensitive' } },
+        { mitigation: { contains: term, mode: 'insensitive' } },
+        { project: { name: { contains: term, mode: 'insensitive' } } },
+      ];
+    }
+
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      taskId: true,
+      description: true,
+      severity: true,
+      mitigation: true,
+      ownerId: true,
+      lastReviewedAt: true,
+      closedAt: true,
+      createdAt: true,
+      updatedAt: true,
+      project: { select: { id: true, name: true, ownerId: true } },
+      task: { select: { id: true, title: true } },
+      owner: { select: { id: true, name: true, avatarUrl: true } },
+    };
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    const validSortFields = ['severity', 'lastReviewedAt', 'createdAt'];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : 'lastReviewedAt';
+    const order = String(sortOrder).toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const orderBy = [{ [field]: order }];
+
+    if (isPaginated) {
+      const [total, risks] = await Promise.all([
+        prisma.risk.count({ where }),
+        prisma.risk.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take,
+        }),
+      ]);
+
+      const enriched = risks.map(checkRiskStale);
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader('X-Total-Count', String(total));
+      return res.json({
+        risks: enriched,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
+
     const risks = await prisma.risk.findMany({
       where,
-      include: {
-        project: { select: { id: true, name: true, ownerId: true } },
-        task: { select: { id: true, title: true } },
-        owner: { select: { id: true, name: true, avatarUrl: true } },
-      },
+      select: selectProjection,
       orderBy: [{ severity: 'desc' }, { lastReviewedAt: 'desc' }],
     });
 
     const enriched = risks.map(checkRiskStale);
+    res.setHeader('X-Total-Count', String(enriched.length));
     res.json(enriched);
   } catch (error: any) {
+    console.error('Failed to fetch risks:', error);
     res.status(500).json({ error: 'Failed to fetch risks' });
   }
 });

@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { calculateProgress, calculatePlanPercentage, calculateProjectStatus } from '../../lib/calculations.js';
+import { formatCurrency } from '../../lib/currency.js';
 import { StatusOverrideSchema, ProjectCreateSchema, ProjectCharterUpdateSchema } from '../../lib/validators.js';
 import {
   getUserHierarchyContext,
@@ -90,7 +91,7 @@ export function sanitizeProjectForRole(
   return project;
 }
 
-// GET /api/projects - List projects with dynamic hierarchy & membership filtering
+// GET /api/projects - List projects with lean field selection, server-side filtering, and optional pagination
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
@@ -101,37 +102,148 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       ? {}
       : { id: { in: ctx.authorizedProjectIds } };
 
+    if (req.query.minimal === 'true') {
+      const minimalProjects = await prisma.project.findMany({
+        where: whereClause,
+        select: {
+          id: true,
+          name: true,
+          ownerId: true,
+          startDate: true,
+          endDate: true,
+          statusOverride: true,
+        },
+        orderBy: { name: 'asc' },
+      });
+      return res.json(minimalProjects);
+    }
+
+    // Server-side search filter
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    if (search) {
+      whereClause.AND = [
+        ...(whereClause.AND || []),
+        {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { goal: { contains: search, mode: 'insensitive' } },
+            { sponsor: { contains: search, mode: 'insensitive' } },
+            { owner: { name: { contains: search, mode: 'insensitive' } } },
+          ],
+        },
+      ];
+    }
+
+    // Dynamic sorting
+    const sortBy = typeof req.query.sortBy === 'string' ? req.query.sortBy : 'startDate';
+    const sortOrder = req.query.sortOrder === 'desc' ? 'desc' : 'asc';
+    const allowedSortFields: Record<string, any> = {
+      startDate: { startDate: sortOrder },
+      endDate: { endDate: sortOrder },
+      name: { name: sortOrder },
+      createdAt: { createdAt: sortOrder },
+    };
+    const orderBy = allowedSortFields[sortBy] || { startDate: 'asc' };
+
+    const now = new Date();
+
+    // Lean query: omit memberships, fetch minimal phase/task weights and single nearest milestone
     const projects = await prisma.project.findMany({
       where: whereClause,
-      include: {
+      select: {
+        id: true,
+        name: true,
+        goal: true,
+        sponsor: true,
+        startDate: true,
+        endDate: true,
+        plannedBudget: true,
+        contingency: true,
+        spendToDate: true,
+        statusOverride: true,
+        ownerId: true,
         owner: {
           select: { id: true, name: true, email: true, role: true, avatarUrl: true },
         },
-        memberships: {
-          include: {
-            user: { select: { id: true, name: true, email: true, role: true, avatarUrl: true } },
-          },
-        },
         phases: {
           where: { isArchived: false },
-          include: {
-            tasks: true,
+          select: {
+            id: true,
+            plannedStart: true,
+            plannedEnd: true,
+            order: true,
+            tasks: {
+              select: {
+                id: true,
+                state: true,
+                plannedHours: true,
+              },
+            },
           },
           orderBy: { plannedStart: 'asc' },
         },
-        issues: true,
-        risks: true,
+        issues: {
+          where: { severity: 'Critical', state: { not: 'Closed' } },
+          select: { id: true, severity: true, state: true },
+          take: 1,
+        },
+        risks: {
+          where: { severity: 'High', closedAt: null },
+          select: { id: true, severity: true, closedAt: true },
+          take: 1,
+        },
         milestones: {
+          where: { actualDate: null, forecastDate: { gte: now } },
+          select: {
+            id: true,
+            title: true,
+            forecastDate: true,
+            actualDate: true,
+          },
           orderBy: { forecastDate: 'asc' },
+          take: 1,
         },
       },
-      orderBy: { startDate: 'asc' },
+      orderBy,
     });
 
     const enriched = await Promise.all(projects.map(enrichProject));
-    const sanitized = enriched.map((p) =>
+
+    // Optional status filtering post-calculation
+    const statusParam = typeof req.query.status === 'string' ? req.query.status.toUpperCase() : 'ALL';
+    let filtered = enriched;
+    if (statusParam && statusParam !== 'ALL') {
+      filtered = enriched.filter((p) => p.metrics?.status === statusParam);
+    }
+
+    const totalCount = filtered.length;
+    res.setHeader('X-Total-Count', String(totalCount));
+
+    // Pagination support
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limit = Math.max(1, parseInt(String(req.query.limit || '10'), 10) || 10);
+
+    const paginatedItems = isPaginated
+      ? filtered.slice((page - 1) * limit, page * limit)
+      : filtered;
+
+    const sanitized = paginatedItems.map((p) =>
       sanitizeProjectForRole(p, ctx.roleRank, ctx.isExecutive, p.ownerId === user.id)
     );
+
+    if (isPaginated) {
+      return res.json({
+        projects: sanitized,
+        pagination: {
+          total: totalCount,
+          page,
+          limit,
+          totalPages: Math.ceil(totalCount / limit) || 1,
+        },
+      });
+    }
+
     res.json(sanitized);
   } catch (error: any) {
     console.error('Failed to fetch projects:', error);
@@ -217,7 +329,7 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
           actorId: user.id,
           sourceType: 'PROJECT',
           sourceId: p.id,
-          details: `Project "${name}" chartered by ${user.name} with £${plannedBudget.toLocaleString()} budget and £${contingency.toLocaleString()} contingency.`,
+          details: `Project "${name}" chartered by ${user.name} with ${formatCurrency(plannedBudget)} budget and ${formatCurrency(contingency)} contingency.`,
           changedBy: user.name,
         },
       });
@@ -339,12 +451,7 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
             user: { select: { id: true, name: true } },
           },
           orderBy: { createdAt: 'desc' },
-        },
-        changeLogs: {
-          orderBy: { at: 'desc' },
-        },
-        baselines: {
-          orderBy: { createdAt: 'desc' },
+          take: 20,
         },
       },
     });
@@ -359,6 +466,116 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   } catch (error: any) {
     console.error('Failed to fetch project details:', error);
     res.status(500).json({ error: 'Failed to retrieve project details' });
+  }
+});
+
+// GET /api/projects/:id/summary - Dedicated fast aggregate summary for widgets & dashboards
+router.get('/:id/summary', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to this project' });
+    }
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      select: {
+        id: true,
+        name: true,
+        startDate: true,
+        endDate: true,
+        statusOverride: true,
+        plannedBudget: true,
+        contingency: true,
+        spendToDate: true,
+        phases: {
+          where: { isArchived: false },
+          select: {
+            id: true,
+            plannedStart: true,
+            plannedEnd: true,
+            tasks: {
+              select: {
+                id: true,
+                state: true,
+                priority: true,
+                plannedHours: true,
+                actualHours: true,
+                assigneeId: true,
+              },
+            },
+          },
+        },
+        issues: {
+          select: { id: true, severity: true, state: true },
+        },
+        risks: {
+          select: { id: true, severity: true, closedAt: true },
+        },
+      },
+    });
+
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const tasks = project.phases.flatMap((ph) => ph.tasks);
+    const totalTasks = tasks.length;
+    const completedTasks = tasks.filter((t) => t.state === 'Completed').length;
+    const inProgressTasks = tasks.filter((t) => t.state === 'In progress').length;
+    const notStartedTasks = tasks.filter((t) => t.state === 'Not started').length;
+    const blockedTasks = tasks.filter((t) => t.state === 'Blocked').length;
+    const highPriorityTasks = tasks.filter((t) => t.priority === 'High').length;
+
+    const totalPlannedHours = tasks.reduce((sum, t) => sum + (t.plannedHours || 0), 0);
+    const totalActualHours = tasks.reduce((sum, t) => sum + (t.actualHours || 0), 0);
+
+    const progress = calculateProgress(tasks);
+    const plan = calculatePlanPercentage(project.startDate, project.endDate, project.phases);
+
+    const hasCriticalIssueOpen = project.issues.some((i) => i.severity === 'Critical' && i.state !== 'Closed');
+    const hasHighRiskOpen = project.risks.some((r) => r.severity === 'High' && !r.closedAt);
+
+    const status = calculateProjectStatus({
+      progress,
+      plan,
+      hasCriticalIssueOpen,
+      hasHighRiskOpen,
+      statusOverride: project.statusOverride,
+    });
+
+    res.json({
+      projectId: project.id,
+      name: project.name,
+      status,
+      isOverridden: !!project.statusOverride,
+      progress,
+      plan,
+      tasks: {
+        total: totalTasks,
+        completed: completedTasks,
+        inProgress: inProgressTasks,
+        notStarted: notStartedTasks,
+        blocked: blockedTasks,
+        highPriority: highPriorityTasks,
+      },
+      hours: {
+        planned: totalPlannedHours,
+        actual: totalActualHours,
+        variance: totalActualHours - totalPlannedHours,
+      },
+      issues: {
+        total: project.issues.length,
+        openCritical: project.issues.filter((i) => i.severity === 'Critical' && i.state !== 'Closed').length,
+      },
+      risks: {
+        total: project.risks.length,
+        openHigh: project.risks.filter((r) => r.severity === 'High' && !r.closedAt).length,
+      },
+    });
+  } catch (error: any) {
+    console.error('Failed to fetch project summary:', error);
+    res.status(500).json({ error: 'Failed to retrieve project summary' });
   }
 });
 

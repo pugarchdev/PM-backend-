@@ -15,29 +15,108 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
   // Aggregate events from all sources
   const events = [];
 
-  // 1. Tasks (as date spans)
-  const tasks = await prisma.task.findMany({
-    where: {
-      phase: {
-        projectId: { in: visibleProjectIds },
+  // Fetch all calendar event sources concurrently in parallel
+  const [tasks, milestones, approvals, risks, issues, reminders] = await Promise.all([
+    // 1. Tasks (as date spans)
+    prisma.task.findMany({
+      where: {
+        phase: {
+          projectId: { in: visibleProjectIds },
+        },
+        OR: [
+          { plannedStart: { lte: endDate }, plannedEnd: { gte: startDate } },
+        ],
       },
-      OR: [
-        { plannedStart: { lte: endDate }, plannedEnd: { gte: startDate } },
-      ],
-    },
-    include: {
-      phase: {
-        include: {
-          project: {
-            select: { id: true, name: true },
+      include: {
+        phase: {
+          include: {
+            project: {
+              select: { id: true, name: true },
+            },
           },
         },
+        assignee: {
+          select: { id: true, name: true, avatarUrl: true },
+        },
       },
-      assignee: {
-        select: { id: true, name: true, avatarUrl: true },
+    }),
+
+    // 2. Milestones (single-day events)
+    prisma.milestone.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        OR: [
+          { baselineDate: { gte: startDate, lte: endDate } },
+          { forecastDate: { gte: startDate, lte: endDate } },
+        ],
       },
-    },
-  });
+      include: {
+        project: {
+          select: { id: true, name: true },
+        },
+      },
+    }),
+
+    // 3. Approval Requests (single-day events)
+    prisma.approvalRequest.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        requestedAt: { gte: startDate, lte: endDate },
+        state: 'Pending',
+      },
+      include: {
+        project: {
+          select: { id: true, name: true },
+        },
+        requester: {
+          select: { id: true, name: true },
+        },
+      },
+    }),
+
+    // 4. Risks (single-day events - last reviewed date)
+    prisma.risk.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        lastReviewedAt: { gte: startDate, lte: endDate },
+        closedAt: null, // Only open risks
+      },
+      include: {
+        project: {
+          select: { id: true, name: true },
+        },
+        owner: {
+          select: { id: true, name: true },
+        },
+      },
+    }),
+
+    // 5. Issues (single-day events - raised date)
+    prisma.issue.findMany({
+      where: {
+        projectId: { in: visibleProjectIds },
+        raisedAt: { gte: startDate, lte: endDate },
+        state: { not: 'Closed' }, // Only open issues
+      },
+      include: {
+        project: {
+          select: { id: true, name: true },
+        },
+        owner: {
+          select: { id: true, name: true },
+        },
+      },
+    }),
+
+    // 6. Personal Reminders (single-day events)
+    prisma.reminder.findMany({
+      where: {
+        userId: user.id,
+        reminderDate: { gte: startDate, lte: endDate },
+        isCompleted: false,
+      },
+    }),
+  ]);
 
   for (const task of tasks) {
     events.push({
@@ -59,22 +138,6 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
       },
     });
   }
-
-  // 2. Milestones (single-day events)
-  const milestones = await prisma.milestone.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      OR: [
-        { baselineDate: { gte: startDate, lte: endDate } },
-        { forecastDate: { gte: startDate, lte: endDate } },
-      ],
-    },
-    include: {
-      project: {
-        select: { id: true, name: true },
-      },
-    },
-  });
 
   for (const milestone of milestones) {
     // Baseline date milestone
@@ -112,23 +175,6 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
     }
   }
 
-  // 3. Approval Requests (single-day events)
-  const approvals = await prisma.approvalRequest.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      requestedAt: { gte: startDate, lte: endDate },
-      state: 'Pending',
-    },
-    include: {
-      project: {
-        select: { id: true, name: true },
-      },
-      requester: {
-        select: { id: true, name: true },
-      },
-    },
-  });
-
   for (const approval of approvals) {
     events.push({
       id: `approval-${approval.id}`,
@@ -148,23 +194,6 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
     });
   }
 
-  // 4. Risks (single-day events - last reviewed date)
-  const risks = await prisma.risk.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      lastReviewedAt: { gte: startDate, lte: endDate },
-      closedAt: null, // Only open risks
-    },
-    include: {
-      project: {
-        select: { id: true, name: true },
-      },
-      owner: {
-        select: { id: true, name: true },
-      },
-    },
-  });
-
   for (const risk of risks) {
     events.push({
       id: `risk-${risk.id}`,
@@ -182,23 +211,6 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
       },
     });
   }
-
-  // 5. Issues (single-day events - raised date)
-  const issues = await prisma.issue.findMany({
-    where: {
-      projectId: { in: visibleProjectIds },
-      raisedAt: { gte: startDate, lte: endDate },
-      state: { not: 'Closed' }, // Only open issues
-    },
-    include: {
-      project: {
-        select: { id: true, name: true },
-      },
-      owner: {
-        select: { id: true, name: true },
-      },
-    },
-  });
 
   for (const issue of issues) {
     events.push({
@@ -218,15 +230,6 @@ export async function getCalendarEvents(user: AuthenticatedUser, startDate: Date
       },
     });
   }
-
-  // 6. Personal Reminders (single-day events)
-  const reminders = await prisma.reminder.findMany({
-    where: {
-      userId: user.id,
-      reminderDate: { gte: startDate, lte: endDate },
-      isCompleted: false,
-    },
-  });
 
   for (const reminder of reminders) {
     events.push({

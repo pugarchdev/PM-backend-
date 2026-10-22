@@ -24,15 +24,15 @@ const upload = multer({
   },
 });
 
-// GET /api/issues - List issues across projects or by project
-router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
+// GET /api/issues/summary - Fast aggregation of issue metrics across authorized projects
+router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
     const ctx = await getUserHierarchyContext(user.id);
-    const { projectId, severity, state } = req.query;
+    const { projectId } = req.query;
     const where: any = {};
 
-    if (projectId) {
+    if (projectId && projectId !== 'ALL') {
       const pId = String(projectId);
       if (!canViewProject(ctx, pId)) {
         return res.status(403).json({ error: 'You do not have access to issues for this project.' });
@@ -44,32 +44,183 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       }
     }
 
-    if (severity) where.severity = String(severity);
-    if (state) where.state = String(state);
+    const [stateGroups, severityGroups, total] = await Promise.all([
+      prisma.issue.groupBy({
+        by: ['state'],
+        where,
+        _count: { id: true },
+      }),
+      prisma.issue.groupBy({
+        by: ['severity'],
+        where,
+        _count: { id: true },
+      }),
+      prisma.issue.count({ where }),
+    ]);
+
+    const stateCounts: Record<string, number> = {};
+    stateGroups.forEach((g) => {
+      stateCounts[g.state] = g._count.id;
+    });
+
+    const severityCounts: Record<string, number> = {
+      Minor: 0,
+      Major: 0,
+      Critical: 0,
+    };
+    severityGroups.forEach((g) => {
+      severityCounts[g.severity] = g._count.id;
+    });
+
+    const closedCount = stateCounts['Closed'] || 0;
+    const openCount = total - closedCount;
+
+    res.json({
+      total,
+      openCount,
+      closedCount,
+      byState: stateCounts,
+      bySeverity: severityCounts,
+      criticalCount: severityCounts['Critical'] || 0,
+      majorCount: severityCounts['Major'] || 0,
+      minorCount: severityCounts['Minor'] || 0,
+    });
+  } catch (error: any) {
+    console.error('Failed to get issues summary:', error);
+    res.status(500).json({ error: 'Failed to retrieve issues summary' });
+  }
+});
+
+// GET /api/issues - List issues across projects or by project
+router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+    const {
+      projectId,
+      severity,
+      state,
+      search,
+      page,
+      limit,
+      sortBy = 'raisedAt',
+      sortOrder = 'desc',
+    } = req.query;
+    const where: any = {};
+
+    if (projectId && projectId !== 'ALL') {
+      const pId = String(projectId);
+      if (!canViewProject(ctx, pId)) {
+        return res.status(403).json({ error: 'You do not have access to issues for this project.' });
+      }
+      where.projectId = pId;
+    } else {
+      if (!ctx.isExecutive) {
+        where.projectId = { in: ctx.authorizedProjectIds };
+      }
+    }
+
+    if (severity && severity !== 'ALL') {
+      where.severity = String(severity);
+    }
+
+    if (state && state !== 'ALL') {
+      const s = String(state);
+      if (s === 'OPEN' || s === 'Open') {
+        where.state = { not: 'Closed' };
+      } else if (s === 'CLOSED' || s === 'Closed') {
+        where.state = 'Closed';
+      } else {
+        where.state = s;
+      }
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { title: { contains: term, mode: 'insensitive' } },
+        { detail: { contains: term, mode: 'insensitive' } },
+        { project: { name: { contains: term, mode: 'insensitive' } } },
+      ];
+    }
+
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      taskId: true,
+      title: true,
+      severity: true,
+      detail: true,
+      stepsToReproduce: true,
+      state: true,
+      ownerId: true,
+      raisedBy: true,
+      raisedAt: true,
+      closedAt: true,
+      reopenComment: true,
+      createdAt: true,
+      updatedAt: true,
+      project: { select: { id: true, name: true, ownerId: true } },
+      task: { select: { id: true, title: true } },
+      owner: { select: { id: true, name: true, avatarUrl: true } },
+      raiser: { select: { id: true, name: true, avatarUrl: true } },
+      attachments: {
+        select: {
+          id: true,
+          fileName: true,
+          fileSize: true,
+          mimeType: true,
+          fileType: true,
+          createdAt: true,
+        },
+      },
+    };
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    const validSortFields = ['raisedAt', 'severity', 'state', 'title'];
+    const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : 'raisedAt';
+    const order = String(sortOrder).toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const orderBy = [{ [field]: order }];
+
+    if (isPaginated) {
+      const [total, issues] = await Promise.all([
+        prisma.issue.count({ where }),
+        prisma.issue.findMany({
+          where,
+          select: selectProjection,
+          orderBy,
+          skip,
+          take,
+        }),
+      ]);
+
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader('X-Total-Count', String(total));
+      return res.json({
+        issues,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
 
     const issues = await prisma.issue.findMany({
       where,
-      include: {
-        project: { select: { id: true, name: true, ownerId: true } },
-        task: { select: { id: true, title: true } },
-        owner: { select: { id: true, name: true, avatarUrl: true } },
-        raiser: { select: { id: true, name: true, avatarUrl: true } },
-        attachments: {
-          select: {
-            id: true,
-            fileName: true,
-            fileSize: true,
-            mimeType: true,
-            fileType: true,
-            createdAt: true,
-          },
-        },
-      },
+      select: selectProjection,
       orderBy: { raisedAt: 'desc' },
     });
 
+    res.setHeader('X-Total-Count', String(issues.length));
     res.json(issues);
   } catch (error: any) {
+    console.error('Failed to fetch issues:', error);
     res.status(500).json({ error: 'Failed to fetch issues' });
   }
 });

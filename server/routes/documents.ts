@@ -8,6 +8,7 @@ import {
   getFromS3,
   MAX_FILE_SIZE_BYTES,
 } from '../services/s3Service.js';
+import { getUserHierarchyContext, canViewProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -21,7 +22,9 @@ const upload = multer({
 
 // Helper to check user access to project documents
 async function canAccessDocuments(userId: string, userRole: string, projectId: string): Promise<boolean> {
-  if (userRole === 'CEO') return true;
+  const ctx = await getUserHierarchyContext(userId);
+  if (ctx.isExecutive) return true;
+  if (canViewProject(ctx, projectId)) return true;
 
   const project = await prisma.project.findUnique({
     where: { id: projectId },
@@ -47,26 +50,78 @@ router.get('/projects/:id/documents', requireAuth, async (req: AuthRequest, res:
   try {
     const { id: projectId } = req.params;
     const user = req.user!;
+    const { search, page, limit } = req.query;
 
     const hasAccess = await canAccessDocuments(user.id, user.role, projectId);
     if (!hasAccess) {
       return res.status(403).json({ error: 'You are not a member of this project and cannot access its documents.' });
     }
 
-    const documents = await prisma.document.findMany({
-      where: { projectId },
-      orderBy: { updatedAt: 'desc' },
-      include: {
-        uploader: { select: { id: true, name: true, role: true } },
-        versions: {
-          orderBy: { version: 'desc' },
-          include: {
-            uploader: { select: { id: true, name: true } },
-          },
+    const where: any = { projectId };
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { title: { contains: term, mode: 'insensitive' } },
+        { description: { contains: term, mode: 'insensitive' } },
+      ];
+    }
+
+    const isPaginated = page !== undefined || limit !== undefined;
+    const pageNum = Math.max(1, parseInt(String(page || '1'), 10) || 1);
+    const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
+    const skip = (pageNum - 1) * take;
+
+    const selectProjection = {
+      id: true,
+      projectId: true,
+      title: true,
+      description: true,
+      fileType: true,
+      currentVersion: true,
+      uploadedBy: true,
+      createdAt: true,
+      updatedAt: true,
+      uploader: { select: { id: true, name: true, role: true } },
+      versions: {
+        orderBy: { version: 'desc' as const },
+        include: {
+          uploader: { select: { id: true, name: true } },
         },
       },
+    };
+
+    if (isPaginated) {
+      const [total, documents] = await Promise.all([
+        prisma.document.count({ where }),
+        prisma.document.findMany({
+          where,
+          orderBy: { updatedAt: 'desc' },
+          select: selectProjection,
+          skip,
+          take,
+        }),
+      ]);
+
+      const totalPages = Math.ceil(total / take) || 1;
+      res.setHeader('X-Total-Count', String(total));
+      return res.json({
+        documents,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: take,
+          totalPages,
+        },
+      });
+    }
+
+    const documents = await prisma.document.findMany({
+      where,
+      orderBy: { updatedAt: 'desc' },
+      select: selectProjection,
     });
 
+    res.setHeader('X-Total-Count', String(documents.length));
     res.json(documents);
   } catch (error) {
     console.error('Failed to get documents:', error);

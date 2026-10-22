@@ -7,6 +7,8 @@
  * 4. Workload calculation based on 37-hour work week reference
  */
 
+import { formatCurrency } from './currency.js';
+
 export interface TaskWeightItem {
   state: string;
   plannedHours: number;
@@ -207,7 +209,7 @@ export interface ApprovalRoutingInput {
  * Server-authoritative Approval Routing Logic:
  * 1. Budget within project contingency: Project Owner
  *    - If requester is the Project Owner: escalate one level to CEO.
- * 2. Budget beyond contingency OR any increase over £50,000: CEO
+ * 2. Budget beyond contingency OR any increase over ₹50,000: CEO
  * 3. Timeline change moving a baselined milestone: Sponsor / CEO
  * 4. Scope change OR cross-project resourcing: CEO
  * 5. Self-approval prevention: Nobody can approve their own request.
@@ -252,7 +254,7 @@ export function determineApprovalRoute(input: ApprovalRoutingInput): {
       targetRole = 'CEO';
       designatedId = ceoId;
       escalation = isOver50k
-        ? 'Budget change exceeds £50,000 threshold (CEO approval required).'
+        ? `Budget change exceeds ${formatCurrency(50000, { maximumFractionDigits: 0, minimumFractionDigits: 0 })} threshold (CEO approval required).`
         : 'Budget change exceeds project contingency (CEO approval required).';
     } else {
       targetRole = 'ProjectOwner';
