@@ -5081,6 +5081,7 @@ import path3 from "path";
 // server/services/s3Service.ts
 import fs from "fs";
 import path2 from "path";
+import { v2 as cloudinary } from "cloudinary";
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 var MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
 var ALLOWED_EXTENSIONS = /* @__PURE__ */ new Set(["pdf", "xlsx", "docx", "dwg", "png", "jpg", "jpeg"]);
@@ -5091,6 +5092,23 @@ try {
     fs.mkdirSync(LOCAL_S3_DIR, { recursive: true });
   }
 } catch {
+}
+var cloudinaryCloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+var cloudinaryApiKey = process.env.CLOUDINARY_API_KEY?.trim();
+var cloudinaryApiSecret = process.env.CLOUDINARY_API_SECRET?.trim();
+var cloudinaryUrl = process.env.CLOUDINARY_URL?.trim();
+var hasCloudinaryCredentials = !!(cloudinaryUrl || cloudinaryCloudName && cloudinaryApiKey && cloudinaryApiSecret);
+if (hasCloudinaryCredentials) {
+  if (cloudinaryUrl) {
+    cloudinary.config({ secure: true });
+  } else {
+    cloudinary.config({
+      cloud_name: cloudinaryCloudName,
+      api_key: cloudinaryApiKey,
+      api_secret: cloudinaryApiSecret,
+      secure: true
+    });
+  }
 }
 var s3Bucket = process.env.AWS_S3_BUCKET || "fern-foley-documents-vault";
 var hasAwsCredentials = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
@@ -5117,6 +5135,32 @@ function validateFileType(fileName, mimeType) {
   return { valid: true, extension: ext.toUpperCase() };
 }
 async function uploadToS3(params) {
+  if (hasCloudinaryCredentials) {
+    const ext = path2.extname(params.key).toLowerCase().replace(".", "");
+    const isImage = ["png", "jpg", "jpeg", "webp", "gif", "svg"].includes(ext);
+    const resourceType = isImage ? "image" : "raw";
+    const publicId = isImage ? params.key.replace(/\.[^/.]+$/, "") : params.key;
+    return new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          public_id: publicId,
+          resource_type: resourceType,
+          overwrite: true
+        },
+        (error, result) => {
+          if (error || !result) {
+            console.error("[s3Service] Cloudinary upload failed:", error);
+            return reject(error || new Error("Cloudinary upload returned empty response"));
+          }
+          resolve({
+            s3Key: result.secure_url,
+            s3Bucket: "cloudinary"
+          });
+        }
+      );
+      uploadStream.end(params.body);
+    });
+  }
   if (s3Client && hasAwsCredentials) {
     await s3Client.send(
       new PutObjectCommand({
@@ -5134,9 +5178,20 @@ async function uploadToS3(params) {
     fs.mkdirSync(destDir, { recursive: true });
   }
   fs.writeFileSync(destPath, params.body);
-  return { s3Key: params.key, s3Bucket };
+  return { s3Key: params.key, s3Bucket: "local" };
 }
 async function getFromS3(key) {
+  if (key.startsWith("http://") || key.startsWith("https://")) {
+    const response = await fetch(key);
+    if (!response.ok) {
+      throw new Error(`Failed to retrieve file from remote storage (HTTP ${response.status})`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    return {
+      buffer: Buffer.from(arrayBuffer),
+      contentType: response.headers.get("content-type") || "application/octet-stream"
+    };
+  }
   if (s3Client && hasAwsCredentials) {
     const response = await s3Client.send(
       new GetObjectCommand({
@@ -5162,6 +5217,21 @@ async function getFromS3(key) {
 }
 async function deleteFromS3(key) {
   try {
+    if (key.startsWith("http://") || key.startsWith("https://")) {
+      if (hasCloudinaryCredentials) {
+        const match = key.match(/\/res\.cloudinary\.com\/[^\/]+\/(image|raw|video)\/upload\/(?:v\d+\/)?(.+)$/);
+        if (match) {
+          const resourceType = match[1];
+          let publicId = match[2];
+          if (resourceType === "image") {
+            publicId = publicId.replace(/\.[a-zA-Z0-9]+$/, "");
+          }
+          await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
+          return true;
+        }
+      }
+      return true;
+    }
     if (s3Client && hasAwsCredentials) {
       await s3Client.send(
         new DeleteObjectCommand({

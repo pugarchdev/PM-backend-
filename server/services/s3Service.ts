@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { v2 as cloudinary } from 'cloudinary';
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
 export const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
@@ -31,10 +32,34 @@ try {
     fs.mkdirSync(LOCAL_S3_DIR, { recursive: true });
   }
 } catch {
-  // Silent fallback if filesystem is read-only and AWS S3 credentials are used
+  // Silent fallback if filesystem is read-only
 }
 
-// Check if actual AWS S3 credentials exist
+// 1. Cloudinary configuration
+const cloudinaryCloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+const cloudinaryApiKey = process.env.CLOUDINARY_API_KEY?.trim();
+const cloudinaryApiSecret = process.env.CLOUDINARY_API_SECRET?.trim();
+const cloudinaryUrl = process.env.CLOUDINARY_URL?.trim();
+
+export const hasCloudinaryCredentials = !!(
+  cloudinaryUrl ||
+  (cloudinaryCloudName && cloudinaryApiKey && cloudinaryApiSecret)
+);
+
+if (hasCloudinaryCredentials) {
+  if (cloudinaryUrl) {
+    cloudinary.config({ secure: true });
+  } else {
+    cloudinary.config({
+      cloud_name: cloudinaryCloudName,
+      api_key: cloudinaryApiKey,
+      api_secret: cloudinaryApiSecret,
+      secure: true,
+    });
+  }
+}
+
+// 2. AWS S3 configuration
 const s3Bucket = process.env.AWS_S3_BUCKET || 'fern-foley-documents-vault';
 const hasAwsCredentials = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
 
@@ -66,11 +91,46 @@ export function validateFileType(fileName: string, mimeType: string): { valid: b
   return { valid: true, extension: ext.toUpperCase() };
 }
 
+/**
+ * Uploads a file buffer either to Cloudinary (if configured), AWS S3 (if configured), or local filesystem fallback.
+ */
 export async function uploadToS3(params: {
   key: string;
   body: Buffer;
   contentType: string;
 }): Promise<{ s3Key: string; s3Bucket: string }> {
+  // Option A: Cloudinary
+  if (hasCloudinaryCredentials) {
+    const ext = path.extname(params.key).toLowerCase().replace('.', '');
+    const isImage = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(ext);
+    const resourceType = isImage ? 'image' : 'raw';
+
+    // Normalize public_id: Cloudinary image public_ids typically don't have file extension
+    const publicId = isImage ? params.key.replace(/\.[^/.]+$/, '') : params.key;
+
+    return new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          public_id: publicId,
+          resource_type: resourceType,
+          overwrite: true,
+        },
+        (error, result) => {
+          if (error || !result) {
+            console.error('[s3Service] Cloudinary upload failed:', error);
+            return reject(error || new Error('Cloudinary upload returned empty response'));
+          }
+          resolve({
+            s3Key: result.secure_url,
+            s3Bucket: 'cloudinary',
+          });
+        }
+      );
+      uploadStream.end(params.body);
+    });
+  }
+
+  // Option B: AWS S3
   if (s3Client && hasAwsCredentials) {
     await s3Client.send(
       new PutObjectCommand({
@@ -83,7 +143,7 @@ export async function uploadToS3(params: {
     return { s3Key: params.key, s3Bucket };
   }
 
-  // Fallback to local S3 directory structure
+  // Option C: Local filesystem fallback
   const destPath = path.join(LOCAL_S3_DIR, params.key);
   const destDir = path.dirname(destPath);
   if (!fs.existsSync(destDir)) {
@@ -91,10 +151,27 @@ export async function uploadToS3(params: {
   }
 
   fs.writeFileSync(destPath, params.body);
-  return { s3Key: params.key, s3Bucket };
+  return { s3Key: params.key, s3Bucket: 'local' };
 }
 
+/**
+ * Retrieves file buffer from Cloudinary URL, AWS S3, or local filesystem fallback.
+ */
 export async function getFromS3(key: string): Promise<{ buffer: Buffer; contentType: string }> {
+  // If key is a full URL (Cloudinary secure_url)
+  if (key.startsWith('http://') || key.startsWith('https://')) {
+    const response = await fetch(key);
+    if (!response.ok) {
+      throw new Error(`Failed to retrieve file from remote storage (HTTP ${response.status})`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    return {
+      buffer: Buffer.from(arrayBuffer),
+      contentType: response.headers.get('content-type') || 'application/octet-stream',
+    };
+  }
+
+  // AWS S3
   if (s3Client && hasAwsCredentials) {
     const response = await s3Client.send(
       new GetObjectCommand({
@@ -113,7 +190,7 @@ export async function getFromS3(key: string): Promise<{ buffer: Buffer; contentT
     return { buffer, contentType: response.ContentType || 'application/octet-stream' };
   }
 
-  // Read from local S3 storage
+  // Read from local storage fallback
   const filePath = path.join(LOCAL_S3_DIR, key);
   if (!fs.existsSync(filePath)) {
     throw new Error('File not found in storage');
@@ -123,8 +200,29 @@ export async function getFromS3(key: string): Promise<{ buffer: Buffer; contentT
   return { buffer, contentType: 'application/octet-stream' };
 }
 
+/**
+ * Deletes file from Cloudinary, AWS S3, or local storage.
+ */
 export async function deleteFromS3(key: string): Promise<boolean> {
   try {
+    // If it's a Cloudinary URL
+    if (key.startsWith('http://') || key.startsWith('https://')) {
+      if (hasCloudinaryCredentials) {
+        const match = key.match(/\/res\.cloudinary\.com\/[^\/]+\/(image|raw|video)\/upload\/(?:v\d+\/)?(.+)$/);
+        if (match) {
+          const resourceType = match[1] as 'image' | 'raw' | 'video';
+          let publicId = match[2];
+          if (resourceType === 'image') {
+            publicId = publicId.replace(/\.[a-zA-Z0-9]+$/, '');
+          }
+          await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
+          return true;
+        }
+      }
+      return true;
+    }
+
+    // AWS S3
     if (s3Client && hasAwsCredentials) {
       await s3Client.send(
         new DeleteObjectCommand({
@@ -135,6 +233,7 @@ export async function deleteFromS3(key: string): Promise<boolean> {
       return true;
     }
 
+    // Local filesystem
     const filePath = path.join(LOCAL_S3_DIR, key);
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
@@ -145,3 +244,4 @@ export async function deleteFromS3(key: string): Promise<boolean> {
     return false;
   }
 }
+
