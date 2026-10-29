@@ -276,9 +276,12 @@ async function getVisibleDirectoryUserIds(ctx) {
 async function getLeaveApprover(userId) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, managerId: true }
+    select: { id: true, role: true, managerId: true }
   });
-  if (!user || !user.managerId) {
+  if (!user || user.role === "CEO") {
+    return null;
+  }
+  if (!user.managerId) {
     const executive = await prisma.user.findFirst({
       where: {
         id: { not: userId },
@@ -390,7 +393,7 @@ async function resolveLeaveNotificationRecipients(requesterId) {
 }
 function canViewLeaveRequest(ctx, leave) {
   if (leave.requestedBy === ctx.userId) return true;
-  if (ctx.isExecutive) return true;
+  if (ctx.isExecutive || ctx.roleRank <= 2 || ctx.roleName === "CTO") return true;
   if (ctx.allSubordinateIds.includes(leave.requestedBy)) return true;
   return false;
 }
@@ -413,7 +416,10 @@ function canDecideLeaveRequest(ctx, leave) {
   };
 }
 function canWithdrawLeaveRequest(ctx, leave) {
-  return leave.requestedBy === ctx.userId && leave.status === "Pending";
+  if (leave.requestedBy !== ctx.userId) return false;
+  if (leave.status === "Pending") return true;
+  if (ctx.isExecutive || ctx.roleRank === 1 || ctx.roleName === "CEO") return true;
+  return false;
 }
 async function getVisibleLeaveUserIds(ctx) {
   if (ctx.isExecutive) {
@@ -4639,6 +4645,27 @@ router5.post("/", async (req, res) => {
       });
     }
     const isPostBaseline = !!phase.project.baselineId;
+    if (validation.data.assigneeId) {
+      const now = /* @__PURE__ */ new Date();
+      const taskStart = new Date(validation.data.plannedStart);
+      const taskEnd = new Date(validation.data.plannedEnd);
+      const activeLeave = await prisma.leaveRequest.findFirst({
+        where: {
+          requestedBy: validation.data.assigneeId,
+          status: "Approved",
+          OR: [
+            { startDate: { lte: now }, endDate: { gte: now } },
+            { startDate: { lte: taskEnd }, endDate: { gte: taskStart } }
+          ]
+        },
+        include: { requester: { select: { name: true } } }
+      });
+      if (activeLeave) {
+        return res.status(400).json({
+          error: `Cannot assign task to ${activeLeave.requester.name}: User is on approved leave (${new Date(activeLeave.startDate).toLocaleDateString()} \u2013 ${new Date(activeLeave.endDate).toLocaleDateString()}).`
+        });
+      }
+    }
     const task = await prisma.task.create({
       data: {
         phaseId: validation.data.phaseId,
@@ -4739,6 +4766,27 @@ router5.patch("/:id", async (req, res) => {
       const completionCheck = await verifyTaskCompletion(task.id);
       if (!completionCheck.allowed) {
         return res.status(400).json({ error: completionCheck.reason });
+      }
+    }
+    if (data.assigneeId && data.assigneeId !== task.assigneeId) {
+      const now = /* @__PURE__ */ new Date();
+      const taskStart = data.plannedStart ? new Date(data.plannedStart) : task.plannedStart;
+      const taskEnd = data.plannedEnd ? new Date(data.plannedEnd) : task.plannedEnd;
+      const activeLeave = await prisma.leaveRequest.findFirst({
+        where: {
+          requestedBy: data.assigneeId,
+          status: "Approved",
+          OR: [
+            { startDate: { lte: now }, endDate: { gte: now } },
+            { startDate: { lte: taskEnd }, endDate: { gte: taskStart } }
+          ]
+        },
+        include: { requester: { select: { name: true } } }
+      });
+      if (activeLeave) {
+        return res.status(400).json({
+          error: `Cannot assign task to ${activeLeave.requester.name}: User is on approved leave (${new Date(activeLeave.startDate).toLocaleDateString()} \u2013 ${new Date(activeLeave.endDate).toLocaleDateString()}).`
+        });
       }
     }
     const updated = await prisma.task.update({
@@ -7623,6 +7671,12 @@ router12.post("/", requireAuth, async (req, res) => {
         return res.status(403).json({ error: "You do not have access to submit approvals for this project." });
       }
     }
+    if (type === "Budget") {
+      const isOwner = project.ownerId === user.id;
+      if (ctx.roleRank >= 3 && !isOwner && !ctx.isExecutive) {
+        return res.status(403).json({ error: "Employees are not authorized to submit budget approval requests." });
+      }
+    }
     const ceo = await prisma.user.findFirst({
       where: { role: "CEO" }
     });
@@ -8123,19 +8177,15 @@ var baselines_default = router13;
 // server/routes/changelog.ts
 init_prisma();
 import { Router as Router14 } from "express";
+init_authorizationService();
 var router14 = Router14();
 router14.get("/:id/changelog", requireAuth, async (req, res) => {
   try {
     const { id: projectId } = req.params;
     const user = req.user;
-    if (user.role !== "CEO") {
-      const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId, userId: user.id } }
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: "You do not have access to view this project change log." });
-      }
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canViewProject(ctx, projectId)) {
+      return res.status(403).json({ error: "You do not have access to view this project change log." });
     }
     const logs = await prisma.changeLogEntry.findMany({
       where: { projectId },
@@ -8146,10 +8196,24 @@ router14.get("/:id/changelog", requireAuth, async (req, res) => {
       orderBy: { createdAt: "desc" },
       include: { user: { select: { id: true, name: true } } }
     });
-    res.json({
-      changeLogs: logs,
-      statusOverrides: statusLogs
-    });
+    const mappedStatusLogs = statusLogs.map((s) => ({
+      id: s.id,
+      projectId: s.projectId,
+      what: "Status Override",
+      fromValue: s.fromStatus,
+      toValue: s.toStatus,
+      actorId: s.user?.name || s.overriddenBy,
+      at: s.createdAt,
+      sourceType: "STATUS",
+      sourceId: s.id,
+      action: "STATUS_OVERRIDE",
+      details: s.reason,
+      changedBy: s.user?.name || s.overriddenBy
+    }));
+    const unifiedLogs = [...logs, ...mappedStatusLogs].sort(
+      (a, b) => new Date(b.at).getTime() - new Date(a.at).getTime()
+    );
+    res.json(unifiedLogs);
   } catch (error) {
     console.error("Failed to get changelog:", error);
     res.status(500).json({ error: "Failed to retrieve change logs" });
@@ -9310,6 +9374,7 @@ router19.get("/", requireAuth, async (req, res) => {
     const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
     const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
     const skip = (pageNum - 1) * take;
+    const now = /* @__PURE__ */ new Date();
     const selectProjection = {
       id: true,
       name: true,
@@ -9324,8 +9389,21 @@ router19.get("/", requireAuth, async (req, res) => {
       },
       manager: {
         select: { id: true, name: true, role: true }
+      },
+      leaveRequests: {
+        where: {
+          status: "Approved",
+          startDate: { lte: now },
+          endDate: { gte: now }
+        },
+        select: { id: true }
       }
     };
+    const formatUser = (u) => ({
+      ...u,
+      isOnLeave: Array.isArray(u.leaveRequests) && u.leaveRequests.length > 0,
+      leaveRequests: void 0
+    });
     const validSortFields = ["name", "email", "department", "role"];
     const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : "name";
     const order = String(sortOrder).toLowerCase() === "desc" ? "desc" : "asc";
@@ -9341,10 +9419,11 @@ router19.get("/", requireAuth, async (req, res) => {
           take
         })
       ]);
+      const formattedUsers2 = users2.map(formatUser);
       const totalPages = Math.ceil(total / take) || 1;
       res.setHeader("X-Total-Count", String(total));
       return res.json({
-        users: users2,
+        users: formattedUsers2,
         pagination: {
           total,
           page: pageNum,
@@ -9358,8 +9437,9 @@ router19.get("/", requireAuth, async (req, res) => {
       select: selectProjection,
       orderBy: [{ role: "asc" }, { name: "asc" }]
     });
-    res.setHeader("X-Total-Count", String(users.length));
-    res.json(users);
+    const formattedUsers = users.map(formatUser);
+    res.setHeader("X-Total-Count", String(formattedUsers.length));
+    res.json(formattedUsers);
   } catch (error) {
     console.error("Failed to fetch users:", error);
     res.status(500).json({ error: "Failed to retrieve users" });
@@ -10033,31 +10113,21 @@ router21.get("/", requireAuth, async (req, res) => {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
     const { status, scope, startDate, endDate, search, page, limit } = req.query;
+    const isCEOorCTO = ctx.isExecutive || ctx.roleRank <= 2 || user.role === "CEO" || user.role === "CTO" || ctx.roleName === "CTO";
     const where = {};
-    if (scope === "mine") {
+    if (!isCEOorCTO || scope === "mine") {
       where.requestedBy = user.id;
     } else if (scope === "subordinates" || scope === "pending_review") {
-      if (!ctx.isExecutive) {
-        if (ctx.allSubordinateIds.length > 0) {
-          where.requestedBy = { in: ctx.allSubordinateIds };
-        } else {
-          where.requestedBy = { in: [] };
-        }
+      if (!ctx.isExecutive && ctx.roleRank > 2) {
+        where.requestedBy = { in: ctx.allSubordinateIds.length > 0 ? ctx.allSubordinateIds : [] };
       }
     } else if (scope === "team" || scope === "availability") {
-      if (!ctx.isExecutive) {
+      if (!ctx.isExecutive && ctx.roleRank > 2) {
         const sharedIds = await getSharedProjectUserIds(ctx);
         const subordinateSet = /* @__PURE__ */ new Set([user.id, ...ctx.allSubordinateIds, ...sharedIds]);
         where.requestedBy = { in: Array.from(subordinateSet) };
       }
     } else {
-      if (!ctx.isExecutive) {
-        if (ctx.allSubordinateIds.length > 0) {
-          where.requestedBy = { in: [user.id, ...ctx.allSubordinateIds] };
-        } else {
-          where.requestedBy = user.id;
-        }
-      }
     }
     if (status && typeof status === "string" && status !== "ALL") {
       where.status = status;
@@ -10125,14 +10195,14 @@ router21.get("/", requireAuth, async (req, res) => {
     const sanitizedRequests = requests.filter((reqItem) => {
       const isSelf = reqItem.requestedBy === ctx.userId;
       const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
-      if (isSelf || isSubordinate || ctx.isExecutive) {
+      if (isSelf || isSubordinate || isCEOorCTO) {
         return true;
       }
       return reqItem.status === "Approved";
     }).map((reqItem) => {
       const isSelf = reqItem.requestedBy === ctx.userId;
       const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
-      const hasFullAccess = isSelf || isSubordinate || ctx.isExecutive;
+      const hasFullAccess = isSelf || isSubordinate || isCEOorCTO;
       if (!hasFullAccess) {
         return {
           ...reqItem,
@@ -10263,7 +10333,8 @@ router21.post("/", requireAuth, async (req, res) => {
         error: `You already have a ${overlapping.status.toLowerCase()} leave request for overlapping dates (${new Date(overlapping.startDate).toLocaleDateString()} \u2013 ${new Date(overlapping.endDate).toLocaleDateString()}).`
       });
     }
-    const approver = await getLeaveApprover(user.id);
+    const isCEOUser = user.role === "CEO" || ctx.isExecutive && ctx.roleRank === 1;
+    const approver = isCEOUser ? null : await getLeaveApprover(user.id);
     const leave = await prisma.leaveRequest.create({
       data: {
         requestedBy: user.id,
@@ -10272,7 +10343,10 @@ router21.post("/", requireAuth, async (req, res) => {
         dayType: dayType || "Full day",
         leaveType,
         reason: typeof reason === "string" && reason.trim() ? reason.trim() : null,
-        status: "Pending"
+        status: isCEOUser ? "Approved" : "Pending",
+        reviewedBy: isCEOUser ? user.id : null,
+        reviewedAt: isCEOUser ? /* @__PURE__ */ new Date() : null,
+        reviewNote: isCEOUser ? reason ? `CEO leave: ${reason}` : "CEO self-declared leave" : null
       },
       include: {
         requester: {
@@ -10295,7 +10369,7 @@ router21.post("/", requireAuth, async (req, res) => {
         }
       }
     });
-    if (approver && approver.id !== user.id) {
+    if (!isCEOUser && approver && approver.id !== user.id) {
       try {
         await prisma.notification.create({
           data: {
@@ -10310,21 +10384,23 @@ router21.post("/", requireAuth, async (req, res) => {
         console.error("Failed to create leave request notification:", notifErr);
       }
     }
-    try {
-      await dispatchLeaveSubmissionEmails({
-        leaveId: leave.id,
-        requesterId: user.id,
-        requesterName: user.name,
-        requesterRole: leave.requester?.roleDefinition?.name || user.role,
-        leaveType: leave.leaveType,
-        dayType: leave.dayType,
-        startDate: leave.startDate,
-        endDate: leave.endDate,
-        submissionDate: leave.createdAt,
-        status: leave.status
-      });
-    } catch (emailErr) {
-      console.error("[LeaveAPI] Failed to dispatch leave submission emails:", emailErr.message || emailErr);
+    if (!isCEOUser) {
+      try {
+        await dispatchLeaveSubmissionEmails({
+          leaveId: leave.id,
+          requesterId: user.id,
+          requesterName: user.name,
+          requesterRole: leave.requester?.roleDefinition?.name || user.role,
+          leaveType: leave.leaveType,
+          dayType: leave.dayType,
+          startDate: leave.startDate,
+          endDate: leave.endDate,
+          submissionDate: leave.createdAt,
+          status: leave.status
+        });
+      } catch (emailErr) {
+        console.error("[LeaveAPI] Failed to dispatch leave submission emails:", emailErr.message || emailErr);
+      }
     }
     res.status(201).json({
       ...leave,
