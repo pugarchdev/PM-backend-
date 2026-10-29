@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
+import { getUserHierarchyContext, canViewProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -9,15 +10,10 @@ router.get('/:id/changelog', requireAuth, async (req: AuthRequest, res: Response
   try {
     const { id: projectId } = req.params;
     const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
 
-    if (user.role !== 'CEO') {
-      const isOwner = await prisma.project.findFirst({ where: { id: projectId, ownerId: user.id } });
-      const isMember = await prisma.projectMembership.findUnique({
-        where: { projectId_userId: { projectId, userId: user.id } },
-      });
-      if (!isOwner && !isMember) {
-        return res.status(403).json({ error: 'You do not have access to view this project change log.' });
-      }
+    if (!canViewProject(ctx, projectId)) {
+      return res.status(403).json({ error: 'You do not have access to view this project change log.' });
     }
 
     const logs = await prisma.changeLogEntry.findMany({
@@ -32,10 +28,26 @@ router.get('/:id/changelog', requireAuth, async (req: AuthRequest, res: Response
       include: { user: { select: { id: true, name: true } } },
     });
 
-    res.json({
-      changeLogs: logs,
-      statusOverrides: statusLogs,
-    });
+    const mappedStatusLogs = statusLogs.map((s) => ({
+      id: s.id,
+      projectId: s.projectId,
+      what: 'Status Override',
+      fromValue: s.fromStatus,
+      toValue: s.toStatus,
+      actorId: s.user?.name || s.overriddenBy,
+      at: s.createdAt,
+      sourceType: 'STATUS',
+      sourceId: s.id,
+      action: 'STATUS_OVERRIDE',
+      details: s.reason,
+      changedBy: s.user?.name || s.overriddenBy,
+    }));
+
+    const unifiedLogs = [...logs, ...mappedStatusLogs].sort(
+      (a, b) => new Date(b.at).getTime() - new Date(a.at).getTime()
+    );
+
+    res.json(unifiedLogs);
   } catch (error) {
     console.error('Failed to get changelog:', error);
     res.status(500).json({ error: 'Failed to retrieve change logs' });

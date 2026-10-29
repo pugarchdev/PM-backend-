@@ -394,6 +394,30 @@ router.post('/', async (req: AuthRequest, res: Response) => {
 
     const isPostBaseline = !!phase.project.baselineId;
 
+    if (validation.data.assigneeId) {
+      const now = new Date();
+      const taskStart = new Date(validation.data.plannedStart);
+      const taskEnd = new Date(validation.data.plannedEnd);
+
+      const activeLeave = await prisma.leaveRequest.findFirst({
+        where: {
+          requestedBy: validation.data.assigneeId,
+          status: 'Approved',
+          OR: [
+            { startDate: { lte: now }, endDate: { gte: now } },
+            { startDate: { lte: taskEnd }, endDate: { gte: taskStart } },
+          ],
+        },
+        include: { requester: { select: { name: true } } },
+      });
+
+      if (activeLeave) {
+        return res.status(400).json({
+          error: `Cannot assign task to ${activeLeave.requester.name}: User is on approved leave (${new Date(activeLeave.startDate).toLocaleDateString()} – ${new Date(activeLeave.endDate).toLocaleDateString()}).`,
+        });
+      }
+    }
+
     const task = await prisma.task.create({
       data: {
         phaseId: validation.data.phaseId,
@@ -511,6 +535,30 @@ router.patch('/:id', async (req: AuthRequest, res: Response) => {
       const completionCheck = await verifyTaskCompletion(task.id);
       if (!completionCheck.allowed) {
         return res.status(400).json({ error: completionCheck.reason });
+      }
+    }
+
+    if (data.assigneeId && data.assigneeId !== task.assigneeId) {
+      const now = new Date();
+      const taskStart = data.plannedStart ? new Date(data.plannedStart) : task.plannedStart;
+      const taskEnd = data.plannedEnd ? new Date(data.plannedEnd) : task.plannedEnd;
+
+      const activeLeave = await prisma.leaveRequest.findFirst({
+        where: {
+          requestedBy: data.assigneeId,
+          status: 'Approved',
+          OR: [
+            { startDate: { lte: now }, endDate: { gte: now } },
+            { startDate: { lte: taskEnd }, endDate: { gte: taskStart } },
+          ],
+        },
+        include: { requester: { select: { name: true } } },
+      });
+
+      if (activeLeave) {
+        return res.status(400).json({
+          error: `Cannot assign task to ${activeLeave.requester.name}: User is on approved leave (${new Date(activeLeave.startDate).toLocaleDateString()} – ${new Date(activeLeave.endDate).toLocaleDateString()}).`,
+        });
       }
     }
 

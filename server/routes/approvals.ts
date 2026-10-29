@@ -248,6 +248,13 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
       }
     }
 
+    if (type === 'Budget') {
+      const isOwner = project.ownerId === user.id;
+      if (ctx.roleRank >= 3 && !isOwner && !ctx.isExecutive) {
+        return res.status(403).json({ error: 'Employees are not authorized to submit budget approval requests.' });
+      }
+    }
+
     // Find a CEO in the system for routing
     const ceo = await prisma.user.findFirst({
       where: { role: 'CEO' },

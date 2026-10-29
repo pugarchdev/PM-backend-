@@ -392,10 +392,14 @@ export async function getVisibleDirectoryUserIds(ctx: UserHierarchyContext): Pro
 export async function getLeaveApprover(userId: string): Promise<{ id: string; name: string; email: string; role: string } | null> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, managerId: true },
+    select: { id: true, role: true, managerId: true },
   });
 
-  if (!user || !user.managerId) {
+  if (!user || user.role === 'CEO') {
+    return null;
+  }
+
+  if (!user.managerId) {
     // If no direct manager, find the highest-ranking executive or active administrator (excluding the user themselves)
     const executive = await prisma.user.findFirst({
       where: {
@@ -565,7 +569,7 @@ export function canViewLeaveRequest(
   leave: { requestedBy: string; status: string }
 ): boolean {
   if (leave.requestedBy === ctx.userId) return true;
-  if (ctx.isExecutive) return true;
+  if (ctx.isExecutive || ctx.roleRank <= 2 || ctx.roleName === 'CTO') return true;
   if (ctx.allSubordinateIds.includes(leave.requestedBy)) return true;
   return false;
 }
@@ -610,7 +614,10 @@ export function canWithdrawLeaveRequest(
   ctx: UserHierarchyContext,
   leave: { requestedBy: string; status: string }
 ): boolean {
-  return leave.requestedBy === ctx.userId && leave.status === 'Pending';
+  if (leave.requestedBy !== ctx.userId) return false;
+  if (leave.status === 'Pending') return true;
+  if (ctx.isExecutive || ctx.roleRank === 1 || ctx.roleName === 'CEO') return true;
+  return false;
 }
 
 /**

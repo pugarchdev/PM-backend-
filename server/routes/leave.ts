@@ -30,33 +30,24 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     const ctx = await getUserHierarchyContext(user.id);
     const { status, scope, startDate, endDate, search, page, limit } = req.query;
 
+    const isCEOorCTO = ctx.isExecutive || ctx.roleRank <= 2 || user.role === 'CEO' || user.role === 'CTO' || ctx.roleName === 'CTO';
     const where: Prisma.LeaveRequestWhereInput = {};
 
-    if (scope === 'mine') {
+    if (!isCEOorCTO || scope === 'mine') {
+      // Employees and interns strictly see ONLY their own leave requests
       where.requestedBy = user.id;
     } else if (scope === 'subordinates' || scope === 'pending_review') {
-      if (!ctx.isExecutive) {
-        if (ctx.allSubordinateIds.length > 0) {
-          where.requestedBy = { in: ctx.allSubordinateIds };
-        } else {
-          where.requestedBy = { in: [] };
-        }
+      if (!ctx.isExecutive && ctx.roleRank > 2) {
+        where.requestedBy = { in: ctx.allSubordinateIds.length > 0 ? ctx.allSubordinateIds : [] };
       }
     } else if (scope === 'team' || scope === 'availability') {
-      if (!ctx.isExecutive) {
+      if (!ctx.isExecutive && ctx.roleRank > 2) {
         const sharedIds = await getSharedProjectUserIds(ctx);
         const subordinateSet = new Set([user.id, ...ctx.allSubordinateIds, ...sharedIds]);
         where.requestedBy = { in: Array.from(subordinateSet) };
       }
     } else {
-      // Default:
-      if (!ctx.isExecutive) {
-        if (ctx.allSubordinateIds.length > 0) {
-          where.requestedBy = { in: [user.id, ...ctx.allSubordinateIds] };
-        } else {
-          where.requestedBy = user.id;
-        }
-      }
+      // Default for CEO and CTO: view all organization leave requests (no requestedBy restriction)
     }
 
     if (status && typeof status === 'string' && status !== 'ALL') {
@@ -129,14 +120,14 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     ]);
 
     // PRIVACY ENFORCEMENT:
-    // If request belongs to a colleague who is NOT a subordinate and user is NOT an executive:
-    // - Only APPROVED requests may be viewed (for team availability).
-    // - The 'reason' and 'reviewNote' fields are sanitized to protect sensitive medical or personal privacy.
+    // CEO & CTO have complete visibility across the organization.
+    // Managers have visibility for their subordinates.
+    // Non-executive peers only see approved dates for scheduling without private reasons.
     const sanitizedRequests = requests
       .filter((reqItem) => {
         const isSelf = reqItem.requestedBy === ctx.userId;
         const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
-        if (isSelf || isSubordinate || ctx.isExecutive) {
+        if (isSelf || isSubordinate || isCEOorCTO) {
           return true;
         }
         // Colleague on shared project: only approved leaves can be seen for scheduling
@@ -145,7 +136,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       .map((reqItem) => {
         const isSelf = reqItem.requestedBy === ctx.userId;
         const isSubordinate = ctx.allSubordinateIds.includes(reqItem.requestedBy);
-        const hasFullAccess = isSelf || isSubordinate || ctx.isExecutive;
+        const hasFullAccess = isSelf || isSubordinate || isCEOorCTO;
 
         if (!hasFullAccess) {
           return {
@@ -314,8 +305,10 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
       });
     }
 
-    // Resolve designated approver using dynamic reporting hierarchy
-    const approver = await getLeaveApprover(user.id);
+    const isCEOUser = user.role === 'CEO' || (ctx.isExecutive && ctx.roleRank === 1);
+
+    // Resolve designated approver using dynamic reporting hierarchy (CEO has no approver)
+    const approver = isCEOUser ? null : await getLeaveApprover(user.id);
 
     const leave = await prisma.leaveRequest.create({
       data: {
@@ -325,7 +318,10 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
         dayType: dayType || 'Full day',
         leaveType,
         reason: typeof reason === 'string' && reason.trim() ? reason.trim() : null,
-        status: 'Pending',
+        status: isCEOUser ? 'Approved' : 'Pending',
+        reviewedBy: isCEOUser ? user.id : null,
+        reviewedAt: isCEOUser ? new Date() : null,
+        reviewNote: isCEOUser ? (reason ? `CEO leave: ${reason}` : 'CEO self-declared leave') : null,
       },
       include: {
         requester: {
@@ -349,8 +345,8 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
       },
     });
 
-    // Notify the designated direct approver in the hierarchy (if not self)
-    if (approver && approver.id !== user.id) {
+    // Notify the designated direct approver in the hierarchy (only for non-CEO requests)
+    if (!isCEOUser && approver && approver.id !== user.id) {
       try {
         await prisma.notification.create({
           data: {
@@ -366,23 +362,25 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
       }
     }
 
-    // Dispatch email notifications in compliance with dynamic leave recipient rules
-    try {
-      await dispatchLeaveSubmissionEmails({
-        leaveId: leave.id,
-        requesterId: user.id,
-        requesterName: user.name,
-        requesterRole: (leave.requester as any)?.roleDefinition?.name || user.role,
-        leaveType: leave.leaveType,
-        dayType: leave.dayType,
-        startDate: leave.startDate,
-        endDate: leave.endDate,
-        submissionDate: leave.createdAt,
-        status: leave.status,
-      });
-    } catch (emailErr: any) {
-      // Non-blocking: email delivery errors must NOT rollback or fail the saved leave request
-      console.error('[LeaveAPI] Failed to dispatch leave submission emails:', emailErr.message || emailErr);
+    // Dispatch email notifications in compliance with dynamic leave recipient rules (skip approval email for CEO)
+    if (!isCEOUser) {
+      try {
+        await dispatchLeaveSubmissionEmails({
+          leaveId: leave.id,
+          requesterId: user.id,
+          requesterName: user.name,
+          requesterRole: (leave.requester as any)?.roleDefinition?.name || user.role,
+          leaveType: leave.leaveType,
+          dayType: leave.dayType,
+          startDate: leave.startDate,
+          endDate: leave.endDate,
+          submissionDate: leave.createdAt,
+          status: leave.status,
+        });
+      } catch (emailErr: any) {
+        // Non-blocking: email delivery errors must NOT rollback or fail the saved leave request
+        console.error('[LeaveAPI] Failed to dispatch leave submission emails:', emailErr.message || emailErr);
+      }
     }
 
     res.status(201).json({

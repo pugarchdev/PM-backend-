@@ -105,6 +105,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     const take = limit ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 50)) : 50;
     const skip = (pageNum - 1) * take;
 
+    const now = new Date();
     const selectProjection = {
       id: true,
       name: true,
@@ -120,7 +121,21 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       manager: {
         select: { id: true, name: true, role: true },
       },
+      leaveRequests: {
+        where: {
+          status: 'Approved',
+          startDate: { lte: now },
+          endDate: { gte: now },
+        },
+        select: { id: true },
+      },
     };
+
+    const formatUser = (u: any) => ({
+      ...u,
+      isOnLeave: Array.isArray(u.leaveRequests) && u.leaveRequests.length > 0,
+      leaveRequests: undefined,
+    });
 
     const validSortFields = ['name', 'email', 'department', 'role'];
     const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : 'name';
@@ -139,10 +154,11 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
         }),
       ]);
 
+      const formattedUsers = users.map(formatUser);
       const totalPages = Math.ceil(total / take) || 1;
       res.setHeader('X-Total-Count', String(total));
       return res.json({
-        users,
+        users: formattedUsers,
         pagination: {
           total,
           page: pageNum,
@@ -158,8 +174,9 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       orderBy: [{ role: 'asc' }, { name: 'asc' }],
     });
 
-    res.setHeader('X-Total-Count', String(users.length));
-    res.json(users);
+    const formattedUsers = users.map(formatUser);
+    res.setHeader('X-Total-Count', String(formattedUsers.length));
+    res.json(formattedUsers);
   } catch (error: any) {
     console.error('Failed to fetch users:', error);
     res.status(500).json({ error: 'Failed to retrieve users' });
