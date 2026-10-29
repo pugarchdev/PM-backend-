@@ -12,6 +12,7 @@ import {
   MAX_EVIDENCE_FILE_SIZE_BYTES,
   MAX_EVIDENCE_ATTACHMENTS,
 } from '../services/evidenceService.js';
+import { deleteFromS3 } from '../services/s3Service.js';
 
 const router = Router();
 
@@ -596,6 +597,111 @@ router.post('/:id/reopen', requireAuth, async (req: AuthRequest, res: Response) 
     res.json({ message: 'Issue reopened', issue: updated });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to reopen issue' });
+  }
+});
+
+// DELETE /api/issues/:id - Delete issue and all its evidence attachments from Cloudinary/S3 and DB
+router.delete('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const issue = await prisma.issue.findUnique({
+      where: { id: req.params.id },
+      include: {
+        attachments: true,
+        project: { select: { id: true, ownerId: true } },
+      },
+    });
+
+    if (!issue) {
+      return res.status(404).json({ error: 'Issue not found' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const isOwner = issue.project?.ownerId === user.id;
+    const isRaiser = issue.raisedBy === user.id;
+    const canDelete = ctx.isExecutive || isOwner || isRaiser || canManageIssue(ctx, issue);
+
+    if (!canDelete) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to delete this issue.' });
+    }
+
+    // Delete all attachments from Cloudinary / S3 / local storage
+    for (const att of issue.attachments) {
+      if (att.s3Key) {
+        try {
+          await deleteFromS3(att.s3Key);
+        } catch (delErr) {
+          console.warn(`[issues] Failed to delete Cloudinary evidence file for attachment ${att.id}:`, delErr);
+        }
+      }
+    }
+
+    // Delete issue record from DB (cascades to IssueAttachment)
+    await prisma.issue.delete({
+      where: { id: issue.id },
+    });
+
+    res.json({
+      success: true,
+      message: `Issue "${issue.title}" and its ${issue.attachments.length} attachment(s) deleted permanently from cloud storage.`,
+    });
+  } catch (error: any) {
+    console.error('Failed to delete issue:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete issue' });
+  }
+});
+
+// DELETE /api/issues/:id/attachments/:attachmentId - Delete single attachment from Cloudinary/S3 and DB
+router.delete('/:id/attachments/:attachmentId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const { id: issueId, attachmentId } = req.params;
+
+    const issue = await prisma.issue.findUnique({
+      where: { id: issueId },
+      include: {
+        project: { select: { id: true, ownerId: true } },
+      },
+    });
+
+    if (!issue) {
+      return res.status(404).json({ error: 'Issue not found' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const isOwner = issue.project?.ownerId === user.id;
+    const isRaiser = issue.raisedBy === user.id;
+    const canDelete = ctx.isExecutive || isOwner || isRaiser || canManageIssue(ctx, issue);
+
+    if (!canDelete) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to delete this attachment.' });
+    }
+
+    const attachment = await prisma.issueAttachment.findFirst({
+      where: { id: attachmentId, issueId },
+    });
+
+    if (!attachment) {
+      return res.status(404).json({ error: 'Attachment not found' });
+    }
+
+    // Delete from Cloudinary / S3
+    if (attachment.s3Key) {
+      await deleteFromS3(attachment.s3Key);
+    }
+
+    // Delete from DB
+    await prisma.issueAttachment.delete({
+      where: { id: attachmentId },
+    });
+
+    res.json({
+      success: true,
+      message: `Attachment "${attachment.fileName}" deleted permanently from cloud storage.`,
+    });
+  } catch (error: any) {
+    console.error('Failed to delete attachment:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete attachment' });
   }
 });
 

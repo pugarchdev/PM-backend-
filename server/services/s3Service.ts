@@ -205,25 +205,58 @@ export async function getFromS3(key: string): Promise<{ buffer: Buffer; contentT
  */
 export async function deleteFromS3(key: string): Promise<boolean> {
   try {
-    // If it's a Cloudinary URL
-    if (key.startsWith('http://') || key.startsWith('https://')) {
-      if (hasCloudinaryCredentials) {
-        const match = key.match(/\/res\.cloudinary\.com\/[^\/]+\/(image|raw|video)\/upload\/(?:v\d+\/)?(.+)$/);
-        if (match) {
-          const resourceType = match[1] as 'image' | 'raw' | 'video';
-          let publicId = match[2];
-          if (resourceType === 'image') {
-            publicId = publicId.replace(/\.[a-zA-Z0-9]+$/, '');
+    if (!key) return true;
+
+    // Option A: Cloudinary deletion
+    if (hasCloudinaryCredentials) {
+      // 1. If key is a full Cloudinary URL
+      const cloudinaryUrlMatch = key.match(
+        /\/res\.cloudinary\.com\/[^\/]+\/(image|raw|video)\/upload\/(?:[a-zA-Z0-9_,]+\/)*(?:v\d+\/)?([^?#]+)/
+      );
+
+      if (cloudinaryUrlMatch) {
+        const resourceType = cloudinaryUrlMatch[1] as 'image' | 'raw' | 'video';
+        let publicId = decodeURIComponent(cloudinaryUrlMatch[2]);
+        if (resourceType === 'image') {
+          // Cloudinary images have their file extension stripped from publicId
+          publicId = publicId.replace(/\.[a-zA-Z0-9]+$/, '');
+        }
+
+        try {
+          const res = await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
+          console.log(`[s3Service] Cloudinary destroy result for "${publicId}" (${resourceType}):`, res);
+
+          // If not found under specified resource_type, try alternate resource_type as fallback
+          if (res?.result === 'not found') {
+            const altType = resourceType === 'image' ? 'raw' : 'image';
+            const altId = altType === 'image' ? publicId.replace(/\.[a-zA-Z0-9]+$/, '') : publicId;
+            const retryRes = await cloudinary.uploader.destroy(altId, { resource_type: altType });
+            console.log(`[s3Service] Cloudinary retry destroy result for "${altId}" (${altType}):`, retryRes);
           }
-          await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
-          return true;
+        } catch (cErr) {
+          console.warn(`[s3Service] Error calling cloudinary.uploader.destroy for "${publicId}":`, cErr);
+        }
+        return true;
+      }
+
+      // 2. If key is a relative storage key (e.g. "projects/...") without http(s)
+      if (!key.startsWith('http://') && !key.startsWith('https://')) {
+        const ext = path.extname(key).toLowerCase().replace('.', '');
+        const isImage = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(ext);
+        const resourceType = isImage ? 'image' : 'raw';
+        const publicId = isImage ? key.replace(/\.[^/.]+$/, '') : key;
+
+        try {
+          const res = await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
+          console.log(`[s3Service] Cloudinary direct destroy result for "${publicId}" (${resourceType}):`, res);
+        } catch (cErr) {
+          // Non-blocking fallback
         }
       }
-      return true;
     }
 
-    // AWS S3
-    if (s3Client && hasAwsCredentials) {
+    // Option B: AWS S3
+    if (s3Client && hasAwsCredentials && !key.startsWith('http://') && !key.startsWith('https://')) {
       await s3Client.send(
         new DeleteObjectCommand({
           Bucket: s3Bucket,
@@ -233,10 +266,12 @@ export async function deleteFromS3(key: string): Promise<boolean> {
       return true;
     }
 
-    // Local filesystem
-    const filePath = path.join(LOCAL_S3_DIR, key);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+    // Option C: Local filesystem
+    if (!key.startsWith('http://') && !key.startsWith('https://')) {
+      const filePath = path.join(LOCAL_S3_DIR, key);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
     }
     return true;
   } catch (err) {

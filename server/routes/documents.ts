@@ -6,6 +6,7 @@ import {
   validateFileType,
   uploadToS3,
   getFromS3,
+  deleteFromS3,
   MAX_FILE_SIZE_BYTES,
 } from '../services/s3Service.js';
 import { getUserHierarchyContext, canViewProject } from '../services/authorizationService.js';
@@ -330,6 +331,143 @@ router.get('/documents/:id/download', requireAuth, async (req: AuthRequest, res:
   } catch (error) {
     console.error('Failed to download document:', error);
     res.status(500).json({ error: 'Failed to retrieve document binary from storage' });
+  }
+});
+
+// DELETE /api/documents/:id — Delete entire document and all its versions from DB and Cloudinary
+router.delete('/documents/:id', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id: documentId } = req.params;
+    const user = req.user!;
+
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      include: {
+        versions: true,
+        project: { select: { id: true, ownerId: true } },
+      },
+    });
+
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const isOwner = doc.project?.ownerId === user.id;
+    const isUploader = doc.uploadedBy === user.id;
+    const canDelete = ctx.isExecutive || isOwner || isUploader;
+
+    if (!canDelete) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to delete this document.' });
+    }
+
+    // Delete all version files from Cloudinary / S3 / local storage
+    for (const version of doc.versions) {
+      if (version.s3Key) {
+        try {
+          await deleteFromS3(version.s3Key);
+        } catch (delErr) {
+          console.warn(`[documents] Failed to delete Cloudinary file for version ${version.version}:`, delErr);
+        }
+      }
+    }
+
+    // Delete document record from DB (cascades to DocumentVersion)
+    await prisma.document.delete({
+      where: { id: documentId },
+    });
+
+    res.json({
+      success: true,
+      message: `Document "${doc.title}" and its ${doc.versions.length} version(s) deleted permanently from cloud storage.`,
+    });
+  } catch (error: any) {
+    console.error('Failed to delete document:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete document' });
+  }
+});
+
+// DELETE /api/documents/:id/versions/:version — Delete specific version from DB and Cloudinary
+router.delete('/documents/:id/versions/:version', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id: documentId, version: versionStr } = req.params;
+    const versionNum = parseInt(versionStr, 10);
+    const user = req.user!;
+
+    if (isNaN(versionNum)) {
+      return res.status(400).json({ error: 'Invalid version number' });
+    }
+
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      include: {
+        versions: { orderBy: { version: 'desc' } },
+        project: { select: { id: true, ownerId: true } },
+      },
+    });
+
+    if (!doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const isOwner = doc.project?.ownerId === user.id;
+    const isUploader = doc.uploadedBy === user.id;
+    const canDelete = ctx.isExecutive || isOwner || isUploader;
+
+    if (!canDelete) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to delete this version.' });
+    }
+
+    const targetVersion = doc.versions.find((v) => v.version === versionNum);
+    if (!targetVersion) {
+      return res.status(404).json({ error: `Version ${versionNum} not found` });
+    }
+
+    // If this is the only remaining version, delete the whole document
+    if (doc.versions.length <= 1) {
+      if (targetVersion.s3Key) {
+        await deleteFromS3(targetVersion.s3Key);
+      }
+      await prisma.document.delete({ where: { id: documentId } });
+      return res.json({
+        success: true,
+        message: 'Document and its only version deleted permanently from cloud storage.',
+        documentDeleted: true,
+      });
+    }
+
+    // Delete the file from Cloudinary / S3 / local
+    if (targetVersion.s3Key) {
+      await deleteFromS3(targetVersion.s3Key);
+    }
+
+    // Delete the version record
+    await prisma.documentVersion.delete({
+      where: { id: targetVersion.id },
+    });
+
+    // If the deleted version was currentVersion, update document to point to highest remaining version
+    if (doc.currentVersion === versionNum) {
+      const remainingVersions = doc.versions.filter((v) => v.version !== versionNum);
+      const highestRemaining = remainingVersions[0];
+      await prisma.document.update({
+        where: { id: documentId },
+        data: {
+          currentVersion: highestRemaining.version,
+          fileType: highestRemaining.fileName.split('.').pop()?.toUpperCase() || doc.fileType,
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Version ${versionNum} deleted permanently from cloud storage.`,
+      documentDeleted: false,
+    });
+  } catch (error: any) {
+    console.error('Failed to delete document version:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete document version' });
   }
 });
 
