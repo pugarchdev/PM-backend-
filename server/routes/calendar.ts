@@ -280,7 +280,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// GET /api/calendar/today - Today's events for Alerts page preview
+// GET /api/calendar/today - Today's tasks only for Alerts/Dashboard preview
 router.get('/today', async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user;
@@ -288,22 +288,92 @@ router.get('/today', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const ctx = await getUserHierarchyContext(user.id);
+    const visibleProjectIds = ctx.authorizedProjectIds;
 
-    const events = await getCalendarEvents(user, today, tomorrow);
-    
-    // Sort by date and limit to top 5
-    const todayEvents = events
-      .sort((a: any, b: any) => new Date(a.start).getTime() - new Date(b.start).getTime())
-      .slice(0, 5);
+    // Resolve date: accept ?date=YYYY-MM-DD from client or default to current date
+    const dateQuery = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
+      ? req.query.date
+      : null;
 
-    res.json(todayEvents);
+    let dayStartUtc: Date;
+    let dayEndUtc: Date;
+    let dayStartLocal: Date;
+    let dayEndLocal: Date;
+
+    if (dateQuery) {
+      const [y, m, d] = dateQuery.split('-').map(Number);
+      dayStartUtc = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+      dayEndUtc = new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999));
+      dayStartLocal = new Date(y, m - 1, d, 0, 0, 0, 0);
+      dayEndLocal = new Date(y, m - 1, d, 23, 59, 59, 999);
+    } else {
+      const now = new Date();
+      dayStartUtc = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0));
+      dayEndUtc = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999));
+      dayStartLocal = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+      dayEndLocal = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    }
+
+    const earliestStart = new Date(Math.min(dayStartUtc.getTime(), dayStartLocal.getTime()));
+    const latestEnd = new Date(Math.max(dayEndUtc.getTime(), dayEndLocal.getTime()));
+
+    // Strict filter: ONLY active (not completed) tasks starting today or ending/due today
+    const tasks = await prisma.task.findMany({
+      where: {
+        phase: {
+          projectId: { in: visibleProjectIds },
+        },
+        state: { not: 'Completed' },
+        OR: [
+          // Starts today
+          { plannedStart: { gte: earliestStart, lte: latestEnd } },
+          // Due / ends today
+          { plannedEnd: { gte: earliestStart, lte: latestEnd } },
+        ],
+      },
+      include: {
+        phase: {
+          include: {
+            project: {
+              select: { id: true, name: true },
+            },
+          },
+        },
+        assignee: {
+          select: { id: true, name: true, avatarUrl: true },
+        },
+      },
+      orderBy: [
+        { priority: 'desc' },
+        { plannedStart: 'asc' },
+      ],
+      take: 10,
+    });
+
+    const todayTasks = tasks.map((task) => ({
+      id: `task-${task.id}`,
+      title: task.title,
+      start: task.plannedStart,
+      end: task.plannedEnd,
+      allDay: true,
+      color: '#3B82F6',
+      extendedProps: {
+        type: 'task',
+        projectId: task.phase.project.id,
+        projectName: task.phase.project.name,
+        taskId: task.id,
+        assigneeId: task.assigneeId,
+        assigneeName: task.assignee?.name,
+        state: task.state,
+        priority: task.priority,
+      },
+    }));
+
+    res.json(todayTasks);
   } catch (error: any) {
-    console.error('Today\'s events API error:', error);
-    res.status(500).json({ error: 'Failed to fetch today\'s events' });
+    console.error('Today\'s tasks API error:', error);
+    res.status(500).json({ error: 'Failed to fetch today\'s tasks' });
   }
 });
 

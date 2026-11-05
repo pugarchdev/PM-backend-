@@ -6415,8 +6415,10 @@ router8.post("/", requireOwnerOrCEO, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (user.role !== "CEO" && project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only create milestones for projects you own." });
+    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === "CEO";
+    const isCTO = user.roleRank <= 2 || user.role === "CTO" || user.role === "ProjectOwner";
+    if (!isCEO && !isCTO) {
+      return res.status(403).json({ error: "Forbidden: Only CEO and CTO have access to manage milestones." });
     }
     const baselineDate = new Date(validation.data.baselineDate);
     const forecastDate = new Date(validation.data.forecastDate);
@@ -6458,8 +6460,10 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
     if (!milestone) {
       return res.status(404).json({ error: "Milestone not found" });
     }
-    if (user.role !== "CEO" && milestone.project.ownerId !== user.id) {
-      return res.status(403).json({ error: "Forbidden: You can only update milestones for projects you own." });
+    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === "CEO";
+    const isCTO = user.roleRank <= 2 || user.role === "CTO" || user.role === "ProjectOwner";
+    if (!isCEO && !isCTO) {
+      return res.status(403).json({ error: "Forbidden: Only CEO and CTO have access to update milestones." });
     }
     const pStart = new Date(milestone.project.startDate).getTime();
     const pEnd = new Date(milestone.project.endDate).getTime();
@@ -6508,8 +6512,36 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
       if (actualDate) {
         const aDate = new Date(actualDate);
         data.actualDate = aDate;
+        await prisma.changeLogEntry.create({
+          data: {
+            projectId: milestone.projectId,
+            entityType: "MILESTONE",
+            entityId: milestone.id,
+            action: "MILESTONE_ACHIEVED",
+            what: `Milestone Achieved: ${milestone.title}`,
+            fromValue: "Pending",
+            toValue: aDate.toISOString().slice(0, 10),
+            actorId: req.user.id,
+            details: `Milestone "${milestone.title}" was marked as Achieved on ${aDate.toISOString().slice(0, 10)} by ${req.user.name}.`,
+            changedBy: req.user.name
+          }
+        });
       } else {
         data.actualDate = null;
+        await prisma.changeLogEntry.create({
+          data: {
+            projectId: milestone.projectId,
+            entityType: "MILESTONE",
+            entityId: milestone.id,
+            action: "MILESTONE_REOPENED",
+            what: `Milestone Reopened: ${milestone.title}`,
+            fromValue: "Achieved",
+            toValue: "Pending",
+            actorId: req.user.id,
+            details: `Milestone "${milestone.title}" was reverted to Pending by ${req.user.name}.`,
+            changedBy: req.user.name
+          }
+        });
       }
     }
     const updated = await prisma.milestone.update({
@@ -6519,6 +6551,42 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
     res.json(updated);
   } catch (error) {
     res.status(500).json({ error: "Failed to update milestone" });
+  }
+});
+router8.delete("/:id", requireOwnerOrCEO, async (req, res) => {
+  try {
+    const user = req.user;
+    const milestone = await prisma.milestone.findUnique({
+      where: { id: req.params.id },
+      include: { project: true }
+    });
+    if (!milestone) {
+      return res.status(404).json({ error: "Milestone not found" });
+    }
+    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === "CEO";
+    const isCTO = user.roleRank <= 2 || user.role === "CTO" || user.role === "ProjectOwner";
+    if (!isCEO && !isCTO) {
+      return res.status(403).json({ error: "Forbidden: Only CEO and CTO have access to delete milestones." });
+    }
+    await prisma.milestone.delete({
+      where: { id: req.params.id }
+    });
+    await prisma.changeLogEntry.create({
+      data: {
+        projectId: milestone.projectId,
+        entityType: "MILESTONE",
+        entityId: milestone.id,
+        action: "MILESTONE_DELETED",
+        what: `Milestone Deleted: ${milestone.title}`,
+        actorId: req.user.id,
+        details: `Milestone "${milestone.title}" was deleted by ${req.user.name}.`,
+        changedBy: req.user.name
+      }
+    });
+    res.json({ success: true, message: "Milestone deleted" });
+  } catch (error) {
+    console.error("Failed to delete milestone:", error);
+    res.status(500).json({ error: "Failed to delete milestone" });
   }
 });
 var milestones_default = router8;
@@ -9429,16 +9497,81 @@ router18.get("/today", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    const today = /* @__PURE__ */ new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const events = await getCalendarEvents(user, today, tomorrow);
-    const todayEvents = events.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()).slice(0, 5);
-    res.json(todayEvents);
+    const ctx = await getUserHierarchyContext(user.id);
+    const visibleProjectIds = ctx.authorizedProjectIds;
+    const dateQuery = typeof req.query.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : null;
+    let dayStartUtc;
+    let dayEndUtc;
+    let dayStartLocal;
+    let dayEndLocal;
+    if (dateQuery) {
+      const [y, m, d] = dateQuery.split("-").map(Number);
+      dayStartUtc = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+      dayEndUtc = new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999));
+      dayStartLocal = new Date(y, m - 1, d, 0, 0, 0, 0);
+      dayEndLocal = new Date(y, m - 1, d, 23, 59, 59, 999);
+    } else {
+      const now = /* @__PURE__ */ new Date();
+      dayStartUtc = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0));
+      dayEndUtc = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999));
+      dayStartLocal = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+      dayEndLocal = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    }
+    const earliestStart = new Date(Math.min(dayStartUtc.getTime(), dayStartLocal.getTime()));
+    const latestEnd = new Date(Math.max(dayEndUtc.getTime(), dayEndLocal.getTime()));
+    const tasks = await prisma.task.findMany({
+      where: {
+        phase: {
+          projectId: { in: visibleProjectIds }
+        },
+        state: { not: "Completed" },
+        OR: [
+          // Starts today
+          { plannedStart: { gte: earliestStart, lte: latestEnd } },
+          // Due / ends today
+          { plannedEnd: { gte: earliestStart, lte: latestEnd } }
+        ]
+      },
+      include: {
+        phase: {
+          include: {
+            project: {
+              select: { id: true, name: true }
+            }
+          }
+        },
+        assignee: {
+          select: { id: true, name: true, avatarUrl: true }
+        }
+      },
+      orderBy: [
+        { priority: "desc" },
+        { plannedStart: "asc" }
+      ],
+      take: 10
+    });
+    const todayTasks = tasks.map((task) => ({
+      id: `task-${task.id}`,
+      title: task.title,
+      start: task.plannedStart,
+      end: task.plannedEnd,
+      allDay: true,
+      color: "#3B82F6",
+      extendedProps: {
+        type: "task",
+        projectId: task.phase.project.id,
+        projectName: task.phase.project.name,
+        taskId: task.id,
+        assigneeId: task.assigneeId,
+        assigneeName: task.assignee?.name,
+        state: task.state,
+        priority: task.priority
+      }
+    }));
+    res.json(todayTasks);
   } catch (error) {
-    console.error("Today's events API error:", error);
-    res.status(500).json({ error: "Failed to fetch today's events" });
+    console.error("Today's tasks API error:", error);
+    res.status(500).json({ error: "Failed to fetch today's tasks" });
   }
 });
 router18.post("/reminders", async (req, res) => {

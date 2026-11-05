@@ -5,7 +5,7 @@ import { MilestoneCreateSchema } from '../../lib/validators.js';
 
 const router = Router();
 
-// POST /api/milestones - Create milestone
+// POST /api/milestones - Create milestone (CEO and CTO only)
 router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
@@ -22,9 +22,11 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // RBAC: Project Owner can only create milestones on projects they own
-    if (user.role !== 'CEO' && project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only create milestones for projects you own.' });
+    // RBAC: Only CEO and CTO (rank <= 2) can create milestones
+    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === 'CEO';
+    const isCTO = user.roleRank <= 2 || user.role === 'CTO' || user.role === 'ProjectOwner';
+    if (!isCEO && !isCTO) {
+      return res.status(403).json({ error: 'Forbidden: Only CEO and CTO have access to manage milestones.' });
     }
 
     const baselineDate = new Date(validation.data.baselineDate);
@@ -62,7 +64,7 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// PATCH /api/milestones/:id - Update forecast or actual date
+// PATCH /api/milestones/:id - Update forecast or actual date (CEO and CTO only)
 router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
@@ -76,9 +78,11 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
       return res.status(404).json({ error: 'Milestone not found' });
     }
 
-    // RBAC: Project Owner can only update milestones on projects they own
-    if (user.role !== 'CEO' && milestone.project.ownerId !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: You can only update milestones for projects you own.' });
+    // RBAC: Only CEO and CTO (rank <= 2) can update milestones
+    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === 'CEO';
+    const isCTO = user.roleRank <= 2 || user.role === 'CTO' || user.role === 'ProjectOwner';
+    if (!isCEO && !isCTO) {
+      return res.status(403).json({ error: 'Forbidden: Only CEO and CTO have access to update milestones.' });
     }
 
     const pStart = new Date(milestone.project.startDate).getTime();
@@ -136,8 +140,36 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
       if (actualDate) {
         const aDate = new Date(actualDate);
         data.actualDate = aDate;
+        await prisma.changeLogEntry.create({
+          data: {
+            projectId: milestone.projectId,
+            entityType: 'MILESTONE',
+            entityId: milestone.id,
+            action: 'MILESTONE_ACHIEVED',
+            what: `Milestone Achieved: ${milestone.title}`,
+            fromValue: 'Pending',
+            toValue: aDate.toISOString().slice(0, 10),
+            actorId: req.user!.id,
+            details: `Milestone "${milestone.title}" was marked as Achieved on ${aDate.toISOString().slice(0, 10)} by ${req.user!.name}.`,
+            changedBy: req.user!.name,
+          },
+        });
       } else {
         data.actualDate = null;
+        await prisma.changeLogEntry.create({
+          data: {
+            projectId: milestone.projectId,
+            entityType: 'MILESTONE',
+            entityId: milestone.id,
+            action: 'MILESTONE_REOPENED',
+            what: `Milestone Reopened: ${milestone.title}`,
+            fromValue: 'Achieved',
+            toValue: 'Pending',
+            actorId: req.user!.id,
+            details: `Milestone "${milestone.title}" was reverted to Pending by ${req.user!.name}.`,
+            changedBy: req.user!.name,
+          },
+        });
       }
     }
 
@@ -149,6 +181,49 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
     res.json(updated);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to update milestone' });
+  }
+});
+
+// DELETE /api/milestones/:id - Delete milestone (CEO and CTO only)
+router.delete('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const milestone = await prisma.milestone.findUnique({
+      where: { id: req.params.id },
+      include: { project: true },
+    });
+
+    if (!milestone) {
+      return res.status(404).json({ error: 'Milestone not found' });
+    }
+
+    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === 'CEO';
+    const isCTO = user.roleRank <= 2 || user.role === 'CTO' || user.role === 'ProjectOwner';
+    if (!isCEO && !isCTO) {
+      return res.status(403).json({ error: 'Forbidden: Only CEO and CTO have access to delete milestones.' });
+    }
+
+    await prisma.milestone.delete({
+      where: { id: req.params.id },
+    });
+
+    await prisma.changeLogEntry.create({
+      data: {
+        projectId: milestone.projectId,
+        entityType: 'MILESTONE',
+        entityId: milestone.id,
+        action: 'MILESTONE_DELETED',
+        what: `Milestone Deleted: ${milestone.title}`,
+        actorId: req.user!.id,
+        details: `Milestone "${milestone.title}" was deleted by ${req.user!.name}.`,
+        changedBy: req.user!.name,
+      },
+    });
+
+    res.json({ success: true, message: 'Milestone deleted' });
+  } catch (error: any) {
+    console.error('Failed to delete milestone:', error);
+    res.status(500).json({ error: 'Failed to delete milestone' });
   }
 });
 
