@@ -13,6 +13,7 @@ import {
   getUserHierarchyContext,
   getVisibleDirectoryUserIds,
 } from '../services/authorizationService.js';
+import { sendPreRegistrationEmail, resolvePortalUrl } from '../services/emailService.js';
 
 const router = Router();
 
@@ -305,7 +306,7 @@ router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRe
  */
 router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
   try {
-    const { name, email, phone, role, roleId, department, managerId } = req.body;
+    const { name, email, phone, role, roleId, department, managerId, portalUrl: clientPortalUrl } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
       return res.status(400).json({ error: 'Full name is required (minimum 2 characters).' });
@@ -320,7 +321,7 @@ router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: Aut
     }
 
     const cleanEmail = normalizeEmail(email);
-    const cleanPhone = normalizePhone(phone);
+    const cleanPhone = phone.replace(/\D/g, '');
 
     // Check duplicate email
     const existingEmail = await prisma.user.findUnique({
@@ -380,6 +381,21 @@ router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: Aut
         manager: { select: { id: true, name: true, role: true } },
       },
     });
+
+    // Send email with portal link and pre-registered account details
+    try {
+      const portalUrl = resolvePortalUrl(req, clientPortalUrl);
+      await sendPreRegistrationEmail({
+        to: preRegistered.email,
+        name: preRegistered.name,
+        phone: preRegistered.phone,
+        role: preRegistered.role,
+        department: preRegistered.department,
+        portalUrl,
+      });
+    } catch (emailErr: any) {
+      console.error('[PreRegister] Failed to send activation invitation email:', emailErr.message || emailErr);
+    }
 
     res.status(201).json({
       message: 'User successfully pre-registered with organizational role and reporting manager.',

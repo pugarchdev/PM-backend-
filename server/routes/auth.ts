@@ -30,6 +30,8 @@ import {
 import {
   sendVerificationOtpEmail,
   sendPasswordResetOtpEmail,
+  sendPreRegistrationEmail,
+  resolvePortalUrl,
 } from '../services/emailService.js';
 
 const router = Router();
@@ -150,6 +152,16 @@ router.post('/login', async (req: AuthRequest, res: Response) => {
 // -------------------------------------------------------------
 // PRE-REGISTRATION CANDIDATE RESOLUTION & VALIDATION HELPER
 // -------------------------------------------------------------
+function isMatchingPhone(p1?: string | null, p2?: string | null): boolean {
+  if (!p1 || !p2) return false;
+  const d1 = p1.replace(/\D/g, '');
+  const d2 = p2.replace(/\D/g, '');
+  if (!d1 || !d2) return false;
+  if (d1 === d2) return true;
+  if (d1.length >= 10 && d2.length >= 10 && d1.slice(-10) === d2.slice(-10)) return true;
+  return false;
+}
+
 /**
  * Resolves a user record for the HR/CEO pre-registration verification flow.
  * - Confirms that the candidate was pre-registered by HR/CEO.
@@ -203,7 +215,7 @@ async function resolvePreRegisteredCandidate(reqBody: any) {
 
   if (candidatePhone) {
     const prePhone = (user as any).phone ? normalizePhone((user as any).phone) : null;
-    if (prePhone && prePhone !== candidatePhone) {
+    if (prePhone && !isMatchingPhone(prePhone, candidatePhone)) {
       return {
         errorStatus: 403,
         errorMessage:
@@ -536,7 +548,7 @@ const handleRegister = async (req: AuthRequest, res: Response) => {
     }
 
     const cleanEmail = normalizeEmail(email);
-    const cleanPhone = normalizePhone(phone);
+    const cleanPhone = phone.replace(/\D/g, '');
 
     const preRegisteredUser = await prisma.user.findUnique({
       where: { email: cleanEmail },
@@ -550,7 +562,7 @@ const handleRegister = async (req: AuthRequest, res: Response) => {
     }
 
     const prePhone = (preRegisteredUser as any).phone ? normalizePhone((preRegisteredUser as any).phone) : null;
-    if (!prePhone || prePhone !== cleanPhone) {
+    if (!prePhone || !isMatchingPhone(prePhone, cleanPhone)) {
       return res.status(403).json({
         error:
           'Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account.',
@@ -865,7 +877,7 @@ router.post('/reset-password', async (req: AuthRequest, res: Response) => {
 // POST /api/auth/pre-register — HR/CEO Pre-registers a new user (HR/CEO only)
 router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response) => {
   try {
-    const { name, email, phone, role, roleId, managerId, department } = req.body;
+    const { name, email, phone, role, roleId, managerId, department, portalUrl: clientPortalUrl } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
       return res.status(400).json({ error: 'Full name is required (minimum 2 characters).' });
@@ -880,7 +892,7 @@ router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response)
     }
 
     const cleanEmail = normalizeEmail(email);
-    const cleanPhone = normalizePhone(phone);
+    const cleanPhone = phone.replace(/\D/g, '');
 
     // Check email uniqueness
     const existingEmail = await prisma.user.findUnique({
@@ -947,6 +959,21 @@ router.post('/pre-register', requireCEO, async (req: AuthRequest, res: Response)
         manager: { select: { id: true, name: true, role: true } },
       },
     });
+
+    // Send email with portal link and pre-registered account details
+    try {
+      const portalUrl = resolvePortalUrl(req, clientPortalUrl);
+      await sendPreRegistrationEmail({
+        to: preRegistered.email,
+        name: preRegistered.name,
+        phone: (preRegistered as any).phone,
+        role: preRegistered.role,
+        department: preRegistered.department,
+        portalUrl,
+      });
+    } catch (emailErr: any) {
+      console.error('[PreRegister] Failed to send activation invitation email:', emailErr.message || emailErr);
+    }
 
     res.status(201).json({
       message: 'User successfully pre-registered. They can now complete account creation using their email and phone.',

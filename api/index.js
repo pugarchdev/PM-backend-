@@ -1864,6 +1864,178 @@ Enterprise Architecture & Access Control
   }
   throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
 }
+function resolvePortalUrl(req, bodyPortalUrl) {
+  if (bodyPortalUrl && typeof bodyPortalUrl === "string" && bodyPortalUrl.startsWith("http")) {
+    return bodyPortalUrl.trim().replace(/\/+$/, "");
+  }
+  const origin = req?.get?.("origin") || req?.headers?.origin;
+  if (origin && typeof origin === "string" && origin.startsWith("http") && !origin.includes("null")) {
+    return origin.trim().replace(/\/+$/, "");
+  }
+  const referer = req?.get?.("referer") || req?.headers?.referer;
+  if (referer && typeof referer === "string" && referer.startsWith("http")) {
+    try {
+      const url = new URL(referer);
+      return url.origin;
+    } catch {
+    }
+  }
+  const envAppUrl = (process.env.APP_URL || process.env.FRONTEND_URL || "").trim().replace(/\/+$/, "");
+  if (envAppUrl && !envAppUrl.includes("localhost") && !envAppUrl.includes("127.0.0.1")) {
+    return envAppUrl;
+  }
+  if (process.env.VERCEL || process.env.NODE_ENV === "production") {
+    return "https://pm-frontend-rouge.vercel.app";
+  }
+  return envAppUrl || "http://localhost:3000";
+}
+async function sendPreRegistrationEmail(params) {
+  const { to, name, phone, role, department, portalUrl } = params;
+  const from = getFromAddress();
+  const transporter = getTransporter();
+  const baseUrl = resolvePortalUrl(void 0, portalUrl);
+  const signupLink = `${baseUrl}/signup?email=${encodeURIComponent(to)}&phone=${encodeURIComponent(phone)}`;
+  const subject = `Welcome to PugArch \u2014 You have been registered on the workspace portal`;
+  const text = `
+Hello ${name || "Team Member"},
+
+Your organization has registered your account on the PugArch Projects portal.
+
+Your Pre-Registered Details:
+\u2022 Portal: PugArch Projects
+\u2022 Assigned Role: ${role || "Employee"}
+\u2022 Department: ${department || "Operations"}
+\u2022 Pre-Registered Email: ${to}
+\u2022 Pre-Registered Mobile: ${phone}
+
+To complete your account registration and set up your password, visit the portal link below:
+${signupLink}
+
+Follow the on-screen steps to verify your identity with a one-time verification code and activate your account.
+
+\u2014
+PugArch Projects Cloud
+Enterprise Architecture & Access Control
+`.trim();
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome to PugArch</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #FBF9F4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #FBF9F4; padding: 40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 560px; background-color: #FFFFFF; border: 1px solid #E8E2D5; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 20px rgba(35, 30, 27, 0.05);">
+          <!-- Brand Header -->
+          <tr>
+            <td style="background-color: #231E1B; padding: 28px 32px; text-align: left;">
+              <span style="font-family: Georgia, serif; font-size: 22px; font-weight: bold; color: #FFFFFF; letter-spacing: 0.5px;">
+                PugArch &mdash; <span style="color: #E28C68;">Projects</span>
+              </span>
+              <div style="font-size: 11px; color: #A49C90; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px;">
+                Enterprise Workspace Invitation
+              </div>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 36px 32px;">
+              <h1 style="font-size: 20px; font-weight: 700; color: #231E1B; margin: 0 0 16px 0; letter-spacing: -0.3px;">
+                Welcome to PugArch, ${name || "Team Member"}!
+              </h1>
+              <p style="font-size: 14px; line-height: 22px; color: #5A524A; margin: 0 0 24px 0;">
+                Your organization has pre-registered your work account on the <strong>PugArch Projects</strong> portal. You can now complete your activation and set up your workspace password.
+              </p>
+
+              <!-- Account Details Card -->
+              <div style="background-color: #FAF7F0; border: 1px solid #DDD6C8; border-radius: 14px; padding: 20px 24px; margin: 24px 0;">
+                <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #70685F; letter-spacing: 1.2px; margin-bottom: 14px; border-bottom: 1px solid #E8E2D5; padding-bottom: 8px;">
+                  Your Pre-Registered Details
+                </div>
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size: 13px; line-height: 22px;">
+                  <tr>
+                    <td style="color: #8F867A; width: 140px; padding: 4px 0;">Assigned Role:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${role || "Employee"}</td>
+                  </tr>
+                  <tr>
+                    <td style="color: #8F867A; padding: 4px 0;">Department:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${department || "Operations"}</td>
+                  </tr>
+                  <tr>
+                    <td style="color: #8F867A; padding: 4px 0;">Registered Email:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${to}</td>
+                  </tr>
+                  <tr>
+                    <td style="color: #8F867A; padding: 4px 0;">Registered Phone:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${phone}</td>
+                  </tr>
+                </table>
+              </div>
+
+              <!-- CTA Button -->
+              <div style="text-align: center; margin: 32px 0 24px 0;">
+                <a href="${signupLink}" target="_blank" style="display: inline-block; background-color: #C85A32; color: #FFFFFF; font-size: 14px; font-weight: 600; text-decoration: none; padding: 14px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(200, 90, 50, 0.25);">
+                  Activate Account &amp; Set Password &rarr;
+                </a>
+              </div>
+
+              <div style="background-color: #F8F5EE; border-radius: 10px; padding: 12px 16px; margin-top: 20px; font-size: 12px; color: #70685F; line-height: 18px;">
+                <strong>Next Step:</strong> When prompted on the activation screen, verify your email with a one-time security code to finalize your password.
+              </div>
+
+              <p style="font-size: 11px; line-height: 16px; color: #A49C90; margin: 24px 0 0 0; word-break: break-all;">
+                Direct Link: <a href="${signupLink}" style="color: #C85A32; text-decoration: underline;">${signupLink}</a>
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #F8F5EE; padding: 20px 32px; border-top: 1px solid #EDE7DC; text-align: center;">
+              <p style="font-size: 11px; color: #8F867A; margin: 0;">
+                End-to-End Enterprise Access Control &bull; PugArch Projects Cloud
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`.trim();
+  if (transporter) {
+    try {
+      await transporter.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html
+      });
+      return { delivered: true };
+    } catch (err) {
+      console.error(`[EmailService] Failed to deliver pre-registration invitation to ${to}:`, err.message || err);
+      return { delivered: false };
+    }
+  }
+  const isDev = process.env.NODE_ENV !== "production";
+  if (isDev) {
+    console.log(`
+======================================================`);
+    console.log(`[EmailService DEV] Simulated pre-registration email to: ${to}`);
+    console.log(`[EmailService DEV] Signup URL: ${signupLink}`);
+    console.log(`======================================================
+`);
+    return { delivered: true, mockLogged: true };
+  }
+  return { delivered: false };
+}
 async function sendLeaveRequestEmail(params) {
   const {
     to,
@@ -2067,7 +2239,7 @@ async function dispatchLeaveSubmissionEmails(params) {
       minute: "2-digit"
     });
   };
-  const appBaseUrl = (process.env.APP_URL || "http://localhost:3000").trim().replace(/\/+$/, "");
+  const appBaseUrl = resolvePortalUrl();
   const viewLink = `${appBaseUrl}/dashboard`;
   const startDateStr = fmtDate(startDate);
   const endDateStr = fmtDate(endDate);
@@ -2200,6 +2372,15 @@ router2.post("/login", async (req, res) => {
     res.status(500).json({ error: "Authentication failed" });
   }
 });
+function isMatchingPhone(p1, p2) {
+  if (!p1 || !p2) return false;
+  const d1 = p1.replace(/\D/g, "");
+  const d2 = p2.replace(/\D/g, "");
+  if (!d1 || !d2) return false;
+  if (d1 === d2) return true;
+  if (d1.length >= 10 && d2.length >= 10 && d1.slice(-10) === d2.slice(-10)) return true;
+  return false;
+}
 async function resolvePreRegisteredCandidate(reqBody) {
   const { email, phone, identifier } = reqBody || {};
   let candidateEmail = "";
@@ -2240,7 +2421,7 @@ async function resolvePreRegisteredCandidate(reqBody) {
   }
   if (candidatePhone) {
     const prePhone = user.phone ? normalizePhone(user.phone) : null;
-    if (prePhone && prePhone !== candidatePhone) {
+    if (prePhone && !isMatchingPhone(prePhone, candidatePhone)) {
       return {
         errorStatus: 403,
         errorMessage: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account.",
@@ -2471,7 +2652,7 @@ var handleRegister = async (req, res) => {
       });
     }
     const cleanEmail = normalizeEmail(email);
-    const cleanPhone = normalizePhone(phone);
+    const cleanPhone = phone.replace(/\D/g, "");
     const preRegisteredUser = await prisma.user.findUnique({
       where: { email: cleanEmail }
     });
@@ -2481,7 +2662,7 @@ var handleRegister = async (req, res) => {
       });
     }
     const prePhone = preRegisteredUser.phone ? normalizePhone(preRegisteredUser.phone) : null;
-    if (!prePhone || prePhone !== cleanPhone) {
+    if (!prePhone || !isMatchingPhone(prePhone, cleanPhone)) {
       return res.status(403).json({
         error: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account."
       });
@@ -2728,7 +2909,7 @@ router2.post("/reset-password", async (req, res) => {
 });
 router2.post("/pre-register", requireCEO, async (req, res) => {
   try {
-    const { name, email, phone, role, roleId, managerId, department } = req.body;
+    const { name, email, phone, role, roleId, managerId, department, portalUrl: clientPortalUrl } = req.body;
     if (!name || typeof name !== "string" || name.trim().length < 2) {
       return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
     }
@@ -2739,7 +2920,7 @@ router2.post("/pre-register", requireCEO, async (req, res) => {
       return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
     }
     const cleanEmail = normalizeEmail(email);
-    const cleanPhone = normalizePhone(phone);
+    const cleanPhone = phone.replace(/\D/g, "");
     const existingEmail = await prisma.user.findUnique({
       where: { email: cleanEmail }
     });
@@ -2798,6 +2979,19 @@ router2.post("/pre-register", requireCEO, async (req, res) => {
         manager: { select: { id: true, name: true, role: true } }
       }
     });
+    try {
+      const portalUrl = resolvePortalUrl(req, clientPortalUrl);
+      await sendPreRegistrationEmail({
+        to: preRegistered.email,
+        name: preRegistered.name,
+        phone: preRegistered.phone,
+        role: preRegistered.role,
+        department: preRegistered.department,
+        portalUrl
+      });
+    } catch (emailErr) {
+      console.error("[PreRegister] Failed to send activation invitation email:", emailErr.message || emailErr);
+    }
     res.status(201).json({
       message: "User successfully pre-registered. They can now complete account creation using their email and phone.",
       user: {
@@ -9891,7 +10085,7 @@ router19.get("/management", requireAuth, requireCanManageUsers, async (req, res)
 });
 router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, res) => {
   try {
-    const { name, email, phone, role, roleId, department, managerId } = req.body;
+    const { name, email, phone, role, roleId, department, managerId, portalUrl: clientPortalUrl } = req.body;
     if (!name || typeof name !== "string" || name.trim().length < 2) {
       return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
     }
@@ -9902,7 +10096,7 @@ router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, r
       return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
     }
     const cleanEmail = normalizeEmail(email);
-    const cleanPhone = normalizePhone(phone);
+    const cleanPhone = phone.replace(/\D/g, "");
     const existingEmail = await prisma.user.findUnique({
       where: { email: cleanEmail }
     });
@@ -9950,6 +10144,19 @@ router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, r
         manager: { select: { id: true, name: true, role: true } }
       }
     });
+    try {
+      const portalUrl = resolvePortalUrl(req, clientPortalUrl);
+      await sendPreRegistrationEmail({
+        to: preRegistered.email,
+        name: preRegistered.name,
+        phone: preRegistered.phone,
+        role: preRegistered.role,
+        department: preRegistered.department,
+        portalUrl
+      });
+    } catch (emailErr) {
+      console.error("[PreRegister] Failed to send activation invitation email:", emailErr.message || emailErr);
+    }
     res.status(201).json({
       message: "User successfully pre-registered with organizational role and reporting manager.",
       user: {

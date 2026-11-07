@@ -306,6 +306,216 @@ Enterprise Architecture & Access Control
   throw new Error('Email service configuration error: SMTP_HOST environment variable is required in production.');
 }
 
+export interface SendPreRegistrationEmailParams {
+  to: string;
+  name: string;
+  phone: string;
+  role?: string;
+  department?: string;
+  portalUrl?: string;
+}
+
+/**
+ * Intelligently resolves the portal URL:
+ * - When called from a live frontend domain, uses the live domain.
+ * - When called locally (localhost / 127.0.0.1 / local network), uses the local address.
+ * - In production environments (Vercel / production server), falls back to the live portal URL.
+ */
+export function resolvePortalUrl(req?: any, bodyPortalUrl?: string): string {
+  // 1. Explicitly provided from browser client window.location.origin
+  if (bodyPortalUrl && typeof bodyPortalUrl === 'string' && bodyPortalUrl.startsWith('http')) {
+    return bodyPortalUrl.trim().replace(/\/+$/, '');
+  }
+
+  // 2. Request Origin header
+  const origin = req?.get?.('origin') || req?.headers?.origin;
+  if (origin && typeof origin === 'string' && origin.startsWith('http') && !origin.includes('null')) {
+    return origin.trim().replace(/\/+$/, '');
+  }
+
+  // 3. Request Referer header (parse origin from referer)
+  const referer = req?.get?.('referer') || req?.headers?.referer;
+  if (referer && typeof referer === 'string' && referer.startsWith('http')) {
+    try {
+      const url = new URL(referer);
+      return url.origin;
+    } catch {}
+  }
+
+  // 4. In production, check APP_URL / FRONTEND_URL if not localhost
+  const envAppUrl = (process.env.APP_URL || process.env.FRONTEND_URL || '').trim().replace(/\/+$/, '');
+  if (envAppUrl && !envAppUrl.includes('localhost') && !envAppUrl.includes('127.0.0.1')) {
+    return envAppUrl;
+  }
+
+  // 5. If running in production or on Vercel, default to live production link
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    return 'https://pm-frontend-rouge.vercel.app';
+  }
+
+  // 6. Local development fallback
+  return envAppUrl || 'http://localhost:3000';
+}
+
+/**
+ * Dispatches an account pre-registration invitation email to a newly added user.
+ * Provides their pre-registered details and a direct activation link to the portal signup page.
+ */
+export async function sendPreRegistrationEmail(
+  params: SendPreRegistrationEmailParams
+): Promise<{ delivered: boolean; mockLogged?: boolean }> {
+  const { to, name, phone, role, department, portalUrl } = params;
+  const from = getFromAddress();
+  const transporter = getTransporter();
+
+  const baseUrl = resolvePortalUrl(undefined, portalUrl);
+  const signupLink = `${baseUrl}/signup?email=${encodeURIComponent(to)}&phone=${encodeURIComponent(phone)}`;
+
+  const subject = `Welcome to PugArch — You have been registered on the workspace portal`;
+
+  const text = `
+Hello ${name || 'Team Member'},
+
+Your organization has registered your account on the PugArch Projects portal.
+
+Your Pre-Registered Details:
+• Portal: PugArch Projects
+• Assigned Role: ${role || 'Employee'}
+• Department: ${department || 'Operations'}
+• Pre-Registered Email: ${to}
+• Pre-Registered Mobile: ${phone}
+
+To complete your account registration and set up your password, visit the portal link below:
+${signupLink}
+
+Follow the on-screen steps to verify your identity with a one-time verification code and activate your account.
+
+—
+PugArch Projects Cloud
+Enterprise Architecture & Access Control
+`.trim();
+
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome to PugArch</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #FBF9F4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color: #FBF9F4; padding: 40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 560px; background-color: #FFFFFF; border: 1px solid #E8E2D5; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 20px rgba(35, 30, 27, 0.05);">
+          <!-- Brand Header -->
+          <tr>
+            <td style="background-color: #231E1B; padding: 28px 32px; text-align: left;">
+              <span style="font-family: Georgia, serif; font-size: 22px; font-weight: bold; color: #FFFFFF; letter-spacing: 0.5px;">
+                PugArch &mdash; <span style="color: #E28C68;">Projects</span>
+              </span>
+              <div style="font-size: 11px; color: #A49C90; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px;">
+                Enterprise Workspace Invitation
+              </div>
+            </td>
+          </tr>
+
+          <!-- Main Content -->
+          <tr>
+            <td style="padding: 36px 32px;">
+              <h1 style="font-size: 20px; font-weight: 700; color: #231E1B; margin: 0 0 16px 0; letter-spacing: -0.3px;">
+                Welcome to PugArch, ${name || 'Team Member'}!
+              </h1>
+              <p style="font-size: 14px; line-height: 22px; color: #5A524A; margin: 0 0 24px 0;">
+                Your organization has pre-registered your work account on the <strong>PugArch Projects</strong> portal. You can now complete your activation and set up your workspace password.
+              </p>
+
+              <!-- Account Details Card -->
+              <div style="background-color: #FAF7F0; border: 1px solid #DDD6C8; border-radius: 14px; padding: 20px 24px; margin: 24px 0;">
+                <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #70685F; letter-spacing: 1.2px; margin-bottom: 14px; border-bottom: 1px solid #E8E2D5; padding-bottom: 8px;">
+                  Your Pre-Registered Details
+                </div>
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size: 13px; line-height: 22px;">
+                  <tr>
+                    <td style="color: #8F867A; width: 140px; padding: 4px 0;">Assigned Role:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${role || 'Employee'}</td>
+                  </tr>
+                  <tr>
+                    <td style="color: #8F867A; padding: 4px 0;">Department:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${department || 'Operations'}</td>
+                  </tr>
+                  <tr>
+                    <td style="color: #8F867A; padding: 4px 0;">Registered Email:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${to}</td>
+                  </tr>
+                  <tr>
+                    <td style="color: #8F867A; padding: 4px 0;">Registered Phone:</td>
+                    <td style="color: #231E1B; font-weight: 600; padding: 4px 0;">${phone}</td>
+                  </tr>
+                </table>
+              </div>
+
+              <!-- CTA Button -->
+              <div style="text-align: center; margin: 32px 0 24px 0;">
+                <a href="${signupLink}" target="_blank" style="display: inline-block; background-color: #C85A32; color: #FFFFFF; font-size: 14px; font-weight: 600; text-decoration: none; padding: 14px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(200, 90, 50, 0.25);">
+                  Activate Account &amp; Set Password &rarr;
+                </a>
+              </div>
+
+              <div style="background-color: #F8F5EE; border-radius: 10px; padding: 12px 16px; margin-top: 20px; font-size: 12px; color: #70685F; line-height: 18px;">
+                <strong>Next Step:</strong> When prompted on the activation screen, verify your email with a one-time security code to finalize your password.
+              </div>
+
+              <p style="font-size: 11px; line-height: 16px; color: #A49C90; margin: 24px 0 0 0; word-break: break-all;">
+                Direct Link: <a href="${signupLink}" style="color: #C85A32; text-decoration: underline;">${signupLink}</a>
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #F8F5EE; padding: 20px 32px; border-top: 1px solid #EDE7DC; text-align: center;">
+              <p style="font-size: 11px; color: #8F867A; margin: 0;">
+                End-to-End Enterprise Access Control &bull; PugArch Projects Cloud
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`.trim();
+
+  if (transporter) {
+    try {
+      await transporter.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html,
+      });
+      return { delivered: true };
+    } catch (err: any) {
+      console.error(`[EmailService] Failed to deliver pre-registration invitation to ${to}:`, err.message || err);
+      return { delivered: false };
+    }
+  }
+
+  const isDev = process.env.NODE_ENV !== 'production';
+  if (isDev) {
+    console.log(`\n======================================================`);
+    console.log(`[EmailService DEV] Simulated pre-registration email to: ${to}`);
+    console.log(`[EmailService DEV] Signup URL: ${signupLink}`);
+    console.log(`======================================================\n`);
+    return { delivered: true, mockLogged: true };
+  }
+
+  return { delivered: false };
+}
+
 export interface SendLeaveRequestEmailParams {
   to: string;
   recipientName: string;
@@ -562,7 +772,7 @@ export async function dispatchLeaveSubmissionEmails(params: {
     });
   };
 
-  const appBaseUrl = (process.env.APP_URL || 'http://localhost:3000').trim().replace(/\/+$/, '');
+  const appBaseUrl = resolvePortalUrl();
   const viewLink = `${appBaseUrl}/dashboard`;
 
   const startDateStr = fmtDate(startDate);
