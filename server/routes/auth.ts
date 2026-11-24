@@ -264,11 +264,13 @@ const handleSendOrResendVerificationOtp = async (
 
     const previousChallenge = parseVerificationChallenge((user as any).verificationCode);
 
-    // Requirement 5: Prevent resending after successful verification
+    // If already verified, acknowledge and return 200 with alreadyVerified and isEmailVerified flags
     if (previousChallenge?.isEmailVerified) {
-      return res.status(400).json({
-        error: 'This email address has already been verified. Please proceed to complete your registration.',
+      return res.status(200).json({
+        success: true,
+        alreadyVerified: true,
         isEmailVerified: true,
+        message: 'This email address has already been verified. Please proceed to complete your registration.',
       });
     }
 

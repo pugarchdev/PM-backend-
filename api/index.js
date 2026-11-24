@@ -2446,9 +2446,11 @@ var handleSendOrResendVerificationOtp = async (req, res, options = {}) => {
     }
     const previousChallenge = parseVerificationChallenge(user.verificationCode);
     if (previousChallenge?.isEmailVerified) {
-      return res.status(400).json({
-        error: "This email address has already been verified. Please proceed to complete your registration.",
-        isEmailVerified: true
+      return res.status(200).json({
+        success: true,
+        alreadyVerified: true,
+        isEmailVerified: true,
+        message: "This email address has already been verified. Please proceed to complete your registration."
       });
     }
     const cooldown = checkResendCooldown(previousChallenge);
