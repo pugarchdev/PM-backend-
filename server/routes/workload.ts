@@ -39,7 +39,7 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
           allocations: {
             where: {
               weekStartDate: weekDate,
-              ...(ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }),
+              ...(ctx.bypassPermissions || ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }),
             },
             select: {
               allocatedHours: true,
@@ -48,7 +48,7 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
           tasks: {
             where: {
               state: { not: 'Completed' },
-              ...(ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }),
+              ...(ctx.bypassPermissions || ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }),
             },
             select: {
               id: true,
@@ -140,6 +140,7 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
         isExecutive: ctx.isExecutive,
         subordinatesCount: ctx.allSubordinateIds.length,
         visibleUserCount: users.length,
+        hasTeamVisibility: Boolean(ctx.bypassPermissions || ctx.isExecutive || ctx.autoAddToProjects || ctx.allSubordinateIds.length > 0),
       },
     });
   } catch (error: any) {
@@ -187,7 +188,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
           allocations: {
             where: {
               weekStartDate: weekDate,
-              ...(ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }),
+              ...(ctx.bypassPermissions || ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }),
             },
             select: {
               id: true,
@@ -199,7 +200,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
           tasks: {
             where: {
               state: { not: 'Completed' },
-              ...(ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }),
+              ...(ctx.bypassPermissions || ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }),
             },
             select: {
               id: true,
@@ -371,6 +372,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
         isExecutive: ctx.isExecutive,
         subordinatesCount: ctx.allSubordinateIds.length,
         visibleUserCount: users.length,
+        hasTeamVisibility: Boolean(ctx.bypassPermissions || ctx.isExecutive || ctx.autoAddToProjects || ctx.allSubordinateIds.length > 0),
       },
     };
 
@@ -411,19 +413,63 @@ router.post('/allocate', requireAuth, async (req: AuthRequest, res: Response) =>
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Must be project owner or executive
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: 'Forbidden: You can only allocate resources on projects you own or manage.' });
-    }
-
-    // Check target user eligibility: must be a member of the project, a subordinate in reporting scope, or current user
     const isMember = await prisma.projectMembership.findUnique({
       where: { projectId_userId: { projectId, userId } },
     });
-    const isSubordinate = ctx.allSubordinateIds.includes(userId);
-    const isSelf = userId === ctx.userId;
+    const callerMembership = await prisma.projectMembership.findUnique({
+      where: { projectId_userId: { projectId, userId: ctx.userId } },
+    });
 
-    if (!ctx.isExecutive && !isMember && !isSubordinate && !isSelf) {
+    // Check project authorization: bypass, executive, project owner, or autoAddToProjects member
+    const canAllocateOnProject =
+      ctx.bypassPermissions ||
+      ctx.isExecutive ||
+      project.ownerId === ctx.userId ||
+      (ctx.autoAddToProjects && (Boolean(isMember) || Boolean(callerMembership)));
+
+    if (!canAllocateOnProject) {
+      return res.status(403).json({ error: 'Forbidden: You can only allocate resources on projects you own or manage.' });
+    }
+
+    // Target user eligibility check
+    const isSelf = userId === ctx.userId;
+    const isSubordinate = ctx.allSubordinateIds.includes(userId);
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { roleDefinition: true },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Target user does not exist' });
+    }
+
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === 'Intern' ? 4 : 3);
+    const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+
+    // Non-bypass callers cannot allocate users with bypassPermissions: true or equal/higher rank unless explicitly subordinate
+    if (!ctx.bypassPermissions) {
+      if (targetBypass && !isSubordinate && !isSelf) {
+        return res.status(403).json({
+          error: 'Forbidden: Cannot allocate a user with administrative bypass permissions.',
+        });
+      }
+      if (targetRank <= ctx.roleRank && !isSubordinate && !isSelf) {
+        return res.status(403).json({
+          error: 'Forbidden: Cannot allocate a user at or above your hierarchy level.',
+        });
+      }
+    }
+
+    // Target user must be self, subordinate, strictly below caller's rank (when autoAddToProjects), or existing project member
+    const isEligibleTarget =
+      ctx.bypassPermissions ||
+      isSelf ||
+      isSubordinate ||
+      (ctx.autoAddToProjects && targetRank > ctx.roleRank && !targetBypass) ||
+      (Boolean(isMember) && !ctx.bypassPermissions && !ctx.isExecutive);
+
+    if (!isEligibleTarget) {
       return res.status(403).json({
         error: 'Forbidden: Cannot allocate a user who is not a project member or in your reporting scope.',
       });

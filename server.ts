@@ -34,6 +34,7 @@ import documentsRouter from './server/routes/documents.js';
 import calendarRouter from './server/routes/calendar.js';
 import usersRouter from './server/routes/users.js';
 import rolesRouter from './server/routes/roles.js';
+import permissionsRouter from './server/routes/permissions.js';
 import leaveRouter from './server/routes/leave.js';
 
 const app = express();
@@ -123,6 +124,7 @@ app.use('/api/workload', workloadRouter);
 app.use('/api/calendar', calendarRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/roles', rolesRouter);
+app.use('/api/permissions', permissionsRouter);
 
 // Phase 2 Routers
 app.use('/api/notifications', notificationsRouter);

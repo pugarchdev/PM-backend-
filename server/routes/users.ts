@@ -4,11 +4,18 @@ import {
   AuthRequest,
   requireAuth,
   requireCanManageUsers,
+  requirePermission,
   normalizeEmail,
   normalizePhone,
   isValidEmail,
   isValidPhone,
 } from '../auth.js';
+import {
+  canManageTargetRank,
+  isUnrestrictedUser,
+  getTargetUserPermissions,
+  addUserToAllExistingProjects,
+} from '../services/permissionService.js';
 import {
   getUserHierarchyContext,
   getVisibleDirectoryUserIds,
@@ -186,11 +193,11 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
 
 /**
  * GET /api/users/management
- * Returns all users in the system including their phone and signup completion status.
- * Restricted to executive / user management capability.
+ * Returns all users in the system within caller's hierarchy scope.
+ * Restricted to users with 'add_user' permission.
  * Supports search, status filter, role filter, dynamic sorting, and server-side pagination.
  */
-router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
+router.get('/management', requireAuth, requirePermission('add_user'), async (req: AuthRequest, res: Response) => {
   try {
     const {
       search,
@@ -203,31 +210,54 @@ router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRe
       sortOrder = 'asc',
     } = req.query;
 
-    const where: any = {};
+    const callerRank = req.user!.roleRank;
+    const hierarchyFilter = isUnrestrictedUser(req.user)
+      ? {
+          OR: [
+            { roleDefinition: { rank: { gte: callerRank } } },
+            { roleDefinition: null },
+          ],
+        }
+      : {
+          roleDefinition: {
+            rank: { gt: callerRank },
+            bypassPermissions: false,
+          },
+        };
+
+    const hierarchyWhere: any = {
+      AND: [hierarchyFilter],
+    };
+
+    const where: any = {
+      AND: [hierarchyFilter],
+    };
 
     if (status === 'pending') {
-      where.isSignupCompleted = false;
+      where.AND.push({ isSignupCompleted: false });
     } else if (status === 'completed') {
-      where.isSignupCompleted = true;
+      where.AND.push({ isSignupCompleted: true });
     }
 
     if (search && typeof search === 'string' && search.trim()) {
       const term = search.trim();
-      where.OR = [
-        { name: { contains: term, mode: 'insensitive' } },
-        { email: { contains: term, mode: 'insensitive' } },
-        { phone: { contains: term } },
-        { department: { contains: term, mode: 'insensitive' } },
-        { role: { contains: term, mode: 'insensitive' } },
-      ];
+      where.AND.push({
+        OR: [
+          { name: { contains: term, mode: 'insensitive' } },
+          { email: { contains: term, mode: 'insensitive' } },
+          { phone: { contains: term } },
+          { department: { contains: term, mode: 'insensitive' } },
+          { role: { contains: term, mode: 'insensitive' } },
+        ],
+      });
     }
 
     if (roleId && typeof roleId === 'string' && roleId !== 'ALL') {
-      where.roleId = roleId;
+      where.AND.push({ roleId });
     }
 
     if (department && typeof department === 'string' && department !== 'ALL') {
-      where.department = department;
+      where.AND.push({ department });
     }
 
     const isPaginated = page !== undefined || limit !== undefined;
@@ -261,8 +291,18 @@ router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRe
     const orderBy = [{ isSignupCompleted: 'asc' as const }, { [field]: order }];
 
     if (isPaginated) {
-      const [total, users] = await Promise.all([
+      const [total, pendingCount, completedCount, users] = await Promise.all([
         prisma.user.count({ where }),
+        prisma.user.count({
+          where: {
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: false }],
+          },
+        }),
+        prisma.user.count({
+          where: {
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: true }],
+          },
+        }),
         prisma.user.findMany({
           where,
           select: selectProjection,
@@ -281,6 +321,11 @@ router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRe
           page: pageNum,
           limit: take,
           totalPages,
+        },
+        summary: {
+          total: pendingCount + completedCount,
+          pending: pendingCount,
+          completed: completedCount,
         },
       });
     }
@@ -302,9 +347,9 @@ router.get('/management', requireAuth, requireCanManageUsers, async (req: AuthRe
 /**
  * POST /api/users/pre-register
  * Pre-registers a user's details with configurable role and reporting manager.
- * Restricted to executive / user management capability.
+ * Restricted to users with 'add_user' permission.
  */
-router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
+router.post('/pre-register', requireAuth, requirePermission('add_user'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, email, phone, role, roleId, department, managerId, portalUrl: clientPortalUrl } = req.body;
 
@@ -344,16 +389,23 @@ router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: Aut
     if (roleId) {
       targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
     } else if (role) {
-      targetRole = await prisma.role.findFirst({ where: { name: String(role), isActive: true } });
+      targetRole = await prisma.role.findFirst({ where: { name: String(role) } });
     }
 
-    if (!targetRole) {
-      // Fallback: default to Employee role
-      targetRole = await prisma.role.findFirst({ where: { name: 'Employee' } });
+    if (!targetRole || !targetRole.isActive) {
+      return res.status(400).json({ error: 'Selected role is invalid or inactive.' });
     }
 
-    const assignedRoleName = targetRole?.name || 'Employee';
-    const assignedRoleId = targetRole?.id || null;
+    // Enforce hierarchy rank check
+    if (
+      !canManageTargetRank(req.user!, targetRole.rank) ||
+      (!isUnrestrictedUser(req.user) && targetRole.bypassPermissions)
+    ) {
+      return res.status(403).json({ error: 'Cannot assign a role at or above your hierarchy level' });
+    }
+
+    const assignedRoleName = targetRole.name;
+    const assignedRoleId = targetRole.id;
 
     // Validate reporting manager if provided
     let assignedManagerId: string | null = null;
@@ -381,6 +433,10 @@ router.post('/pre-register', requireAuth, requireCanManageUsers, async (req: Aut
         manager: { select: { id: true, name: true, role: true } },
       },
     });
+
+    if (targetRole.autoAddToProjects === true) {
+      await addUserToAllExistingProjects(preRegistered.id);
+    }
 
     // Send email with portal link and pre-registered account details
     try {
@@ -529,6 +585,10 @@ router.patch('/:id/role', requireAuth, requireCanManageUsers, async (req: AuthRe
         manager: { select: { id: true, name: true, role: true } },
       },
     });
+
+    if (targetRole.autoAddToProjects === true) {
+      await addUserToAllExistingProjects(updated.id);
+    }
 
     res.json({ message: `Role updated to "${targetRole.name}".`, user: updated });
   } catch (error: any) {
@@ -783,5 +843,70 @@ const handleProfileUpdate = async (req: AuthRequest, res: Response) => {
 
 router.patch('/profile', requireAuth, handleProfileUpdate);
 router.put('/profile', requireAuth, handleProfileUpdate);
+
+/**
+ * GET /api/users/:id
+ * Retrieves sanitized user details with hierarchy authorization and permissions.
+ * Restricted to users with 'add_user' permission.
+ * Placed after all static /api/users/* routes to prevent route collisions.
+ */
+router.get('/:id', requireAuth, requirePermission('add_user'), async (req: AuthRequest, res: Response) => {
+  try {
+    const targetUserId = req.params.id;
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: {
+        roleDefinition: true,
+        manager: {
+          select: { id: true, name: true, email: true, role: true },
+        },
+      },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const targetRoleRank = targetUser.roleDefinition?.rank ?? 4;
+    const targetBypassPermissions = Boolean(targetUser.roleDefinition?.bypassPermissions);
+
+    // Enforce hierarchy check
+    if (
+      !canManageTargetRank(req.user!, targetRoleRank) ||
+      (!isUnrestrictedUser(req.user) && targetBypassPermissions)
+    ) {
+      return res.status(403).json({
+        error: 'Forbidden: You cannot view user details of users at or above your hierarchy level',
+      });
+    }
+
+    // Retrieve target user permissions
+    const permissionState = await getTargetUserPermissions(req.user, targetUser.id);
+
+    const userDetail = {
+      id: targetUser.id,
+      name: targetUser.name,
+      email: targetUser.email,
+      phone: (targetUser as any).phone || null,
+      role: targetUser.role,
+      roleId: targetUser.roleId,
+      roleRank: targetRoleRank,
+      department: targetUser.department,
+      managerId: targetUser.managerId,
+      manager: targetUser.manager,
+      isSignupCompleted: (targetUser as any).isSignupCompleted ?? true,
+      createdAt: targetUser.createdAt,
+      updatedAt: targetUser.updatedAt,
+      isUnrestricted: targetBypassPermissions,
+      permissionState,
+    };
+
+    res.json(userDetail);
+  } catch (error: any) {
+    console.error('Failed to retrieve user details:', error);
+    res.status(500).json({ error: 'Failed to retrieve user details' });
+  }
+});
 
 export default router;

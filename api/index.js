@@ -86,11 +86,15 @@ async function getUserHierarchyContext(userId) {
       let roleRank = 999;
       let isExecutive = false;
       let canManageUsers = false;
+      let bypassPermissions = false;
+      let autoAddToProjects = false;
       if (user.roleDefinition && user.roleDefinition.isActive) {
         roleName = user.roleDefinition.name;
         roleRank = user.roleDefinition.rank;
         isExecutive = user.roleDefinition.isExecutive;
         canManageUsers = user.roleDefinition.canManageUsers;
+        bypassPermissions = Boolean(user.roleDefinition.bypassPermissions);
+        autoAddToProjects = Boolean(user.roleDefinition.autoAddToProjects);
       } else {
         const matchedRole = await prisma.role.findFirst({
           where: { name: user.role, isActive: true }
@@ -100,10 +104,13 @@ async function getUserHierarchyContext(userId) {
           roleRank = matchedRole.rank;
           isExecutive = matchedRole.isExecutive;
           canManageUsers = matchedRole.canManageUsers;
+          bypassPermissions = Boolean(matchedRole.bypassPermissions);
+          autoAddToProjects = Boolean(matchedRole.autoAddToProjects);
         } else if (user.role === "CEO") {
           roleRank = 1;
           isExecutive = true;
           canManageUsers = true;
+          bypassPermissions = true;
         } else if (user.role === "CTO" || user.role === "ProjectOwner") {
           roleRank = 2;
         } else {
@@ -179,6 +186,8 @@ async function getUserHierarchyContext(userId) {
         roleRank,
         isExecutive,
         canManageUsers,
+        bypassPermissions,
+        autoAddToProjects,
         managerId: user.managerId,
         directSubordinateIds,
         allSubordinateIds,
@@ -240,14 +249,51 @@ function canManageIssue(ctx, issue) {
   return false;
 }
 async function getVisibleWorkloadUserIds(ctx) {
-  if (ctx.isExecutive) {
+  if (ctx.bypassPermissions || ctx.isExecutive) {
     const allUsers = await prisma.user.findMany({ select: { id: true } });
     return allUsers.map((u) => u.id);
   }
-  if ((ctx.roleRank < 3 || ctx.canManageUsers) && ctx.allSubordinateIds.length > 0) {
-    return [ctx.userId, ...ctx.allSubordinateIds];
+  if (ctx.autoAddToProjects) {
+    const lowerRankUsers = await prisma.user.findMany({
+      where: {
+        roleDefinition: {
+          is: {
+            rank: { gt: ctx.roleRank },
+            bypassPermissions: false
+          }
+        }
+      },
+      select: { id: true }
+    });
+    const idSet = /* @__PURE__ */ new Set([ctx.userId, ...lowerRankUsers.map((u) => u.id)]);
+    return Array.from(idSet);
   }
-  return [ctx.userId];
+  const candidateIds = /* @__PURE__ */ new Set([ctx.userId]);
+  ctx.allSubordinateIds.forEach((id) => candidateIds.add(id));
+  if (ctx.authorizedProjectIds.length > 0) {
+    const projectMembers = await prisma.projectMembership.findMany({
+      where: { projectId: { in: ctx.authorizedProjectIds } },
+      select: { userId: true }
+    });
+    projectMembers.forEach((m) => candidateIds.add(m.userId));
+  }
+  const idsToCheck = Array.from(candidateIds).filter((id) => id !== ctx.userId);
+  if (idsToCheck.length === 0) {
+    return [ctx.userId];
+  }
+  const bypassUsers = await prisma.user.findMany({
+    where: {
+      id: { in: idsToCheck },
+      roleDefinition: {
+        is: {
+          bypassPermissions: true
+        }
+      }
+    },
+    select: { id: true }
+  });
+  const bypassSet = new Set(bypassUsers.map((u) => u.id));
+  return Array.from(candidateIds).filter((id) => id === ctx.userId || !bypassSet.has(id));
 }
 async function getVisibleDirectoryUserIds(ctx) {
   if (ctx.isExecutive || ctx.canManageUsers) {
@@ -471,6 +517,301 @@ import cors from "cors";
 // server/auth.ts
 init_prisma();
 import crypto from "crypto";
+
+// server/services/permissionService.ts
+init_prisma();
+var PermissionServiceError = class extends Error {
+  status;
+  constructor(status, message) {
+    super(message);
+    this.name = "PermissionServiceError";
+    this.status = status;
+  }
+};
+var authCacheInvalidator = null;
+function registerAuthCacheInvalidator(fn) {
+  authCacheInvalidator = fn;
+}
+function invalidateUserAuthCache(userId) {
+  if (authCacheInvalidator && userId) {
+    authCacheInvalidator(userId);
+  }
+}
+function parsePermissionMap(raw) {
+  if (!raw) return {};
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {};
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value === "boolean") {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+function isUnrestrictedUser(user) {
+  return Boolean(user?.bypassPermissions);
+}
+async function getConfigurations() {
+  return prisma.configuration.findMany({
+    orderBy: { createdAt: "asc" },
+    select: {
+      id: true,
+      name: true,
+      key: true,
+      createdAt: true
+    }
+  });
+}
+async function createConfiguration(actor, data) {
+  if (!isUnrestrictedUser(actor)) {
+    throw new PermissionServiceError(403, "Restricted to top-level executive role");
+  }
+  const name = String(data?.name || "").trim();
+  if (!name || name.length > 100) {
+    throw new PermissionServiceError(400, "Configuration name is required (max 100 characters)");
+  }
+  const rawKey = String(data?.key || "").trim().toLowerCase();
+  const keyRegex = /^[a-z][a-z0-9_]{1,63}$/;
+  if (!keyRegex.test(rawKey)) {
+    throw new PermissionServiceError(
+      400,
+      "Invalid configuration key format. Must be 2-64 lowercase alphanumeric characters or underscores, starting with a letter."
+    );
+  }
+  const existing = await prisma.configuration.findUnique({
+    where: { key: rawKey }
+  });
+  if (existing) {
+    throw new PermissionServiceError(409, "Configuration key already exists");
+  }
+  const created = await prisma.configuration.create({
+    data: {
+      name,
+      key: rawKey
+    },
+    select: {
+      id: true,
+      name: true,
+      key: true,
+      createdAt: true
+    }
+  });
+  return created;
+}
+async function getUserPermissionKeys(userId) {
+  if (!userId) return [];
+  const [permissionRow, configRows] = await Promise.all([
+    prisma.permission.findUnique({
+      where: { userId },
+      select: { permissions: true }
+    }),
+    prisma.configuration.findMany({
+      select: { key: true }
+    })
+  ]);
+  if (!permissionRow || !permissionRow.permissions) return [];
+  const map = parsePermissionMap(permissionRow.permissions);
+  const validKeySet = new Set(configRows.map((c) => c.key));
+  return Object.keys(map).filter((key) => validKeySet.has(key) && map[key] === true);
+}
+async function hasPermission(user, key) {
+  if (!user) return false;
+  if (isUnrestrictedUser(user)) return true;
+  if (Array.isArray(user.permissions)) {
+    return user.permissions.includes(key);
+  }
+  if (user.id) {
+    const keys = await getUserPermissionKeys(user.id);
+    return keys.includes(key);
+  }
+  return false;
+}
+function canManageTargetRank(actor, targetRank) {
+  if (isUnrestrictedUser(actor)) {
+    return targetRank >= actor.roleRank;
+  }
+  return targetRank > actor.roleRank;
+}
+async function canAccessUserManagement(actor) {
+  if (!actor) return false;
+  if (isUnrestrictedUser(actor)) return true;
+  return hasPermission(actor, "add_user");
+}
+async function getTargetUserPermissions(actor, targetUserId) {
+  const hasUserMgmtAccess = await canAccessUserManagement(actor);
+  if (!hasUserMgmtAccess) {
+    throw new PermissionServiceError(403, "Forbidden: Insufficient permissions to view or manage users");
+  }
+  const targetUser = await prisma.user.findUnique({
+    where: { id: targetUserId },
+    include: { roleDefinition: true }
+  });
+  if (!targetUser) {
+    throw new PermissionServiceError(404, "Target user not found");
+  }
+  const targetRank = targetUser.roleDefinition?.rank ?? 4;
+  const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+  if (!canManageTargetRank(actor, targetRank)) {
+    throw new PermissionServiceError(
+      403,
+      "Forbidden: You cannot view or manage permissions of users at or above your hierarchy rank"
+    );
+  }
+  const [configs, targetPermissionRow] = await Promise.all([
+    prisma.configuration.findMany({
+      orderBy: { createdAt: "asc" },
+      select: { key: true, name: true }
+    }),
+    prisma.permission.findUnique({
+      where: { userId: targetUserId },
+      select: { permissions: true }
+    })
+  ]);
+  const map = parsePermissionMap(targetPermissionRow?.permissions);
+  const permissions = await Promise.all(
+    configs.map(async (config) => {
+      const isEnabled = targetBypass ? true : Boolean(map[config.key]);
+      const actorHasKey = await hasPermission(actor, config.key);
+      const canToggle = !targetBypass && actor.id !== targetUserId && actorHasKey;
+      return {
+        key: config.key,
+        name: config.name,
+        isEnabled,
+        canToggle
+      };
+    })
+  );
+  return {
+    targetUserId,
+    isUnrestricted: targetBypass,
+    permissions
+  };
+}
+async function updateUserPermissions(actor, targetUserId, rawUpdates) {
+  if (!Array.isArray(rawUpdates) || rawUpdates.length === 0) {
+    throw new PermissionServiceError(400, "No permission updates provided");
+  }
+  if (actor.id === targetUserId) {
+    throw new PermissionServiceError(403, "Forbidden: You cannot modify your own permissions");
+  }
+  const hasUserMgmtAccess = await canAccessUserManagement(actor);
+  if (!hasUserMgmtAccess) {
+    throw new PermissionServiceError(403, "Forbidden: Insufficient permissions to manage users");
+  }
+  const targetUser = await prisma.user.findUnique({
+    where: { id: targetUserId },
+    include: { roleDefinition: true }
+  });
+  if (!targetUser) {
+    throw new PermissionServiceError(404, "Target user not found");
+  }
+  const targetRank = targetUser.roleDefinition?.rank ?? 4;
+  const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+  if (targetBypass) {
+    throw new PermissionServiceError(403, "Forbidden: Permissions cannot be modified for unrestricted users");
+  }
+  if (!canManageTargetRank(actor, targetRank)) {
+    throw new PermissionServiceError(
+      403,
+      "Forbidden: You cannot modify permissions of users at or above your hierarchy rank"
+    );
+  }
+  const validConfigs = await prisma.configuration.findMany({
+    select: { key: true }
+  });
+  const validKeySet = new Set(validConfigs.map((c) => c.key));
+  for (const update of rawUpdates) {
+    if (!validKeySet.has(update.key)) {
+      throw new PermissionServiceError(400, `Unknown configuration key: "${update.key}"`);
+    }
+  }
+  if (!isUnrestrictedUser(actor)) {
+    for (const update of rawUpdates) {
+      const actorHasKey = await hasPermission(actor, update.key);
+      if (!actorHasKey) {
+        throw new PermissionServiceError(
+          403,
+          `Forbidden: Cannot assign or revoke permission "${update.key}" which you do not possess`
+        );
+      }
+    }
+  }
+  await prisma.$transaction(async (tx) => {
+    const existingRow = await tx.permission.findUnique({
+      where: { userId: targetUserId }
+    });
+    const currentMap = parsePermissionMap(existingRow?.permissions);
+    for (const update of rawUpdates) {
+      currentMap[update.key] = Boolean(update.isEnabled);
+    }
+    await tx.permission.upsert({
+      where: { userId: targetUserId },
+      create: {
+        userId: targetUserId,
+        permissions: currentMap,
+        updatedById: actor.id
+      },
+      update: {
+        permissions: currentMap,
+        updatedById: actor.id
+      }
+    });
+  });
+  invalidateUserAuthCache(targetUserId);
+  return getTargetUserPermissions(actor, targetUserId);
+}
+async function addAutoJoinRoleUsersToProject(tx, projectId) {
+  if (!projectId) return;
+  const users = await tx.user.findMany({
+    where: {
+      roleDefinition: {
+        is: {
+          autoAddToProjects: true,
+          isActive: true
+        }
+      }
+    },
+    select: { id: true }
+  });
+  if (users.length > 0) {
+    await tx.projectMembership.createMany({
+      data: users.map((u) => ({
+        projectId,
+        userId: u.id,
+        role: "Member"
+      })),
+      skipDuplicates: true
+    });
+  }
+}
+async function addUserToAllExistingProjects(userId) {
+  if (!userId) return;
+  const projects = await prisma.project.findMany({
+    select: { id: true }
+  });
+  if (projects.length > 0) {
+    await prisma.projectMembership.createMany({
+      data: projects.map((p) => ({
+        projectId: p.id,
+        userId,
+        role: "Member"
+      })),
+      skipDuplicates: true
+    });
+  }
+}
+
+// server/auth.ts
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
@@ -551,6 +892,17 @@ function parseIdentifier(identifier) {
   return { type: "phone", value: normalizePhone(raw) };
 }
 var authUserCache = /* @__PURE__ */ new Map();
+function clearAuthCache(userId) {
+  if (userId) {
+    authUserCache.delete(userId);
+  } else {
+    authUserCache.clear();
+  }
+}
+function invalidateUserAuthCache2(userId) {
+  clearAuthCache(userId);
+}
+registerAuthCacheInvalidator(invalidateUserAuthCache2);
 async function authenticate(req, res, next) {
   let userId;
   const authHeader = req.headers.authorization;
@@ -586,6 +938,8 @@ async function authenticate(req, res, next) {
         const roleRank = roleDef?.rank ?? (user.role === "CEO" ? 1 : user.role === "CTO" || user.role === "ProjectOwner" ? 2 : user.role === "Intern" ? 4 : 3);
         const isExecutive = roleDef?.isExecutive ?? user.role === "CEO";
         const canManageUsers = roleDef?.canManageUsers ?? user.role === "CEO";
+        const bypassPermissions = roleDef?.bypassPermissions ?? false;
+        const permissions = bypassPermissions ? [] : await getUserPermissionKeys(user.id);
         const authUser = {
           id: user.id,
           name: user.name,
@@ -596,6 +950,8 @@ async function authenticate(req, res, next) {
           roleRank,
           isExecutive,
           canManageUsers,
+          bypassPermissions,
+          permissions,
           managerId: user.managerId || null,
           department: user.department,
           avatarUrl: user.avatarUrl,
@@ -631,18 +987,6 @@ function requireCTOOrCEO(req, res, next) {
   next();
 }
 var requireOwnerOrCEO = requireCTOOrCEO;
-function requireExecutive(req, res, next) {
-  if (!req.user) {
-    return res.status(401).json({ error: "Unauthorized: Authentication required." });
-  }
-  if (!req.user.isExecutive && req.user.roleRank !== 1 && req.user.role !== "CEO") {
-    return res.status(403).json({
-      error: "Forbidden: This action requires executive administrative authority."
-    });
-  }
-  next();
-}
-var requireCEO = requireExecutive;
 function requireCanManageUsers(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: "Unauthorized: Authentication required." });
@@ -651,6 +995,27 @@ function requireCanManageUsers(req, res, next) {
     return res.status(403).json({
       error: "Forbidden: You do not have permission to manage users or organizational roles."
     });
+  }
+  next();
+}
+function requirePermission(key) {
+  return async (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized: Authentication required." });
+    }
+    const allowed = await hasPermission(req.user, key);
+    if (!allowed) {
+      return res.status(403).json({ error: "Insufficient permissions" });
+    }
+    next();
+  };
+}
+function requireUnrestricted(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: "Unauthorized: Authentication required." });
+  }
+  if (!isUnrestrictedUser(req.user)) {
+    return res.status(403).json({ error: "Restricted to top-level executive role" });
   }
   next();
 }
@@ -2312,12 +2677,18 @@ router2.post("/login", async (req, res) => {
       if (parsed.type === "email") {
         user = await prisma.user.findUnique({ where: { email: parsed.value } });
       } else {
-        user = await prisma.user.findUnique({ where: { phone: parsed.value } });
+        user = await prisma.user.findUnique({
+          where: { phone: parsed.value }
+        });
       }
     } else if (email) {
-      user = await prisma.user.findUnique({ where: { email: normalizeEmail(String(email)) } });
+      user = await prisma.user.findUnique({
+        where: { email: normalizeEmail(String(email)) }
+      });
     } else if (phone) {
-      user = await prisma.user.findUnique({ where: { phone: normalizePhone(String(phone)) } });
+      user = await prisma.user.findUnique({
+        where: { phone: normalizePhone(String(phone)) }
+      });
     } else if (userId) {
       user = await prisma.user.findUnique({ where: { id: userId } });
     }
@@ -2334,7 +2705,9 @@ router2.post("/login", async (req, res) => {
     if (storedHash) {
       const isValid = verifyPassword(submittedPassword, storedHash);
       if (!isValid) {
-        return res.status(401).json({ error: "Invalid credentials. Password is incorrect. Please check your password and try again." });
+        return res.status(401).json({
+          error: "Invalid credentials. Password is incorrect. Please check your password and try again."
+        });
       }
     } else if (password !== void 0) {
       const isDefault = submittedPassword === "PugArch@2026" || submittedPassword === "Password123!";
@@ -2378,7 +2751,8 @@ function isMatchingPhone(p1, p2) {
   const d2 = p2.replace(/\D/g, "");
   if (!d1 || !d2) return false;
   if (d1 === d2) return true;
-  if (d1.length >= 10 && d2.length >= 10 && d1.slice(-10) === d2.slice(-10)) return true;
+  if (d1.length >= 10 && d2.length >= 10 && d1.slice(-10) === d2.slice(-10))
+    return true;
   return false;
 }
 async function resolvePreRegisteredCandidate(reqBody) {
@@ -2444,13 +2818,13 @@ var handleSendOrResendVerificationOtp = async (req, res, options = {}) => {
     if (!user || errorStatus) {
       return res.status(errorStatus || 403).json({ error: errorMessage });
     }
-    const previousChallenge = parseVerificationChallenge(user.verificationCode);
+    const previousChallenge = parseVerificationChallenge(
+      user.verificationCode
+    );
     if (previousChallenge?.isEmailVerified) {
-      return res.status(200).json({
-        success: true,
-        alreadyVerified: true,
-        isEmailVerified: true,
-        message: "This email address has already been verified. Please proceed to complete your registration."
+      return res.status(400).json({
+        error: "This email address has already been verified. Please proceed to complete your registration.",
+        isEmailVerified: true
       });
     }
     const cooldown = checkResendCooldown(previousChallenge);
@@ -2644,7 +3018,9 @@ var handleRegister = async (req, res) => {
       return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
     }
     if (confirmPassword !== void 0 && confirmPassword !== password) {
-      return res.status(400).json({ error: "Passwords do not match. Please ensure both fields are identical." });
+      return res.status(400).json({
+        error: "Passwords do not match. Please ensure both fields are identical."
+      });
     }
     const passwordValidation = validatePassword(password);
     if (!passwordValidation.isValid) {
@@ -2674,7 +3050,9 @@ var handleRegister = async (req, res) => {
         error: "An account with this email address has already completed registration. Please sign in instead."
       });
     }
-    const challenge = parseVerificationChallenge(preRegisteredUser.verificationCode);
+    const challenge = parseVerificationChallenge(
+      preRegisteredUser.verificationCode
+    );
     const isAlreadyVerified = challenge?.isEmailVerified === true;
     if (!isAlreadyVerified) {
       if (!code || typeof code !== "string") {
@@ -2693,7 +3071,9 @@ var handleRegister = async (req, res) => {
       }
       const expiry = preRegisteredUser.verificationExpiry;
       if (expiry && /* @__PURE__ */ new Date() > new Date(expiry)) {
-        return res.status(400).json({ error: "Verification code has expired. Please request a new code." });
+        return res.status(400).json({
+          error: "Verification code has expired. Please request a new code."
+        });
       }
       if (challenge.attempts >= challenge.maxAttempts) {
         return res.status(429).json({
@@ -2760,10 +3140,22 @@ var handleRegister = async (req, res) => {
     return res.status(500).json({ error: "Failed to complete registration" });
   }
 };
-router2.post("/register/send-code", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: false }));
-router2.post("/otp/send", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: false }));
-router2.post("/register/resend-code", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: true }));
-router2.post("/otp/resend", (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: true }));
+router2.post(
+  "/register/send-code",
+  (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: false })
+);
+router2.post(
+  "/otp/send",
+  (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: false })
+);
+router2.post(
+  "/register/resend-code",
+  (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: true })
+);
+router2.post(
+  "/otp/resend",
+  (req, res) => handleSendOrResendVerificationOtp(req, res, { isResend: true })
+);
 router2.post("/register/verify-code", handleVerifyOtp);
 router2.post("/otp/verify", handleVerifyOtp);
 router2.post("/otp/status", async (req, res) => {
@@ -2772,7 +3164,9 @@ router2.post("/otp/status", async (req, res) => {
     if (!user || errorStatus) {
       return res.status(errorStatus || 403).json({ error: errorMessage });
     }
-    const challenge = parseVerificationChallenge(user.verificationCode);
+    const challenge = parseVerificationChallenge(
+      user.verificationCode
+    );
     const cooldown = checkResendCooldown(challenge);
     return res.json({
       isEmailVerified: Boolean(challenge?.isEmailVerified),
@@ -2797,7 +3191,9 @@ router2.post("/forgot-password", async (req, res) => {
     if (parsed.type === "email") {
       user = await prisma.user.findUnique({ where: { email: parsed.value } });
     } else {
-      user = await prisma.user.findUnique({ where: { phone: parsed.value } });
+      user = await prisma.user.findUnique({
+        where: { phone: parsed.value }
+      });
     }
     if (!user || !user.isSignupCompleted) {
       return res.json({
@@ -2855,7 +3251,9 @@ router2.post("/reset-password", async (req, res) => {
       return res.status(400).json({ error: "6-digit recovery code is required." });
     }
     if (confirmPassword !== void 0 && confirmPassword !== newPassword) {
-      return res.status(400).json({ error: "Passwords do not match. Please ensure both fields are identical." });
+      return res.status(400).json({
+        error: "Passwords do not match. Please ensure both fields are identical."
+      });
     }
     const passwordValidation = validatePassword(newPassword);
     if (!passwordValidation.isValid) {
@@ -2869,7 +3267,9 @@ router2.post("/reset-password", async (req, res) => {
     if (parsed.type === "email") {
       user = await prisma.user.findUnique({ where: { email: parsed.value } });
     } else {
-      user = await prisma.user.findUnique({ where: { phone: parsed.value } });
+      user = await prisma.user.findUnique({
+        where: { phone: parsed.value }
+      });
     }
     if (!user) {
       return res.status(400).json({ error: "Invalid recovery code or account details." });
@@ -2880,7 +3280,9 @@ router2.post("/reset-password", async (req, res) => {
       return res.status(400).json({ error: "Invalid recovery code or account details." });
     }
     if (tokenExpiry && /* @__PURE__ */ new Date() > new Date(tokenExpiry)) {
-      return res.status(400).json({ error: "Recovery code has expired. Please request a new code." });
+      return res.status(400).json({
+        error: "Recovery code has expired. Please request a new code."
+      });
     }
     const isValidToken = verifyOtp(
       String(code).trim(),
@@ -2909,114 +3311,134 @@ router2.post("/reset-password", async (req, res) => {
     res.status(500).json({ error: "Failed to reset password" });
   }
 });
-router2.post("/pre-register", requireCEO, async (req, res) => {
-  try {
-    const { name, email, phone, role, roleId, managerId, department, portalUrl: clientPortalUrl } = req.body;
-    if (!name || typeof name !== "string" || name.trim().length < 2) {
-      return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
-    }
-    if (!email || typeof email !== "string" || !isValidEmail(email)) {
-      return res.status(400).json({ error: "A valid email address is required." });
-    }
-    if (!phone || typeof phone !== "string" || !isValidPhone(phone)) {
-      return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
-    }
-    const cleanEmail = normalizeEmail(email);
-    const cleanPhone = phone.replace(/\D/g, "");
-    const existingEmail = await prisma.user.findUnique({
-      where: { email: cleanEmail }
-    });
-    if (existingEmail) {
-      return res.status(400).json({ error: "An account with this email address already exists." });
-    }
-    const existingPhone = await prisma.user.findUnique({
-      where: { phone: cleanPhone }
-    });
-    if (existingPhone) {
-      return res.status(400).json({ error: "An account with this phone number already exists." });
-    }
-    let finalRoleId = null;
-    let assignedRole = "Employee";
-    if (roleId) {
-      const roleDef = await prisma.role.findUnique({ where: { id: roleId } });
-      if (!roleDef || !roleDef.isActive) {
+router2.post(
+  "/pre-register",
+  requireAuth,
+  requirePermission("add_user"),
+  async (req, res) => {
+    try {
+      const {
+        name,
+        email,
+        phone,
+        role,
+        roleId,
+        managerId,
+        department,
+        portalUrl: clientPortalUrl
+      } = req.body;
+      if (!name || typeof name !== "string" || name.trim().length < 2) {
+        return res.status(400).json({ error: "Full name is required (minimum 2 characters)." });
+      }
+      if (!email || typeof email !== "string" || !isValidEmail(email)) {
+        return res.status(400).json({ error: "A valid email address is required." });
+      }
+      if (!phone || typeof phone !== "string" || !isValidPhone(phone)) {
+        return res.status(400).json({ error: "A valid phone number is required (7\u201315 digits)." });
+      }
+      const cleanEmail = normalizeEmail(email);
+      const cleanPhone = phone.replace(/\D/g, "");
+      const existingEmail = await prisma.user.findUnique({
+        where: { email: cleanEmail }
+      });
+      if (existingEmail) {
+        return res.status(400).json({
+          error: "An account with this email address already exists."
+        });
+      }
+      const existingPhone = await prisma.user.findUnique({
+        where: { phone: cleanPhone }
+      });
+      if (existingPhone) {
+        return res.status(400).json({ error: "An account with this phone number already exists." });
+      }
+      let targetRole = null;
+      if (roleId) {
+        targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
+      } else if (role) {
+        targetRole = await prisma.role.findFirst({ where: { name: String(role) } });
+      }
+      if (!targetRole || !targetRole.isActive) {
         return res.status(400).json({ error: "Selected role is invalid or inactive." });
       }
-      if (roleDef.isExecutive && !req.user.isExecutive) {
-        return res.status(403).json({ error: "Only executive leadership can assign executive roles." });
+      if (!canManageTargetRank(req.user, targetRole.rank) || !isUnrestrictedUser(req.user) && targetRole.bypassPermissions) {
+        return res.status(403).json({
+          error: "Cannot assign a role at or above your hierarchy level"
+        });
       }
-      finalRoleId = roleDef.id;
-      assignedRole = roleDef.name;
-    } else if (role) {
-      const roleDef = await prisma.role.findFirst({
-        where: { name: role, isActive: true }
+      const finalRoleId = targetRole.id;
+      const assignedRole = targetRole.name;
+      if (managerId) {
+        const manager = await prisma.user.findUnique({
+          where: { id: managerId }
+        });
+        if (!manager) {
+          return res.status(400).json({ error: "Specified manager not found." });
+        }
+      }
+      const preRegistered = await prisma.user.create({
+        data: {
+          name: name.trim(),
+          email: cleanEmail,
+          phone: cleanPhone,
+          role: assignedRole,
+          roleId: finalRoleId,
+          managerId: managerId || null,
+          department: department ? String(department).trim() : "Operations",
+          avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
+          isSignupCompleted: false
+        },
+        include: {
+          roleDefinition: true,
+          manager: { select: { id: true, name: true, role: true } }
+        }
       });
-      if (roleDef) {
-        finalRoleId = roleDef.id;
-        assignedRole = roleDef.name;
-      } else {
-        assignedRole = role;
+      if (targetRole.autoAddToProjects === true) {
+        await addUserToAllExistingProjects(preRegistered.id);
       }
-    }
-    if (managerId) {
-      const manager = await prisma.user.findUnique({ where: { id: managerId } });
-      if (!manager) {
-        return res.status(400).json({ error: "Specified manager not found." });
+      try {
+        const portalUrl = resolvePortalUrl(req, clientPortalUrl);
+        await sendPreRegistrationEmail({
+          to: preRegistered.email,
+          name: preRegistered.name,
+          phone: preRegistered.phone,
+          role: preRegistered.role,
+          department: preRegistered.department,
+          portalUrl
+        });
+      } catch (emailErr) {
+        console.error(
+          "[PreRegister] Failed to send activation invitation email:",
+          emailErr.message || emailErr
+        );
       }
-    }
-    const preRegistered = await prisma.user.create({
-      data: {
-        name: name.trim(),
-        email: cleanEmail,
-        phone: cleanPhone,
-        role: assignedRole,
-        roleId: finalRoleId,
-        managerId: managerId || null,
-        department: department ? String(department).trim() : "Operations",
-        avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name.trim())}`,
-        isSignupCompleted: false
-      },
-      include: {
-        roleDefinition: true,
-        manager: { select: { id: true, name: true, role: true } }
-      }
-    });
-    try {
-      const portalUrl = resolvePortalUrl(req, clientPortalUrl);
-      await sendPreRegistrationEmail({
-        to: preRegistered.email,
-        name: preRegistered.name,
-        phone: preRegistered.phone,
-        role: preRegistered.role,
-        department: preRegistered.department,
-        portalUrl
+      res.status(201).json({
+        message: "User successfully pre-registered. They can now complete account creation using their email and phone.",
+        user: {
+          id: preRegistered.id,
+          name: preRegistered.name,
+          email: preRegistered.email,
+          phone: preRegistered.phone,
+          role: preRegistered.role,
+          department: preRegistered.department,
+          isSignupCompleted: false,
+          createdAt: preRegistered.createdAt
+        }
       });
-    } catch (emailErr) {
-      console.error("[PreRegister] Failed to send activation invitation email:", emailErr.message || emailErr);
+    } catch (error) {
+      console.error("Pre-registration error:", error);
+      res.status(500).json({ error: "Failed to pre-register user" });
     }
-    res.status(201).json({
-      message: "User successfully pre-registered. They can now complete account creation using their email and phone.",
-      user: {
-        id: preRegistered.id,
-        name: preRegistered.name,
-        email: preRegistered.email,
-        phone: preRegistered.phone,
-        role: preRegistered.role,
-        department: preRegistered.department,
-        isSignupCompleted: false,
-        createdAt: preRegistered.createdAt
-      }
-    });
-  } catch (error) {
-    console.error("Pre-registration error:", error);
-    res.status(500).json({ error: "Failed to pre-register user" });
   }
-});
+);
 router2.post("/logout", (req, res) => {
   const isProd = process.env.NODE_ENV === "production" || !!process.env.VERCEL;
   const sameSite = isProd ? "None" : "Lax";
   const secureFlag = isProd ? " Secure;" : "";
-  res.setHeader("Set-Cookie", `ff_user_id=; Path=/; HttpOnly; SameSite=${sameSite};${secureFlag} Max-Age=0`);
+  res.setHeader(
+    "Set-Cookie",
+    `ff_user_id=; Path=/; HttpOnly; SameSite=${sameSite};${secureFlag} Max-Age=0`
+  );
   res.json({ success: true, message: "Logged out successfully" });
 });
 router2.get("/profile", requireAuth, async (req, res) => {
@@ -3049,175 +3471,198 @@ router2.get("/profile", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve profile." });
   }
 });
-router2.patch("/profile", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user?.id;
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized: Authentication required." });
-    }
-    const currentUser = await prisma.user.findUnique({
-      where: { id: userId }
-    });
-    if (!currentUser) {
-      return res.status(404).json({ error: "User account not found." });
-    }
-    const { name, department, role, email, phone, password, resetToken, isSignupCompleted } = req.body || {};
-    if (role !== void 0 && role !== currentUser.role) {
-      return res.status(403).json({
-        error: "Forbidden: User role cannot be modified. Roles are managed strictly by executive leadership."
-      });
-    }
-    if (password !== void 0 || resetToken !== void 0 || isSignupCompleted !== void 0) {
-      return res.status(400).json({
-        error: "Modifying security credentials or signup status via profile updates is forbidden."
-      });
-    }
-    let newEmail;
-    if (email !== void 0) {
-      if (typeof email !== "string") {
-        return res.status(400).json({ error: "Email must be a valid text string." });
+router2.patch(
+  "/profile",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const userId = req.user?.id;
+      if (!userId) {
+        return res.status(401).json({ error: "Unauthorized: Authentication required." });
       }
-      const cleanEmail = normalizeEmail(email);
-      if (!isValidEmail(cleanEmail)) {
-        return res.status(400).json({ error: "Please enter a valid email address." });
+      const currentUser = await prisma.user.findUnique({
+        where: { id: userId }
+      });
+      if (!currentUser) {
+        return res.status(404).json({ error: "User account not found." });
       }
-      if (cleanEmail !== currentUser.email) {
-        const existingEmail = await prisma.user.findFirst({
-          where: {
-            email: cleanEmail,
-            NOT: { id: userId }
-          }
+      const {
+        name,
+        department,
+        role,
+        email,
+        phone,
+        password,
+        resetToken,
+        isSignupCompleted
+      } = req.body || {};
+      if (role !== void 0 && role !== currentUser.role) {
+        return res.status(403).json({
+          error: "Forbidden: User role cannot be modified. Roles are managed strictly by executive leadership."
         });
-        if (existingEmail) {
-          return res.status(400).json({ error: "An account with this email address already exists." });
-        }
-        newEmail = cleanEmail;
       }
-    }
-    let newPhone;
-    if (phone !== void 0) {
-      if (typeof phone !== "string") {
-        return res.status(400).json({ error: "Mobile phone must be a valid text string." });
+      if (password !== void 0 || resetToken !== void 0 || isSignupCompleted !== void 0) {
+        return res.status(400).json({
+          error: "Modifying security credentials or signup status via profile updates is forbidden."
+        });
       }
-      const rawPhone = phone.trim();
-      if (rawPhone) {
-        const cleanPhone = normalizePhone(rawPhone);
-        if (!isValidPhone(cleanPhone)) {
-          return res.status(400).json({ error: "Please enter a valid mobile phone number (7\u201315 digits)." });
+      let newEmail;
+      if (email !== void 0) {
+        if (typeof email !== "string") {
+          return res.status(400).json({ error: "Email must be a valid text string." });
         }
-        const currentPhone = currentUser.phone ? normalizePhone(currentUser.phone) : "";
-        if (cleanPhone !== currentPhone) {
-          const existingPhone = await prisma.user.findFirst({
+        const cleanEmail = normalizeEmail(email);
+        if (!isValidEmail(cleanEmail)) {
+          return res.status(400).json({ error: "Please enter a valid email address." });
+        }
+        if (cleanEmail !== currentUser.email) {
+          const existingEmail = await prisma.user.findFirst({
             where: {
-              phone: cleanPhone,
+              email: cleanEmail,
               NOT: { id: userId }
             }
           });
-          if (existingPhone) {
-            return res.status(400).json({ error: "An account with this phone number already exists." });
+          if (existingEmail) {
+            return res.status(400).json({
+              error: "An account with this email address already exists."
+            });
           }
-          newPhone = cleanPhone;
+          newEmail = cleanEmail;
         }
-      } else if (currentUser.phone) {
-        newPhone = null;
       }
-    }
-    let newName;
-    if (name !== void 0) {
-      if (typeof name !== "string") {
-        return res.status(400).json({ error: "Full name must be a valid text string." });
-      }
-      const trimmedName = name.trim();
-      if (trimmedName.length < 2 || trimmedName.length > 100) {
-        return res.status(400).json({ error: "Full name must be between 2 and 100 characters in length." });
-      }
-      if (/[<>{}]/.test(trimmedName)) {
-        return res.status(400).json({ error: "Full name contains invalid characters." });
-      }
-      if (trimmedName !== currentUser.name) {
-        newName = trimmedName;
-      }
-    }
-    let newDept;
-    if (department !== void 0) {
-      if (typeof department !== "string") {
-        return res.status(400).json({ error: "Department must be a valid text string." });
-      }
-      const trimmedDept = department.trim();
-      if (currentUser.isExecutive) {
-        if (trimmedDept.length < 2 || trimmedDept.length > 100) {
-          return res.status(400).json({ error: "Department must be between 2 and 100 characters in length." });
+      let newPhone;
+      if (phone !== void 0) {
+        if (typeof phone !== "string") {
+          return res.status(400).json({ error: "Mobile phone must be a valid text string." });
         }
-        if (/[<>{}]/.test(trimmedDept)) {
-          return res.status(400).json({ error: "Department contains invalid characters." });
+        const rawPhone = phone.trim();
+        if (rawPhone) {
+          const cleanPhone = normalizePhone(rawPhone);
+          if (!isValidPhone(cleanPhone)) {
+            return res.status(400).json({
+              error: "Please enter a valid mobile phone number (7\u201315 digits)."
+            });
+          }
+          const currentPhone = currentUser.phone ? normalizePhone(currentUser.phone) : "";
+          if (cleanPhone !== currentPhone) {
+            const existingPhone = await prisma.user.findFirst({
+              where: {
+                phone: cleanPhone,
+                NOT: { id: userId }
+              }
+            });
+            if (existingPhone) {
+              return res.status(400).json({
+                error: "An account with this phone number already exists."
+              });
+            }
+            newPhone = cleanPhone;
+          }
+        } else if (currentUser.phone) {
+          newPhone = null;
         }
-        if (trimmedDept !== (currentUser.department || "")) {
-          newDept = trimmedDept;
+      }
+      let newName;
+      if (name !== void 0) {
+        if (typeof name !== "string") {
+          return res.status(400).json({ error: "Full name must be a valid text string." });
         }
-      } else {
-        if (trimmedDept !== (currentUser.department || "")) {
-          return res.status(403).json({
-            error: "Forbidden: Department assignments are managed by executive management."
+        const trimmedName = name.trim();
+        if (trimmedName.length < 2 || trimmedName.length > 100) {
+          return res.status(400).json({
+            error: "Full name must be between 2 and 100 characters in length."
           });
         }
+        if (/[<>{}]/.test(trimmedName)) {
+          return res.status(400).json({ error: "Full name contains invalid characters." });
+        }
+        if (trimmedName !== currentUser.name) {
+          newName = trimmedName;
+        }
       }
-    }
-    if (newName === void 0 && newEmail === void 0 && newPhone === void 0 && newDept === void 0) {
-      return res.json({
-        message: "No changes were detected in your profile.",
-        user: {
-          id: currentUser.id,
-          name: currentUser.name,
-          email: currentUser.email,
-          phone: currentUser.phone,
-          role: currentUser.role,
-          department: currentUser.department,
-          avatarUrl: currentUser.avatarUrl,
-          isSignupCompleted: currentUser.isSignupCompleted,
-          createdAt: currentUser.createdAt,
-          updatedAt: currentUser.updatedAt
+      let newDept;
+      if (department !== void 0) {
+        if (typeof department !== "string") {
+          return res.status(400).json({ error: "Department must be a valid text string." });
+        }
+        const trimmedDept = department.trim();
+        if (currentUser.isExecutive) {
+          if (trimmedDept.length < 2 || trimmedDept.length > 100) {
+            return res.status(400).json({
+              error: "Department must be between 2 and 100 characters in length."
+            });
+          }
+          if (/[<>{}]/.test(trimmedDept)) {
+            return res.status(400).json({ error: "Department contains invalid characters." });
+          }
+          if (trimmedDept !== (currentUser.department || "")) {
+            newDept = trimmedDept;
+          }
+        } else {
+          if (trimmedDept !== (currentUser.department || "")) {
+            return res.status(403).json({
+              error: "Forbidden: Department assignments are managed by executive management."
+            });
+          }
+        }
+      }
+      if (newName === void 0 && newEmail === void 0 && newPhone === void 0 && newDept === void 0) {
+        return res.json({
+          message: "No changes were detected in your profile.",
+          user: {
+            id: currentUser.id,
+            name: currentUser.name,
+            email: currentUser.email,
+            phone: currentUser.phone,
+            role: currentUser.role,
+            department: currentUser.department,
+            avatarUrl: currentUser.avatarUrl,
+            isSignupCompleted: currentUser.isSignupCompleted,
+            createdAt: currentUser.createdAt,
+            updatedAt: currentUser.updatedAt
+          }
+        });
+      }
+      const updateData = {};
+      if (newName) {
+        updateData.name = newName;
+        updateData.avatarUrl = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(newName)}`;
+      }
+      if (newEmail) {
+        updateData.email = newEmail;
+      }
+      if (newPhone !== void 0) {
+        updateData.phone = newPhone;
+      }
+      if (newDept !== void 0) {
+        updateData.department = newDept;
+      }
+      const updatedUser = await prisma.user.update({
+        where: { id: userId },
+        data: updateData,
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          phone: true,
+          role: true,
+          department: true,
+          avatarUrl: true,
+          isSignupCompleted: true,
+          createdAt: true,
+          updatedAt: true
         }
       });
+      res.json({
+        message: "Profile updated successfully.",
+        user: updatedUser
+      });
+    } catch (error) {
+      console.error("Failed to update user profile:", error);
+      res.status(500).json({ error: "Failed to update profile." });
     }
-    const updateData = {};
-    if (newName) {
-      updateData.name = newName;
-      updateData.avatarUrl = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(newName)}`;
-    }
-    if (newEmail) {
-      updateData.email = newEmail;
-    }
-    if (newPhone !== void 0) {
-      updateData.phone = newPhone;
-    }
-    if (newDept !== void 0) {
-      updateData.department = newDept;
-    }
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: updateData,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        department: true,
-        avatarUrl: true,
-        isSignupCompleted: true,
-        createdAt: true,
-        updatedAt: true
-      }
-    });
-    res.json({
-      message: "Profile updated successfully.",
-      user: updatedUser
-    });
-  } catch (error) {
-    console.error("Failed to update user profile:", error);
-    res.status(500).json({ error: "Failed to update profile." });
   }
-});
+);
 var auth_default = router2;
 
 // server/routes/projects.ts
@@ -3734,13 +4179,10 @@ router3.get("/", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve projects" });
   }
 });
-router3.post("/", requireAuth, async (req, res) => {
+router3.post("/", requireAuth, requirePermission("add_project"), async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
-    if (!ctx.isExecutive && ctx.roleRank > 2) {
-      return res.status(403).json({ error: "Forbidden: Insufficient organizational hierarchy permission to charter projects." });
-    }
     const validation = ProjectCreateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid project input" });
@@ -3785,6 +4227,7 @@ router3.post("/", requireAuth, async (req, res) => {
           }
         });
       }
+      await addAutoJoinRoleUsersToProject(tx, p.id);
       await tx.changeLogEntry.create({
         data: {
           projectId: p.id,
@@ -7354,7 +7797,7 @@ router10.get("/summary", requireAuth, async (req, res) => {
           allocations: {
             where: {
               weekStartDate: weekDate,
-              ...ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
+              ...ctx.bypassPermissions || ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
             },
             select: {
               allocatedHours: true
@@ -7363,7 +7806,7 @@ router10.get("/summary", requireAuth, async (req, res) => {
           tasks: {
             where: {
               state: { not: "Completed" },
-              ...ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
+              ...ctx.bypassPermissions || ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
             },
             select: {
               id: true,
@@ -7445,7 +7888,8 @@ router10.get("/summary", requireAuth, async (req, res) => {
       scope: {
         isExecutive: ctx.isExecutive,
         subordinatesCount: ctx.allSubordinateIds.length,
-        visibleUserCount: users.length
+        visibleUserCount: users.length,
+        hasTeamVisibility: Boolean(ctx.bypassPermissions || ctx.isExecutive || ctx.autoAddToProjects || ctx.allSubordinateIds.length > 0)
       }
     });
   } catch (error) {
@@ -7483,7 +7927,7 @@ router10.get("/", requireAuth, async (req, res) => {
           allocations: {
             where: {
               weekStartDate: weekDate,
-              ...ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
+              ...ctx.bypassPermissions || ctx.isExecutive ? {} : { projectId: { in: ctx.authorizedProjectIds } }
             },
             select: {
               id: true,
@@ -7495,7 +7939,7 @@ router10.get("/", requireAuth, async (req, res) => {
           tasks: {
             where: {
               state: { not: "Completed" },
-              ...ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
+              ...ctx.bypassPermissions || ctx.isExecutive ? {} : { phase: { projectId: { in: ctx.authorizedProjectIds } } }
             },
             select: {
               id: true,
@@ -7640,7 +8084,8 @@ router10.get("/", requireAuth, async (req, res) => {
       scope: {
         isExecutive: ctx.isExecutive,
         subordinatesCount: ctx.allSubordinateIds.length,
-        visibleUserCount: users.length
+        visibleUserCount: users.length,
+        hasTeamVisibility: Boolean(ctx.bypassPermissions || ctx.isExecutive || ctx.autoAddToProjects || ctx.allSubordinateIds.length > 0)
       }
     };
     if (isPaginated) {
@@ -7672,15 +8117,41 @@ router10.post("/allocate", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: "Forbidden: You can only allocate resources on projects you own or manage." });
-    }
     const isMember = await prisma.projectMembership.findUnique({
       where: { projectId_userId: { projectId, userId } }
     });
-    const isSubordinate = ctx.allSubordinateIds.includes(userId);
+    const callerMembership = await prisma.projectMembership.findUnique({
+      where: { projectId_userId: { projectId, userId: ctx.userId } }
+    });
+    const canAllocateOnProject = ctx.bypassPermissions || ctx.isExecutive || project.ownerId === ctx.userId || ctx.autoAddToProjects && (Boolean(isMember) || Boolean(callerMembership));
+    if (!canAllocateOnProject) {
+      return res.status(403).json({ error: "Forbidden: You can only allocate resources on projects you own or manage." });
+    }
     const isSelf = userId === ctx.userId;
-    if (!ctx.isExecutive && !isMember && !isSubordinate && !isSelf) {
+    const isSubordinate = ctx.allSubordinateIds.includes(userId);
+    const targetUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { roleDefinition: true }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "Target user does not exist" });
+    }
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === "Intern" ? 4 : 3);
+    const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+    if (!ctx.bypassPermissions) {
+      if (targetBypass && !isSubordinate && !isSelf) {
+        return res.status(403).json({
+          error: "Forbidden: Cannot allocate a user with administrative bypass permissions."
+        });
+      }
+      if (targetRank <= ctx.roleRank && !isSubordinate && !isSelf) {
+        return res.status(403).json({
+          error: "Forbidden: Cannot allocate a user at or above your hierarchy level."
+        });
+      }
+    }
+    const isEligibleTarget = ctx.bypassPermissions || isSelf || isSubordinate || ctx.autoAddToProjects && targetRank > ctx.roleRank && !targetBypass || Boolean(isMember) && !ctx.bypassPermissions && !ctx.isExecutive;
+    if (!isEligibleTarget) {
       return res.status(403).json({
         error: "Forbidden: Cannot allocate a user who is not a project member or in your reporting scope."
       });
@@ -9989,7 +10460,7 @@ router19.get("/", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve users" });
   }
 });
-router19.get("/management", requireAuth, requireCanManageUsers, async (req, res) => {
+router19.get("/management", requireAuth, requirePermission("add_user"), async (req, res) => {
   try {
     const {
       search,
@@ -10001,27 +10472,46 @@ router19.get("/management", requireAuth, requireCanManageUsers, async (req, res)
       sortBy = "name",
       sortOrder = "asc"
     } = req.query;
-    const where = {};
+    const callerRank = req.user.roleRank;
+    const hierarchyFilter = isUnrestrictedUser(req.user) ? {
+      OR: [
+        { roleDefinition: { rank: { gte: callerRank } } },
+        { roleDefinition: null }
+      ]
+    } : {
+      roleDefinition: {
+        rank: { gt: callerRank },
+        bypassPermissions: false
+      }
+    };
+    const hierarchyWhere = {
+      AND: [hierarchyFilter]
+    };
+    const where = {
+      AND: [hierarchyFilter]
+    };
     if (status === "pending") {
-      where.isSignupCompleted = false;
+      where.AND.push({ isSignupCompleted: false });
     } else if (status === "completed") {
-      where.isSignupCompleted = true;
+      where.AND.push({ isSignupCompleted: true });
     }
     if (search && typeof search === "string" && search.trim()) {
       const term = search.trim();
-      where.OR = [
-        { name: { contains: term, mode: "insensitive" } },
-        { email: { contains: term, mode: "insensitive" } },
-        { phone: { contains: term } },
-        { department: { contains: term, mode: "insensitive" } },
-        { role: { contains: term, mode: "insensitive" } }
-      ];
+      where.AND.push({
+        OR: [
+          { name: { contains: term, mode: "insensitive" } },
+          { email: { contains: term, mode: "insensitive" } },
+          { phone: { contains: term } },
+          { department: { contains: term, mode: "insensitive" } },
+          { role: { contains: term, mode: "insensitive" } }
+        ]
+      });
     }
     if (roleId && typeof roleId === "string" && roleId !== "ALL") {
-      where.roleId = roleId;
+      where.AND.push({ roleId });
     }
     if (department && typeof department === "string" && department !== "ALL") {
-      where.department = department;
+      where.AND.push({ department });
     }
     const isPaginated = page !== void 0 || limit !== void 0;
     const pageNum = Math.max(1, parseInt(String(page || "1"), 10) || 1);
@@ -10051,8 +10541,18 @@ router19.get("/management", requireAuth, requireCanManageUsers, async (req, res)
     const order = String(sortOrder).toLowerCase() === "desc" ? "desc" : "asc";
     const orderBy = [{ isSignupCompleted: "asc" }, { [field]: order }];
     if (isPaginated) {
-      const [total, users2] = await Promise.all([
+      const [total, pendingCount, completedCount, users2] = await Promise.all([
         prisma.user.count({ where }),
+        prisma.user.count({
+          where: {
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: false }]
+          }
+        }),
+        prisma.user.count({
+          where: {
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: true }]
+          }
+        }),
         prisma.user.findMany({
           where,
           select: selectProjection,
@@ -10070,6 +10570,11 @@ router19.get("/management", requireAuth, requireCanManageUsers, async (req, res)
           page: pageNum,
           limit: take,
           totalPages
+        },
+        summary: {
+          total: pendingCount + completedCount,
+          pending: pendingCount,
+          completed: completedCount
         }
       });
     }
@@ -10085,7 +10590,7 @@ router19.get("/management", requireAuth, requireCanManageUsers, async (req, res)
     res.status(500).json({ error: "Failed to retrieve user directory" });
   }
 });
-router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, res) => {
+router19.post("/pre-register", requireAuth, requirePermission("add_user"), async (req, res) => {
   try {
     const { name, email, phone, role, roleId, department, managerId, portalUrl: clientPortalUrl } = req.body;
     if (!name || typeof name !== "string" || name.trim().length < 2) {
@@ -10115,13 +10620,16 @@ router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, r
     if (roleId) {
       targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
     } else if (role) {
-      targetRole = await prisma.role.findFirst({ where: { name: String(role), isActive: true } });
+      targetRole = await prisma.role.findFirst({ where: { name: String(role) } });
     }
-    if (!targetRole) {
-      targetRole = await prisma.role.findFirst({ where: { name: "Employee" } });
+    if (!targetRole || !targetRole.isActive) {
+      return res.status(400).json({ error: "Selected role is invalid or inactive." });
     }
-    const assignedRoleName = targetRole?.name || "Employee";
-    const assignedRoleId = targetRole?.id || null;
+    if (!canManageTargetRank(req.user, targetRole.rank) || !isUnrestrictedUser(req.user) && targetRole.bypassPermissions) {
+      return res.status(403).json({ error: "Cannot assign a role at or above your hierarchy level" });
+    }
+    const assignedRoleName = targetRole.name;
+    const assignedRoleId = targetRole.id;
     let assignedManagerId = null;
     if (managerId) {
       const managerUser = await prisma.user.findUnique({ where: { id: String(managerId) } });
@@ -10146,6 +10654,9 @@ router19.post("/pre-register", requireAuth, requireCanManageUsers, async (req, r
         manager: { select: { id: true, name: true, role: true } }
       }
     });
+    if (targetRole.autoAddToProjects === true) {
+      await addUserToAllExistingProjects(preRegistered.id);
+    }
     try {
       const portalUrl = resolvePortalUrl(req, clientPortalUrl);
       await sendPreRegistrationEmail({
@@ -10264,6 +10775,9 @@ router19.patch("/:id/role", requireAuth, requireCanManageUsers, async (req, res)
         manager: { select: { id: true, name: true, role: true } }
       }
     });
+    if (targetRole.autoAddToProjects === true) {
+      await addUserToAllExistingProjects(updated.id);
+    }
     res.json({ message: `Role updated to "${targetRole.name}".`, user: updated });
   } catch (error) {
     console.error("Failed to update user role:", error);
@@ -10484,6 +10998,52 @@ var handleProfileUpdate = async (req, res) => {
 };
 router19.patch("/profile", requireAuth, handleProfileUpdate);
 router19.put("/profile", requireAuth, handleProfileUpdate);
+router19.get("/:id", requireAuth, requirePermission("add_user"), async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: {
+        roleDefinition: true,
+        manager: {
+          select: { id: true, name: true, email: true, role: true }
+        }
+      }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    const targetRoleRank = targetUser.roleDefinition?.rank ?? 4;
+    const targetBypassPermissions = Boolean(targetUser.roleDefinition?.bypassPermissions);
+    if (!canManageTargetRank(req.user, targetRoleRank) || !isUnrestrictedUser(req.user) && targetBypassPermissions) {
+      return res.status(403).json({
+        error: "Forbidden: You cannot view user details of users at or above your hierarchy level"
+      });
+    }
+    const permissionState = await getTargetUserPermissions(req.user, targetUser.id);
+    const userDetail = {
+      id: targetUser.id,
+      name: targetUser.name,
+      email: targetUser.email,
+      phone: targetUser.phone || null,
+      role: targetUser.role,
+      roleId: targetUser.roleId,
+      roleRank: targetRoleRank,
+      department: targetUser.department,
+      managerId: targetUser.managerId,
+      manager: targetUser.manager,
+      isSignupCompleted: targetUser.isSignupCompleted ?? true,
+      createdAt: targetUser.createdAt,
+      updatedAt: targetUser.updatedAt,
+      isUnrestricted: targetBypassPermissions,
+      permissionState
+    };
+    res.json(userDetail);
+  } catch (error) {
+    console.error("Failed to retrieve user details:", error);
+    res.status(500).json({ error: "Failed to retrieve user details" });
+  }
+});
 var users_default = router19;
 
 // server/routes/roles.ts
@@ -10501,6 +11061,16 @@ router20.get("/", requireAuth, async (req, res) => {
         }
       }
     });
+    if (req.query.assignableOnly === "true") {
+      const isCallerUnrestricted = isUnrestrictedUser(req.user);
+      const filtered = roles.filter((role) => {
+        if (!role.isActive) return false;
+        if (!canManageTargetRank(req.user, role.rank)) return false;
+        if (!isCallerUnrestricted && role.bypassPermissions) return false;
+        return true;
+      });
+      return res.json(filtered);
+    }
     res.json(roles);
   } catch (error) {
     console.error("Failed to retrieve roles:", error);
@@ -10510,6 +11080,9 @@ router20.get("/", requireAuth, async (req, res) => {
 router20.get("/hierarchy", requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    if (!isUnrestrictedUser(user) && user.role !== "CEO") {
+      return res.status(403).json({ error: "Forbidden: Access to organizational hierarchy is restricted to CEO." });
+    }
     const ctx = await getUserHierarchyContext(user.id);
     const roles = await prisma.role.findMany({
       orderBy: { rank: "asc" }
@@ -10549,7 +11122,7 @@ router20.get("/hierarchy", requireAuth, async (req, res) => {
 });
 router20.post("/", requireAuth, requireCanManageUsers, async (req, res) => {
   try {
-    const { name, rank, isExecutive = false, canManageUsers = false } = req.body;
+    const { name, rank, isExecutive = false, canManageUsers = false, bypassPermissions = false } = req.body;
     if (!name || typeof name !== "string" || name.trim().length < 2) {
       return res.status(400).json({ error: "Role name is required (minimum 2 characters)." });
     }
@@ -10570,6 +11143,7 @@ router20.post("/", requireAuth, requireCanManageUsers, async (req, res) => {
         rank: parsedRank,
         isExecutive: Boolean(isExecutive),
         canManageUsers: Boolean(canManageUsers),
+        bypassPermissions: Boolean(bypassPermissions),
         isActive: true
       }
     });
@@ -10582,7 +11156,7 @@ router20.post("/", requireAuth, requireCanManageUsers, async (req, res) => {
 router20.patch("/:id", requireAuth, requireCanManageUsers, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, rank, isExecutive, canManageUsers, isActive } = req.body;
+    const { name, rank, isExecutive, canManageUsers, bypassPermissions, isActive } = req.body;
     const existing = await prisma.role.findUnique({
       where: { id }
     });
@@ -10612,6 +11186,7 @@ router20.patch("/:id", requireAuth, requireCanManageUsers, async (req, res) => {
     }
     if (isExecutive !== void 0) updateData.isExecutive = Boolean(isExecutive);
     if (canManageUsers !== void 0) updateData.canManageUsers = Boolean(canManageUsers);
+    if (bypassPermissions !== void 0) updateData.bypassPermissions = Boolean(bypassPermissions);
     if (isActive !== void 0) updateData.isActive = Boolean(isActive);
     const updated = await prisma.role.update({
       where: { id },
@@ -10658,14 +11233,77 @@ router20.delete("/:id", requireAuth, requireCanManageUsers, async (req, res) => 
 });
 var roles_default = router20;
 
+// server/routes/permissions.ts
+import { Router as Router21 } from "express";
+var router21 = Router21();
+router21.get("/configurations", requireAuth, async (req, res) => {
+  try {
+    const configurations = await getConfigurations();
+    res.json(configurations);
+  } catch (error) {
+    if (error instanceof PermissionServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    console.error("Error fetching configurations:", error);
+    res.status(500).json({ error: "Failed to fetch configurations" });
+  }
+});
+router21.post("/configurations", requireAuth, requireUnrestricted, async (req, res) => {
+  try {
+    const { name, key } = req.body || {};
+    const created = await createConfiguration(req.user, { name, key });
+    res.status(201).json(created);
+  } catch (error) {
+    if (error instanceof PermissionServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    console.error("Error creating configuration:", error);
+    res.status(500).json({ error: "Failed to create configuration" });
+  }
+});
+router21.get("/users/:userId", requireAuth, async (req, res) => {
+  try {
+    const result = await getTargetUserPermissions(req.user, req.params.userId);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof PermissionServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    console.error("Error fetching user permissions:", error);
+    res.status(500).json({ error: "Failed to fetch user permissions" });
+  }
+});
+router21.put("/users/:userId", requireAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    let updates = [];
+    if (Array.isArray(body.updates)) {
+      updates = body.updates;
+    } else if (typeof body.key === "string") {
+      updates = [{ key: body.key, isEnabled: Boolean(body.isEnabled) }];
+    } else {
+      return res.status(400).json({ error: 'Invalid payload: provide "updates" array or { key, isEnabled }' });
+    }
+    const result = await updateUserPermissions(req.user, req.params.userId, updates);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof PermissionServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    console.error("Error updating user permissions:", error);
+    res.status(500).json({ error: "Failed to update user permissions" });
+  }
+});
+var permissions_default = router21;
+
 // server/routes/leave.ts
 init_prisma();
-import { Router as Router21 } from "express";
+import { Router as Router22 } from "express";
 init_authorizationService();
-var router21 = Router21();
+var router22 = Router22();
 var LEAVE_TYPES = ["Annual Leave", "Sick Leave", "Personal Leave", "Unpaid Leave", "Other"];
 var DAY_TYPES = ["Full day", "Half day"];
-router21.get("/", requireAuth, async (req, res) => {
+router22.get("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
@@ -10789,7 +11427,7 @@ router21.get("/", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve leave requests" });
   }
 });
-router21.get("/approver", requireAuth, async (req, res) => {
+router22.get("/approver", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const approver = await getLeaveApprover(user.id);
@@ -10799,7 +11437,7 @@ router21.get("/approver", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to resolve leave approver" });
   }
 });
-router21.get("/summary", requireAuth, async (req, res) => {
+router22.get("/summary", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
@@ -10853,7 +11491,7 @@ router21.get("/summary", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to retrieve leave summary" });
   }
 });
-router21.post("/", requireAuth, async (req, res) => {
+router22.post("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const ctx = await getUserHierarchyContext(user.id);
@@ -10968,7 +11606,7 @@ router21.post("/", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to submit leave request" });
   }
 });
-router21.post("/:id/decide", requireAuth, async (req, res) => {
+router22.post("/:id/decide", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const user = req.user;
@@ -11078,10 +11716,10 @@ var handleWithdraw = async (req, res) => {
     res.status(500).json({ error: "Failed to withdraw leave request." });
   }
 };
-router21.post("/:id/withdraw", requireAuth, handleWithdraw);
-router21.delete("/:id/withdraw", requireAuth, handleWithdraw);
-router21.delete("/:id", requireAuth, handleWithdraw);
-var leave_default = router21;
+router22.post("/:id/withdraw", requireAuth, handleWithdraw);
+router22.delete("/:id/withdraw", requireAuth, handleWithdraw);
+router22.delete("/:id", requireAuth, handleWithdraw);
+var leave_default = router22;
 
 // server.ts
 if (!process.env.DATABASE_URL || !process.env.APP_URL) {
@@ -11149,6 +11787,7 @@ app.use("/api/workload", workload_default);
 app.use("/api/calendar", calendar_default);
 app.use("/api/users", users_default);
 app.use("/api/roles", roles_default);
+app.use("/api/permissions", permissions_default);
 app.use("/api/notifications", notifications_default);
 app.use("/api", chat_default);
 app.use("/api/approvals", approvals_default);

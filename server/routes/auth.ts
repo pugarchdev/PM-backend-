@@ -4,6 +4,7 @@ import {
   AuthRequest,
   requireAuth,
   requireCEO,
+  requirePermission,
   normalizeEmail,
   normalizePhone,
   isValidEmail,
@@ -13,6 +14,11 @@ import {
   verifyPassword,
   parseIdentifier,
 } from "../auth.js";
+import {
+  canManageTargetRank,
+  isUnrestrictedUser,
+  addUserToAllExistingProjects,
+} from "../services/permissionService.js";
 import {
   generateOtp,
   getOtpExpiration,
@@ -998,10 +1004,11 @@ router.post("/reset-password", async (req: AuthRequest, res: Response) => {
   }
 });
 
-// POST /api/auth/pre-register — HR/CEO Pre-registers a new user (HR/CEO only)
+// POST /api/auth/pre-register — Pre-registers a new user (restricted to users with 'add_user' permission)
 router.post(
   "/pre-register",
-  requireCEO,
+  requireAuth,
+  requirePermission("add_user"),
   async (req: AuthRequest, res: Response) => {
     try {
       const {
@@ -1058,36 +1065,33 @@ router.post(
           .json({ error: "An account with this phone number already exists." });
       }
 
-      let finalRoleId: string | null = null;
-      let assignedRole = "Employee";
-
+      let targetRole = null;
       if (roleId) {
-        const roleDef = await prisma.role.findUnique({ where: { id: roleId } });
-        if (!roleDef || !roleDef.isActive) {
-          return res
-            .status(400)
-            .json({ error: "Selected role is invalid or inactive." });
-        }
-        if (roleDef.isExecutive && !req.user!.isExecutive) {
-          return res
-            .status(403)
-            .json({
-              error: "Only executive leadership can assign executive roles.",
-            });
-        }
-        finalRoleId = roleDef.id;
-        assignedRole = roleDef.name;
+        targetRole = await prisma.role.findUnique({ where: { id: String(roleId) } });
       } else if (role) {
-        const roleDef = await prisma.role.findFirst({
-          where: { name: role, isActive: true },
-        });
-        if (roleDef) {
-          finalRoleId = roleDef.id;
-          assignedRole = roleDef.name;
-        } else {
-          assignedRole = role;
-        }
+        targetRole = await prisma.role.findFirst({ where: { name: String(role) } });
       }
+
+      if (!targetRole || !targetRole.isActive) {
+        return res
+          .status(400)
+          .json({ error: "Selected role is invalid or inactive." });
+      }
+
+      // Enforce hierarchy rank check
+      if (
+        !canManageTargetRank(req.user!, targetRole.rank) ||
+        (!isUnrestrictedUser(req.user) && targetRole.bypassPermissions)
+      ) {
+        return res
+          .status(403)
+          .json({
+            error: "Cannot assign a role at or above your hierarchy level",
+          });
+      }
+
+      const finalRoleId = targetRole.id;
+      const assignedRole = targetRole.name;
 
       if (managerId) {
         const manager = await prisma.user.findUnique({
@@ -1117,6 +1121,10 @@ router.post(
           manager: { select: { id: true, name: true, role: true } },
         },
       });
+
+      if (targetRole.autoAddToProjects === true) {
+        await addUserToAllExistingProjects(preRegistered.id);
+      }
 
       // Send email with portal link and pre-registered account details
       try {

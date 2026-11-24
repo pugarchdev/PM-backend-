@@ -50,6 +50,8 @@ model User {
   risksOwned                Risk[]              @relation("RiskOwner")
   statusOverrides           StatusOverrideLog[]
   tasks                     Task[]              @relation("TaskAssignee")
+  permission                Permission?         @relation("UserPermission")
+  updatedPermissions        Permission[]        @relation("UpdatedPermissions")
 
   @@index([role])
   @@index([roleId])
@@ -57,18 +59,43 @@ model User {
 }
 
 model Role {
-  id             String   @id @default(cuid())
-  name           String   @unique
-  rank           Int      // 1 = Highest executive, 2 = Senior, 3 = Staff, 4 = Intern, etc.
-  isExecutive    Boolean  @default(false)
-  canManageUsers Boolean  @default(false)
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  users          User[]
+  id                String   @id @default(cuid())
+  name              String   @unique
+  rank              Int      // 1 = Highest executive, 2 = Senior, 3 = Staff, 4 = Intern, etc.
+  isExecutive       Boolean  @default(false)
+  canManageUsers    Boolean  @default(false)
+  bypassPermissions Boolean  @default(false)
+  autoAddToProjects Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  users             User[]
 
   @@index([rank])
   @@index([name])
+}
+
+model Configuration {
+  id        String   @id @default(cuid())
+  name      String
+  key       String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("configuration")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  permissions Json     @default("{}")
+  updatedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation("UserPermission", fields: [userId], references: [id], onDelete: Cascade)
+  updatedBy   User?    @relation("UpdatedPermissions", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@map("permission")
 }
 
 model Project {

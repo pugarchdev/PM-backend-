@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { AuthRequest, requireAuth } from '../auth.js';
+import { AuthRequest, requireAuth, requirePermission } from '../auth.js';
 import { calculateProgress, calculatePlanPercentage, calculateProjectStatus } from '../../lib/calculations.js';
 import { formatCurrency } from '../../lib/currency.js';
 import { StatusOverrideSchema, ProjectCreateSchema, ProjectCharterUpdateSchema } from '../../lib/validators.js';
@@ -10,6 +10,7 @@ import {
   canManageProject,
   canTransferProjectOwnership,
 } from '../services/authorizationService.js';
+import { addAutoJoinRoleUsersToProject } from '../services/permissionService.js';
 
 const router = Router();
 
@@ -251,16 +252,11 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// POST /api/projects - Create a new project (Executive or Manager rank)
-router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
+// POST /api/projects - Create a new project (Executive or authorized user)
+router.post('/', requireAuth, requirePermission('add_project'), async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
     const ctx = await getUserHierarchyContext(user.id);
-
-    // Only executive or manager level can create new projects
-    if (!ctx.isExecutive && ctx.roleRank > 2) {
-      return res.status(403).json({ error: 'Forbidden: Insufficient organizational hierarchy permission to charter projects.' });
-    }
 
     const validation = ProjectCreateSchema.safeParse(req.body);
     if (!validation.success) {
@@ -315,6 +311,9 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
           },
         });
       }
+
+      // Automatically add users with auto-join roles to the project
+      await addAutoJoinRoleUsersToProject(tx, p.id);
 
       // Record creation in Change Log
       await tx.changeLogEntry.create({

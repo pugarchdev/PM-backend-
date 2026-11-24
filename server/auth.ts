@@ -1,6 +1,12 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { prisma } from '../lib/prisma.js';
+import {
+  getUserPermissionKeys,
+  hasPermission,
+  isUnrestrictedUser,
+  registerAuthCacheInvalidator,
+} from './services/permissionService.js';
 
 export interface AuthenticatedUser {
   id: string;
@@ -12,6 +18,8 @@ export interface AuthenticatedUser {
   roleRank: number;
   isExecutive: boolean;
   canManageUsers: boolean;
+  bypassPermissions: boolean;
+  permissions: string[];
   managerId?: string | null;
   department: string | null;
   avatarUrl: string | null;
@@ -171,6 +179,11 @@ export function clearAuthCache(userId?: string): void {
   }
 }
 
+export function invalidateUserAuthCache(userId: string): void {
+  clearAuthCache(userId);
+}
+registerAuthCacheInvalidator(invalidateUserAuthCache);
+
 /**
  * Server-side RBAC & Authentication Middleware
  * Reads user identifier from Authorization header (Bearer <userId>) or cookie (ff_user_id).
@@ -215,6 +228,8 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
         const roleRank = roleDef?.rank ?? (user.role === 'CEO' ? 1 : user.role === 'CTO' || user.role === 'ProjectOwner' ? 2 : user.role === 'Intern' ? 4 : 3);
         const isExecutive = roleDef?.isExecutive ?? (user.role === 'CEO');
         const canManageUsers = roleDef?.canManageUsers ?? (user.role === 'CEO');
+        const bypassPermissions = roleDef?.bypassPermissions ?? false;
+        const permissions = bypassPermissions ? [] : await getUserPermissionKeys(user.id);
 
         const authUser: AuthenticatedUser = {
           id: user.id,
@@ -226,6 +241,8 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
           roleRank,
           isExecutive,
           canManageUsers,
+          bypassPermissions,
+          permissions,
           managerId: user.managerId || null,
           department: user.department,
           avatarUrl: user.avatarUrl,
@@ -309,6 +326,39 @@ export function requireCanManageUsers(req: AuthRequest, res: Response, next: Nex
     return res.status(403).json({
       error: 'Forbidden: You do not have permission to manage users or organizational roles.',
     });
+  }
+
+  next();
+}
+
+/**
+ * Enforce Specific Permission Key
+ */
+export function requirePermission(key: string) {
+  return async (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
+    }
+
+    const allowed = await hasPermission(req.user, key);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    next();
+  };
+}
+
+/**
+ * Enforce Unrestricted Access (e.g. top-level executive role with bypassPermissions)
+ */
+export function requireUnrestricted(req: AuthRequest, res: Response, next: NextFunction) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
+  }
+
+  if (!isUnrestrictedUser(req.user)) {
+    return res.status(403).json({ error: 'Restricted to top-level executive role' });
   }
 
   next();

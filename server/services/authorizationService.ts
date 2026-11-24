@@ -9,6 +9,8 @@ export interface UserHierarchyContext {
   roleRank: number;
   isExecutive: boolean;
   canManageUsers: boolean;
+  bypassPermissions: boolean;
+  autoAddToProjects: boolean;
   managerId: string | null;
   directSubordinateIds: string[];
   allSubordinateIds: string[];
@@ -72,12 +74,16 @@ export async function getUserHierarchyContext(userId: string): Promise<UserHiera
       let roleRank = 999;
       let isExecutive = false;
       let canManageUsers = false;
+      let bypassPermissions = false;
+      let autoAddToProjects = false;
 
       if (user.roleDefinition && user.roleDefinition.isActive) {
         roleName = user.roleDefinition.name;
         roleRank = user.roleDefinition.rank;
         isExecutive = user.roleDefinition.isExecutive;
         canManageUsers = user.roleDefinition.canManageUsers;
+        bypassPermissions = Boolean(user.roleDefinition.bypassPermissions);
+        autoAddToProjects = Boolean(user.roleDefinition.autoAddToProjects);
       } else {
         // Fallback: look up Role by user.role string name
         const matchedRole = await prisma.role.findFirst({
@@ -88,10 +94,13 @@ export async function getUserHierarchyContext(userId: string): Promise<UserHiera
           roleRank = matchedRole.rank;
           isExecutive = matchedRole.isExecutive;
           canManageUsers = matchedRole.canManageUsers;
+          bypassPermissions = Boolean(matchedRole.bypassPermissions);
+          autoAddToProjects = Boolean(matchedRole.autoAddToProjects);
         } else if (user.role === 'CEO') {
           roleRank = 1;
           isExecutive = true;
           canManageUsers = true;
+          bypassPermissions = true;
         } else if (user.role === 'CTO' || user.role === 'ProjectOwner') {
           roleRank = 2;
         } else {
@@ -183,6 +192,8 @@ export async function getUserHierarchyContext(userId: string): Promise<UserHiera
         roleRank,
         isExecutive,
         canManageUsers,
+        bypassPermissions,
+        autoAddToProjects,
         managerId: user.managerId,
         directSubordinateIds,
         allSubordinateIds,
@@ -332,20 +343,61 @@ export function canManageIssue(
  * Returns list of user IDs visible to current user on the workload screen
  */
 export async function getVisibleWorkloadUserIds(ctx: UserHierarchyContext): Promise<string[]> {
-  if (ctx.isExecutive) {
-    // Executive has organization-wide workload visibility
+  if (ctx.bypassPermissions || ctx.isExecutive) {
+    // Executive / unrestricted users have organization-wide workload visibility
     const allUsers = await prisma.user.findMany({ select: { id: true } });
     return allUsers.map((u) => u.id);
   }
 
-  // Management roles (rank < 3 or canManageUsers) see themselves + authorized subordinates
-  // Excludes CEO, peers, and higher-level roles
-  if ((ctx.roleRank < 3 || ctx.canManageUsers) && ctx.allSubordinateIds.length > 0) {
-    return [ctx.userId, ...ctx.allSubordinateIds];
+  if (ctx.autoAddToProjects) {
+    // Roles with autoAddToProjects see themselves and all users strictly below their rank (excluding bypassPermissions)
+    const lowerRankUsers = await prisma.user.findMany({
+      where: {
+        roleDefinition: {
+          is: {
+            rank: { gt: ctx.roleRank },
+            bypassPermissions: false,
+          },
+        },
+      },
+      select: { id: true },
+    });
+    const idSet = new Set<string>([ctx.userId, ...lowerRankUsers.map((u) => u.id)]);
+    return Array.from(idSet);
   }
 
-  // Employees and Interns (rank >= 3) are strictly restricted to their own workload
-  return [ctx.userId];
+  // All other roles (e.g., Employee, Intern)
+  const candidateIds = new Set<string>([ctx.userId]);
+  ctx.allSubordinateIds.forEach((id) => candidateIds.add(id));
+
+  if (ctx.authorizedProjectIds.length > 0) {
+    const projectMembers = await prisma.projectMembership.findMany({
+      where: { projectId: { in: ctx.authorizedProjectIds } },
+      select: { userId: true },
+    });
+    projectMembers.forEach((m) => candidateIds.add(m.userId));
+  }
+
+  // Filter out any user whose roleDefinition.bypassPermissions === true (except ctx.userId)
+  const idsToCheck = Array.from(candidateIds).filter((id) => id !== ctx.userId);
+  if (idsToCheck.length === 0) {
+    return [ctx.userId];
+  }
+
+  const bypassUsers = await prisma.user.findMany({
+    where: {
+      id: { in: idsToCheck },
+      roleDefinition: {
+        is: {
+          bypassPermissions: true,
+        },
+      },
+    },
+    select: { id: true },
+  });
+  const bypassSet = new Set<string>(bypassUsers.map((u) => u.id));
+
+  return Array.from(candidateIds).filter((id) => id === ctx.userId || !bypassSet.has(id));
 }
 
 /**

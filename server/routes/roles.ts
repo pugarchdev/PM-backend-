@@ -2,12 +2,14 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth, requireCanManageUsers } from '../auth.js';
 import { getUserHierarchyContext } from '../services/authorizationService.js';
+import { canManageTargetRank, isUnrestrictedUser } from '../services/permissionService.js';
 
 const router = Router();
 
 /**
  * GET /api/roles
  * Lists all configured roles ordered by hierarchy rank.
+ * Supports ?assignableOnly=true to filter roles assignable by current user.
  */
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
@@ -20,6 +22,17 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       },
     });
 
+    if (req.query.assignableOnly === 'true') {
+      const isCallerUnrestricted = isUnrestrictedUser(req.user);
+      const filtered = roles.filter((role) => {
+        if (!role.isActive) return false;
+        if (!canManageTargetRank(req.user!, role.rank)) return false;
+        if (!isCallerUnrestricted && role.bypassPermissions) return false;
+        return true;
+      });
+      return res.json(filtered);
+    }
+
     res.json(roles);
   } catch (error: any) {
     console.error('Failed to retrieve roles:', error);
@@ -30,10 +43,15 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
 /**
  * GET /api/roles/hierarchy
  * Returns the current organizational reporting hierarchy tree
+ * Restricted to CEO only.
  */
 router.get('/hierarchy', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
+    if (!isUnrestrictedUser(user) && user.role !== 'CEO') {
+      return res.status(403).json({ error: 'Forbidden: Access to organizational hierarchy is restricted to CEO.' });
+    }
+
     const ctx = await getUserHierarchyContext(user.id);
 
     const roles = await prisma.role.findMany({
@@ -82,7 +100,7 @@ router.get('/hierarchy', requireAuth, async (req: AuthRequest, res: Response) =>
  */
 router.post('/', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
   try {
-    const { name, rank, isExecutive = false, canManageUsers = false } = req.body;
+    const { name, rank, isExecutive = false, canManageUsers = false, bypassPermissions = false } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
       return res.status(400).json({ error: 'Role name is required (minimum 2 characters).' });
@@ -109,6 +127,7 @@ router.post('/', requireAuth, requireCanManageUsers, async (req: AuthRequest, re
         rank: parsedRank,
         isExecutive: Boolean(isExecutive),
         canManageUsers: Boolean(canManageUsers),
+        bypassPermissions: Boolean(bypassPermissions),
         isActive: true,
       },
     });
@@ -128,7 +147,7 @@ router.post('/', requireAuth, requireCanManageUsers, async (req: AuthRequest, re
 router.patch('/:id', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { name, rank, isExecutive, canManageUsers, isActive } = req.body;
+    const { name, rank, isExecutive, canManageUsers, bypassPermissions, isActive } = req.body;
 
     const existing = await prisma.role.findUnique({
       where: { id },
@@ -164,6 +183,7 @@ router.patch('/:id', requireAuth, requireCanManageUsers, async (req: AuthRequest
 
     if (isExecutive !== undefined) updateData.isExecutive = Boolean(isExecutive);
     if (canManageUsers !== undefined) updateData.canManageUsers = Boolean(canManageUsers);
+    if (bypassPermissions !== undefined) updateData.bypassPermissions = Boolean(bypassPermissions);
     if (isActive !== undefined) updateData.isActive = Boolean(isActive);
 
     const updated = await prisma.role.update({
