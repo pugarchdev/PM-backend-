@@ -51,6 +51,7 @@ model User {
   statusOverrides           StatusOverrideLog[]
   tasks                     Task[]              @relation("TaskAssignee")
   createdTasks              Task[]              @relation("TaskCreator")
+  createdCalendarEvents     CompanyCalendarEvent[] @relation("CalendarEventCreator")
   permission                Permission?         @relation("UserPermission")
   updatedPermissions        Permission[]        @relation("UpdatedPermissions")
 
@@ -536,4 +537,19 @@ model LeaveRequest {
   @@index([requestedBy])
   @@index([reviewedBy])
   @@index([status])
+}
+
+model CompanyCalendarEvent {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  startDate   DateTime
+  endDate     DateTime?
+  eventType   String    @default("HOLIDAY") // "HOLIDAY" | "COMPANY_EVENT" | "NON_WORKING"
+  createdById String?
+  createdBy   User?     @relation("CalendarEventCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([startDate])
 }

@@ -258,6 +258,22 @@ export function canAssignProjectTasks(
 }
 
 /**
+ * Checks whether user can create/edit/delete organization-wide holidays & company calendar events.
+ * Strictly reserved for CEO / HR (bypassPermissions / isExecutive) or explicit 'manage_calendar' permission.
+ * Does NOT grant access to CTO (autoAddToProjects, isExecutive: false).
+ */
+export function canManageCompanyCalendar(
+  ctx: UserHierarchyContext,
+  user?: { bypassPermissions?: boolean; permissions?: string[] }
+): boolean {
+  return Boolean(
+    ctx.bypassPermissions ||
+    ctx.isExecutive ||
+    user?.permissions?.includes('manage_calendar')
+  );
+}
+
+/**
  * Checks whether user has permission to access project budget & financial data
  * (strictly reserved for CEO, HR, CTO, or users with view_budget permission).
  * Never grants access solely based on project ownership.

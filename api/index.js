@@ -36,6 +36,7 @@ __export(authorizationService_exports, {
   canAssignProjectTasks: () => canAssignProjectTasks,
   canDecideLeaveRequest: () => canDecideLeaveRequest,
   canDeleteTask: () => canDeleteTask,
+  canManageCompanyCalendar: () => canManageCompanyCalendar,
   canManageIssue: () => canManageIssue,
   canManageMilestones: () => canManageMilestones,
   canManageProject: () => canManageProject,
@@ -222,6 +223,11 @@ function canManageMilestones(ctx, project) {
 }
 function canAssignProjectTasks(ctx, project) {
   return Boolean(ctx.bypassPermissions || ctx.autoAddToProjects || project.ownerId === ctx.userId);
+}
+function canManageCompanyCalendar(ctx, user) {
+  return Boolean(
+    ctx.bypassPermissions || ctx.isExecutive || user?.permissions?.includes("manage_calendar")
+  );
 }
 function canAccessBudget(ctx, user) {
   return ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2 || Boolean(user?.bypassPermissions) || Boolean(user?.permissions?.includes("view_budget"));
@@ -10414,19 +10420,45 @@ var documents_default = router17;
 // server/routes/calendar.ts
 init_prisma();
 import { Router as Router18 } from "express";
+import { z as z2 } from "zod";
 init_authorizationService();
 var router18 = Router18();
+var CompanyCalendarEventCreateSchema = z2.object({
+  title: z2.string().trim().min(1, "Title is required").max(120, "Title cannot exceed 120 characters"),
+  description: z2.string().trim().nullable().optional(),
+  startDate: z2.string().min(1, "Start date is required"),
+  endDate: z2.string().nullable().optional(),
+  eventType: z2.enum(["HOLIDAY", "COMPANY_EVENT", "NON_WORKING"]).optional().default("HOLIDAY")
+}).refine(
+  (data) => {
+    if (data.endDate) {
+      const start = new Date(data.startDate).getTime();
+      const end = new Date(data.endDate).getTime();
+      return !isNaN(start) && !isNaN(end) && end >= start;
+    }
+    return true;
+  },
+  { message: "End date cannot precede start date", path: ["endDate"] }
+);
+var CompanyCalendarEventUpdateSchema = z2.object({
+  title: z2.string().trim().min(1, "Title is required").max(120, "Title cannot exceed 120 characters").optional(),
+  description: z2.string().trim().nullable().optional(),
+  startDate: z2.string().min(1).optional(),
+  endDate: z2.string().nullable().optional(),
+  eventType: z2.enum(["HOLIDAY", "COMPANY_EVENT", "NON_WORKING"]).optional()
+});
+var COMPANY_EVENT_COLORS = {
+  HOLIDAY: "#DC2626",
+  COMPANY_EVENT: "#2563EB",
+  NON_WORKING: "#D97706"
+};
 async function getCalendarEvents(user, startDate, endDate) {
-  const ctx = await getUserHierarchyContext(user.id);
-  const visibleProjectIds = ctx.authorizedProjectIds;
   const events = [];
-  const [tasks, milestones, approvals, risks, issues, reminders] = await Promise.all([
-    // 1. Tasks (as date spans)
+  const [tasks, reminders, companyEvents] = await Promise.all([
+    // 1. Personal Tasks (strictly assigned to authenticated user)
     prisma.task.findMany({
       where: {
-        phase: {
-          projectId: { in: visibleProjectIds }
-        },
+        assigneeId: user.id,
         OR: [
           { plannedStart: { lte: endDate }, plannedEnd: { gte: startDate } }
         ]
@@ -10444,78 +10476,27 @@ async function getCalendarEvents(user, startDate, endDate) {
         }
       }
     }),
-    // 2. Milestones (single-day events)
-    prisma.milestone.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        OR: [
-          { baselineDate: { gte: startDate, lte: endDate } },
-          { forecastDate: { gte: startDate, lte: endDate } }
-        ]
-      },
-      include: {
-        project: {
-          select: { id: true, name: true }
-        }
-      }
-    }),
-    // 3. Approval Requests (single-day events)
-    prisma.approvalRequest.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        requestedAt: { gte: startDate, lte: endDate },
-        state: "Pending"
-      },
-      include: {
-        project: {
-          select: { id: true, name: true }
-        },
-        requester: {
-          select: { id: true, name: true }
-        }
-      }
-    }),
-    // 4. Risks (single-day events - last reviewed date)
-    prisma.risk.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        lastReviewedAt: { gte: startDate, lte: endDate },
-        closedAt: null
-        // Only open risks
-      },
-      include: {
-        project: {
-          select: { id: true, name: true }
-        },
-        owner: {
-          select: { id: true, name: true }
-        }
-      }
-    }),
-    // 5. Issues (single-day events - raised date)
-    prisma.issue.findMany({
-      where: {
-        projectId: { in: visibleProjectIds },
-        raisedAt: { gte: startDate, lte: endDate },
-        state: { not: "Closed" }
-        // Only open issues
-      },
-      include: {
-        project: {
-          select: { id: true, name: true }
-        },
-        owner: {
-          select: { id: true, name: true }
-        }
-      }
-    }),
-    // 6. Personal Reminders (single-day events)
+    // 2. Personal Reminders (strictly owned by authenticated user)
     prisma.reminder.findMany({
       where: {
         userId: user.id,
-        reminderDate: { gte: startDate, lte: endDate },
-        isCompleted: false
+        isCompleted: false,
+        OR: [
+          { remindAt: { gte: startDate, lte: endDate } },
+          { remindAt: null, reminderDate: { gte: startDate, lte: endDate } }
+        ]
       }
+    }),
+    // 3. Organization Holidays / Company Events (visible to all authenticated users)
+    prisma.companyCalendarEvent.findMany({
+      where: {
+        startDate: { lte: endDate },
+        OR: [
+          { endDate: { gte: startDate } },
+          { endDate: null, startDate: { gte: startDate } }
+        ]
+      },
+      orderBy: { startDate: "asc" }
     })
   ]);
   for (const task of tasks) {
@@ -10535,112 +10516,46 @@ async function getCalendarEvents(user, startDate, endDate) {
         assigneeId: task.assigneeId,
         assigneeName: task.assignee?.name,
         state: task.state,
-        priority: task.priority
-      }
-    });
-  }
-  for (const milestone of milestones) {
-    events.push({
-      id: `milestone-baseline-${milestone.id}`,
-      title: `${milestone.title} (Baseline)`,
-      start: milestone.baselineDate,
-      allDay: true,
-      color: "#10B981",
-      // Green for milestones
-      extendedProps: {
-        type: "milestone",
-        projectId: milestone.project.id,
-        projectName: milestone.project.name,
-        milestoneId: milestone.id,
-        dateType: "baseline"
-      }
-    });
-    if (milestone.forecastDate.getTime() !== milestone.baselineDate.getTime()) {
-      events.push({
-        id: `milestone-forecast-${milestone.id}`,
-        title: `${milestone.title} (Forecast)`,
-        start: milestone.forecastDate,
-        allDay: true,
-        color: "#10B981",
-        extendedProps: {
-          type: "milestone",
-          projectId: milestone.project.id,
-          projectName: milestone.project.name,
-          milestoneId: milestone.id,
-          dateType: "forecast"
-        }
-      });
-    }
-  }
-  for (const approval of approvals) {
-    events.push({
-      id: `approval-${approval.id}`,
-      title: `Approval: ${approval.type}`,
-      start: approval.requestedAt,
-      allDay: true,
-      color: "#EAB308",
-      // Yellow for approvals
-      extendedProps: {
-        type: "approval",
-        projectId: approval.project.id,
-        projectName: approval.project.name,
-        approvalId: approval.id,
-        approvalType: approval.type,
-        requesterName: approval.requester?.name,
-        state: approval.state
-      }
-    });
-  }
-  for (const risk of risks) {
-    events.push({
-      id: `risk-${risk.id}`,
-      title: `Risk: ${risk.description.substring(0, 50)}${risk.description.length > 50 ? "..." : ""}`,
-      start: risk.lastReviewedAt,
-      allDay: true,
-      color: "#F59E0B",
-      // Orange for risks
-      extendedProps: {
-        type: "risk",
-        projectId: risk.project.id,
-        projectName: risk.project.name,
-        riskId: risk.id,
-        severity: risk.severity,
-        ownerName: risk.owner?.name
-      }
-    });
-  }
-  for (const issue of issues) {
-    events.push({
-      id: `issue-${issue.id}`,
-      title: `Issue: ${issue.title}`,
-      start: issue.raisedAt,
-      allDay: true,
-      color: "#EF4444",
-      // Red for issues
-      extendedProps: {
-        type: "issue",
-        projectId: issue.project.id,
-        projectName: issue.project.name,
-        issueId: issue.id,
-        severity: issue.severity,
-        ownerName: issue.owner?.name,
-        state: issue.state
+        priority: task.priority,
+        createdAt: task.createdAt.toISOString(),
+        plannedStart: task.plannedStart.toISOString(),
+        plannedEnd: task.plannedEnd.toISOString(),
+        frequency: task.frequency,
+        dailyHours: task.dailyHours
       }
     });
   }
   for (const reminder of reminders) {
+    const effectiveTime = reminder.remindAt ?? reminder.reminderDate;
     events.push({
       id: `reminder-${reminder.id}`,
       title: `Reminder: ${reminder.title}`,
-      start: reminder.reminderDate,
-      allDay: true,
+      start: effectiveTime,
+      allDay: false,
       color: "#8B5CF6",
       // Purple for reminders
       extendedProps: {
         type: "reminder",
         reminderId: reminder.id,
         description: reminder.description,
-        isCompleted: reminder.isCompleted
+        isCompleted: reminder.isCompleted,
+        remindAt: effectiveTime.toISOString()
+      }
+    });
+  }
+  for (const evt of companyEvents) {
+    events.push({
+      id: `holiday-${evt.id}`,
+      title: evt.title,
+      start: evt.startDate,
+      end: evt.endDate ?? evt.startDate,
+      allDay: true,
+      color: COMPANY_EVENT_COLORS[evt.eventType] || "#DC2626",
+      extendedProps: {
+        type: "holiday",
+        rawId: evt.id,
+        eventType: evt.eventType,
+        description: evt.description
       }
     });
   }
@@ -10699,6 +10614,7 @@ router18.get("/today", async (req, res) => {
     const latestEnd = new Date(Math.max(dayEndUtc.getTime(), dayEndLocal.getTime()));
     const tasks = await prisma.task.findMany({
       where: {
+        assigneeId: user.id,
         phase: {
           projectId: { in: visibleProjectIds }
         },
@@ -10895,6 +10811,110 @@ router18.delete("/reminders/:id", async (req, res) => {
   } catch (error) {
     console.error("Delete reminder error:", error);
     res.status(500).json({ error: "Failed to delete reminder" });
+  }
+});
+router18.post("/company-events", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageCompanyCalendar(ctx, user)) {
+      return res.status(403).json({
+        error: "Forbidden: Only executive leadership / HR can manage organization calendar events"
+      });
+    }
+    const validation = CompanyCalendarEventCreateSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
+    }
+    const { title, description, startDate, endDate, eventType } = validation.data;
+    const startDt = new Date(startDate);
+    if (isNaN(startDt.getTime())) {
+      return res.status(400).json({ error: "Invalid startDate" });
+    }
+    const endDt = endDate ? new Date(endDate) : null;
+    if (endDt && isNaN(endDt.getTime())) {
+      return res.status(400).json({ error: "Invalid endDate" });
+    }
+    const created = await prisma.companyCalendarEvent.create({
+      data: {
+        title,
+        description: description || null,
+        startDate: startDt,
+        endDate: endDt,
+        eventType,
+        createdById: user.id
+      }
+    });
+    res.status(201).json(created);
+  } catch (error) {
+    console.error("Create company calendar event error:", error);
+    res.status(500).json({ error: "Failed to create company calendar event" });
+  }
+});
+router18.put("/company-events/:id", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageCompanyCalendar(ctx, user)) {
+      return res.status(403).json({
+        error: "Forbidden: Only executive leadership / HR can manage organization calendar events"
+      });
+    }
+    const existing = await prisma.companyCalendarEvent.findUnique({
+      where: { id: req.params.id }
+    });
+    if (!existing) {
+      return res.status(404).json({ error: "Company calendar event not found" });
+    }
+    const validation = CompanyCalendarEventUpdateSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid input" });
+    }
+    const { title, description, startDate, endDate, eventType } = validation.data;
+    const effectiveStart = startDate ? new Date(startDate) : existing.startDate;
+    const effectiveEnd = endDate === null ? null : endDate !== void 0 ? new Date(endDate) : existing.endDate;
+    if (isNaN(effectiveStart.getTime()) || effectiveEnd && isNaN(effectiveEnd.getTime())) {
+      return res.status(400).json({ error: "Invalid date value" });
+    }
+    if (effectiveEnd && effectiveEnd.getTime() < effectiveStart.getTime()) {
+      return res.status(400).json({ error: "End date cannot precede start date" });
+    }
+    const updated = await prisma.companyCalendarEvent.update({
+      where: { id: existing.id },
+      data: {
+        ...title !== void 0 ? { title } : {},
+        ...description !== void 0 ? { description } : {},
+        ...startDate !== void 0 ? { startDate: effectiveStart } : {},
+        ...endDate !== void 0 ? { endDate: effectiveEnd } : {},
+        ...eventType !== void 0 ? { eventType } : {}
+      }
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error("Update company calendar event error:", error);
+    res.status(500).json({ error: "Failed to update company calendar event" });
+  }
+});
+router18.delete("/company-events/:id", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageCompanyCalendar(ctx, user)) {
+      return res.status(403).json({
+        error: "Forbidden: Only executive leadership / HR can manage organization calendar events"
+      });
+    }
+    const existing = await prisma.companyCalendarEvent.findUnique({
+      where: { id: req.params.id }
+    });
+    if (!existing) {
+      return res.status(404).json({ error: "Company calendar event not found" });
+    }
+    await prisma.companyCalendarEvent.delete({ where: { id: existing.id } });
+    res.json({ deleted: true, id: existing.id });
+  } catch (error) {
+    console.error("Delete company calendar event error:", error);
+    res.status(500).json({ error: "Failed to delete company calendar event" });
   }
 });
 var calendar_default = router18;
