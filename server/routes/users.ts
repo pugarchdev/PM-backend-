@@ -410,8 +410,17 @@ router.post('/pre-register', requireAuth, requirePermission('add_user'), async (
     // Validate reporting manager if provided
     let assignedManagerId: string | null = null;
     if (managerId) {
-      const managerUser = await prisma.user.findUnique({ where: { id: String(managerId) } });
+      const managerUser = await prisma.user.findUnique({
+        where: { id: String(managerId) },
+        include: { roleDefinition: true },
+      });
       if (managerUser) {
+        const mgrRank = managerUser.roleDefinition?.rank ?? (managerUser.role === 'CEO' || managerUser.role === 'HR' ? 1 : managerUser.role === 'CTO' ? 2 : 3);
+        if (mgrRank >= targetRole.rank) {
+          return res.status(400).json({
+            error: 'Forbidden: A reporting manager must have a higher hierarchy level (lower rank) than the user being assigned.',
+          });
+        }
         assignedManagerId = managerUser.id;
       }
     }
@@ -488,6 +497,7 @@ router.patch('/:id/manager', requireAuth, requireCanManageUsers, async (req: Aut
 
     const targetUser = await prisma.user.findUnique({
       where: { id: targetUserId },
+      include: { roleDefinition: true },
     });
 
     if (!targetUser) {
@@ -508,10 +518,19 @@ router.patch('/:id/manager', requireAuth, requireCanManageUsers, async (req: Aut
 
     const managerUser = await prisma.user.findUnique({
       where: { id: String(managerId) },
+      include: { roleDefinition: true },
     });
 
     if (!managerUser) {
       return res.status(404).json({ error: 'Designated manager does not exist.' });
+    }
+
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === 'Intern' ? 4 : targetUser.role === 'Employee' ? 3 : 2);
+    const mgrRank = managerUser.roleDefinition?.rank ?? (managerUser.role === 'CEO' || managerUser.role === 'HR' ? 1 : managerUser.role === 'CTO' ? 2 : 3);
+    if (mgrRank >= targetRank) {
+      return res.status(400).json({
+        error: 'Forbidden: A reporting manager must have a higher hierarchy level (lower rank) than the user being assigned.',
+      });
     }
 
     // Circular hierarchy protection: check if targetUser is an ancestor of managerUser

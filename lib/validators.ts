@@ -133,6 +133,8 @@ export const ProjectCharterUpdateSchema = z
     startDate: z.string().or(z.date()).optional(),
     endDate: z.string().or(z.date()).optional(),
     ownerId: z.string().min(1).optional(),
+    plannedBudget: z.coerce.number().min(0, 'Planned budget cannot be negative').optional(),
+    contingency: z.coerce.number().min(0, 'Contingency cannot be negative').optional(),
   })
   .refine(
     (data) => {

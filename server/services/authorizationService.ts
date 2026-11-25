@@ -215,7 +215,7 @@ export async function getUserHierarchyContext(userId: string): Promise<UserHiera
  * Checks whether user can view a given project
  */
 export function canViewProject(ctx: UserHierarchyContext, projectId: string): boolean {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return ctx.authorizedProjectIds.includes(projectId);
 }
 
@@ -223,7 +223,7 @@ export function canViewProject(ctx: UserHierarchyContext, projectId: string): bo
  * Checks whether user can manage (edit charter, update phases, set baseline) a project
  */
 export function canManageProject(ctx: UserHierarchyContext, project: { ownerId: string }): boolean {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return project.ownerId === ctx.userId;
 }
 
@@ -231,7 +231,37 @@ export function canManageProject(ctx: UserHierarchyContext, project: { ownerId: 
  * Checks whether user can transfer project ownership
  */
 export function canTransferProjectOwnership(ctx: UserHierarchyContext): boolean {
-  return ctx.isExecutive;
+  return ctx.isExecutive || ctx.bypassPermissions;
+}
+
+/**
+ * Checks whether user can manage (create, update, delete) milestones for a project.
+ * Granted to executives, rank <= 2 (e.g. CTO), bypass callers, or the actual project owner.
+ */
+export function canManageMilestones(
+  ctx: UserHierarchyContext,
+  project: { ownerId: string }
+): boolean {
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
+  return project.ownerId === ctx.userId;
+}
+
+/**
+ * Checks whether user has permission to access project budget & financial data
+ * (strictly reserved for CEO, HR, CTO, or users with view_budget permission).
+ * Never grants access solely based on project ownership.
+ */
+export function canAccessBudget(
+  ctx: UserHierarchyContext,
+  user?: { bypassPermissions?: boolean; permissions?: string[] }
+): boolean {
+  return (
+    ctx.bypassPermissions ||
+    ctx.isExecutive ||
+    ctx.roleRank <= 2 ||
+    Boolean(user?.bypassPermissions) ||
+    Boolean(user?.permissions?.includes('view_budget'))
+  );
 }
 
 /**
@@ -274,7 +304,7 @@ export function canUpdateTask(
     phase?: { projectId: string; project?: { ownerId: string } } | null;
   }
 ): boolean {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
 
   // User can update their own assigned task
   if (task.assigneeId === ctx.userId) return true;
@@ -302,7 +332,7 @@ export function canDeleteTask(
   ctx: UserHierarchyContext,
   task: { phase?: { project?: { ownerId: string } } | null }
 ): boolean {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return task.phase?.project?.ownerId === ctx.userId;
 }
 
@@ -318,7 +348,7 @@ export function canManageIssue(
     project?: { ownerId: string } | null;
   }
 ): boolean {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
 
   // Project owner can manage issues on their project
   if (issue.project && issue.project.ownerId === ctx.userId) return true;
@@ -412,26 +442,88 @@ export async function getVisibleDirectoryUserIds(ctx: UserHierarchyContext): Pro
 
   const visibleIds = new Set<string>([ctx.userId]);
 
-  // Include all subordinates in reporting scope
+  // Include all subordinates in reporting scope (e.g. interns reporting to current user)
   ctx.allSubordinateIds.forEach((id) => visibleIds.add(id));
 
-  // Include colleagues & interns working on the same authorized projects
+  if (ctx.roleRank <= 2 || ctx.autoAddToProjects) {
+    // Leadership roles (e.g. CTO) can see all users strictly below their rank (Employees & Interns)
+    const lowerRankUsers = await prisma.user.findMany({
+      where: {
+        OR: [
+          { roleDefinition: { is: { rank: { gt: ctx.roleRank }, bypassPermissions: false } } },
+          { role: { in: ['Employee', 'Intern'] } },
+        ],
+      },
+      select: { id: true },
+    });
+    lowerRankUsers.forEach((u) => visibleIds.add(u.id));
+  }
+
+  // Check if current user is an owner of at least one project
+  const ownedProjectsCount = await prisma.project.count({
+    where: { ownerId: ctx.userId },
+  });
+  const isProjectOwner = ownedProjectsCount > 0;
+
+  if (isProjectOwner) {
+    // Project owners need to see all employees across the organization to staff them onto projects
+    const allEmployees = await prisma.user.findMany({
+      where: {
+        OR: [
+          { role: 'Employee' },
+          { roleDefinition: { is: { rank: 3 } } },
+        ],
+      },
+      select: { id: true },
+    });
+    allEmployees.forEach((e) => visibleIds.add(e.id));
+  }
+
+  // Include colleagues working on the same authorized projects (exclude interns unless they report to caller)
   const sharedMembers = await prisma.projectMembership.findMany({
     where: { projectId: { in: ctx.authorizedProjectIds } },
-    select: { userId: true },
+    select: {
+      userId: true,
+      user: {
+        select: {
+          id: true,
+          role: true,
+          roleDefinition: { select: { rank: true } },
+        },
+      },
+    },
   });
-  sharedMembers.forEach((m) => visibleIds.add(m.userId));
+  sharedMembers.forEach((m) => {
+    const isIntern = m.user?.role === 'Intern' || m.user?.roleDefinition?.rank === 4;
+    if (!isIntern || ctx.allSubordinateIds.includes(m.userId)) {
+      visibleIds.add(m.userId);
+    }
+  });
 
-  // Include colleagues assigned to tasks on authorized projects
+  // Include colleagues assigned to tasks on authorized projects (exclude interns unless they report to caller)
   const taskAssignees = await prisma.task.findMany({
     where: {
       phase: { projectId: { in: ctx.authorizedProjectIds } },
       assigneeId: { not: null },
     },
-    select: { assigneeId: true },
+    select: {
+      assigneeId: true,
+      assignee: {
+        select: {
+          id: true,
+          role: true,
+          roleDefinition: { select: { rank: true } },
+        },
+      },
+    },
   });
   taskAssignees.forEach((t) => {
-    if (t.assigneeId) visibleIds.add(t.assigneeId);
+    if (t.assigneeId) {
+      const isIntern = t.assignee?.role === 'Intern' || t.assignee?.roleDefinition?.rank === 4;
+      if (!isIntern || ctx.allSubordinateIds.includes(t.assigneeId)) {
+        visibleIds.add(t.assigneeId);
+      }
+    }
   });
 
   return Array.from(visibleIds);

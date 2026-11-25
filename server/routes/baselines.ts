@@ -2,7 +2,7 @@ import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { calculateMilestoneSlippage } from '../../lib/calculations.js';
-import { getUserHierarchyContext, canViewProject, canManageProject } from '../services/authorizationService.js';
+import { getUserHierarchyContext, canViewProject, canManageProject, canAccessBudget } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -27,7 +27,7 @@ router.get('/:id/baselines', requireAuth, async (req: AuthRequest, res: Response
       orderBy: { version: 'desc' },
     });
 
-    const hideFinancials = !ctx.isExecutive && project?.ownerId !== user.id && ctx.roleRank > 2;
+    const hideFinancials = !canAccessBudget(ctx, user);
     const sanitizedBaselines = baselines.map((b) => {
       if (hideFinancials) {
         try {

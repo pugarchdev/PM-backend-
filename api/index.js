@@ -32,9 +32,11 @@ var init_prisma = __esm({
 // server/services/authorizationService.ts
 var authorizationService_exports = {};
 __export(authorizationService_exports, {
+  canAccessBudget: () => canAccessBudget,
   canDecideLeaveRequest: () => canDecideLeaveRequest,
   canDeleteTask: () => canDeleteTask,
   canManageIssue: () => canManageIssue,
+  canManageMilestones: () => canManageMilestones,
   canManageProject: () => canManageProject,
   canTransferProjectOwnership: () => canTransferProjectOwnership,
   canUpdateTask: () => canUpdateTask,
@@ -203,15 +205,22 @@ async function getUserHierarchyContext(userId) {
   return queryPromise;
 }
 function canViewProject(ctx, projectId) {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return ctx.authorizedProjectIds.includes(projectId);
 }
 function canManageProject(ctx, project) {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return project.ownerId === ctx.userId;
 }
 function canTransferProjectOwnership(ctx) {
-  return ctx.isExecutive;
+  return ctx.isExecutive || ctx.bypassPermissions;
+}
+function canManageMilestones(ctx, project) {
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
+  return project.ownerId === ctx.userId;
+}
+function canAccessBudget(ctx, user) {
+  return ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2 || Boolean(user?.bypassPermissions) || Boolean(user?.permissions?.includes("view_budget"));
 }
 function canViewTask(ctx, task) {
   if (ctx.isExecutive) return true;
@@ -225,7 +234,7 @@ function canViewTask(ctx, task) {
   return true;
 }
 function canUpdateTask(ctx, task) {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   if (task.assigneeId === ctx.userId) return true;
   if (task.phase?.project?.ownerId === ctx.userId) return true;
   if (task.assigneeId && ctx.allSubordinateIds.includes(task.assigneeId) && task.phase?.projectId && ctx.authorizedProjectIds.includes(task.phase.projectId)) {
@@ -234,11 +243,11 @@ function canUpdateTask(ctx, task) {
   return false;
 }
 function canDeleteTask(ctx, task) {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return task.phase?.project?.ownerId === ctx.userId;
 }
 function canManageIssue(ctx, issue) {
-  if (ctx.isExecutive) return true;
+  if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   if (issue.project && issue.project.ownerId === ctx.userId) return true;
   if (issue.raisedBy === ctx.userId || issue.ownerId === ctx.userId) return true;
   if (ctx.authorizedProjectIds.includes(issue.projectId)) {
@@ -302,20 +311,76 @@ async function getVisibleDirectoryUserIds(ctx) {
   }
   const visibleIds = /* @__PURE__ */ new Set([ctx.userId]);
   ctx.allSubordinateIds.forEach((id) => visibleIds.add(id));
+  if (ctx.roleRank <= 2 || ctx.autoAddToProjects) {
+    const lowerRankUsers = await prisma.user.findMany({
+      where: {
+        OR: [
+          { roleDefinition: { is: { rank: { gt: ctx.roleRank }, bypassPermissions: false } } },
+          { role: { in: ["Employee", "Intern"] } }
+        ]
+      },
+      select: { id: true }
+    });
+    lowerRankUsers.forEach((u) => visibleIds.add(u.id));
+  }
+  const ownedProjectsCount = await prisma.project.count({
+    where: { ownerId: ctx.userId }
+  });
+  const isProjectOwner = ownedProjectsCount > 0;
+  if (isProjectOwner) {
+    const allEmployees = await prisma.user.findMany({
+      where: {
+        OR: [
+          { role: "Employee" },
+          { roleDefinition: { is: { rank: 3 } } }
+        ]
+      },
+      select: { id: true }
+    });
+    allEmployees.forEach((e) => visibleIds.add(e.id));
+  }
   const sharedMembers = await prisma.projectMembership.findMany({
     where: { projectId: { in: ctx.authorizedProjectIds } },
-    select: { userId: true }
+    select: {
+      userId: true,
+      user: {
+        select: {
+          id: true,
+          role: true,
+          roleDefinition: { select: { rank: true } }
+        }
+      }
+    }
   });
-  sharedMembers.forEach((m) => visibleIds.add(m.userId));
+  sharedMembers.forEach((m) => {
+    const isIntern = m.user?.role === "Intern" || m.user?.roleDefinition?.rank === 4;
+    if (!isIntern || ctx.allSubordinateIds.includes(m.userId)) {
+      visibleIds.add(m.userId);
+    }
+  });
   const taskAssignees = await prisma.task.findMany({
     where: {
       phase: { projectId: { in: ctx.authorizedProjectIds } },
       assigneeId: { not: null }
     },
-    select: { assigneeId: true }
+    select: {
+      assigneeId: true,
+      assignee: {
+        select: {
+          id: true,
+          role: true,
+          roleDefinition: { select: { rank: true } }
+        }
+      }
+    }
   });
   taskAssignees.forEach((t) => {
-    if (t.assigneeId) visibleIds.add(t.assigneeId);
+    if (t.assigneeId) {
+      const isIntern = t.assignee?.role === "Intern" || t.assignee?.roleDefinition?.rank === 4;
+      if (!isIntern || ctx.allSubordinateIds.includes(t.assigneeId)) {
+        visibleIds.add(t.assigneeId);
+      }
+    }
   });
   return Array.from(visibleIds);
 }
@@ -975,18 +1040,6 @@ function requireAuth(req, res, next) {
   }
   next();
 }
-function requireCTOOrCEO(req, res, next) {
-  if (!req.user) {
-    return res.status(401).json({ error: "Unauthorized: Authentication required." });
-  }
-  if (!req.user.isExecutive && req.user.roleRank > 2 && req.user.role !== "CEO" && req.user.role !== "CTO" && req.user.role !== "ProjectOwner") {
-    return res.status(403).json({
-      error: "Forbidden: This action requires manager or executive hierarchy authorization."
-    });
-  }
-  next();
-}
-var requireOwnerOrCEO = requireCTOOrCEO;
 function requireCanManageUsers(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: "Unauthorized: Authentication required." });
@@ -3956,7 +4009,9 @@ var ProjectCharterUpdateSchema = z.object({
   sponsor: z.string().trim().min(1, "Client is required").optional(),
   startDate: z.string().or(z.date()).optional(),
   endDate: z.string().or(z.date()).optional(),
-  ownerId: z.string().min(1).optional()
+  ownerId: z.string().min(1).optional(),
+  plannedBudget: z.coerce.number().min(0, "Planned budget cannot be negative").optional(),
+  contingency: z.coerce.number().min(0, "Contingency cannot be negative").optional()
 }).refine(
   (data) => {
     if (data.startDate && data.endDate) {
@@ -4024,26 +4079,32 @@ async function enrichProject(project) {
     }
   };
 }
-function sanitizeProjectForRole(project, userRoleOrRank, isExecutive = false, isOwner = false) {
-  if (isExecutive || isOwner) {
+function sanitizeProjectForRole(project, userRoleOrRankOrCanAccess, userOrExecutive, _isOwner) {
+  let canAccess = false;
+  if (typeof userRoleOrRankOrCanAccess === "boolean") {
+    canAccess = userRoleOrRankOrCanAccess;
+  } else if (userRoleOrRankOrCanAccess && typeof userRoleOrRankOrCanAccess === "object" && "roleRank" in userRoleOrRankOrCanAccess) {
+    canAccess = canAccessBudget(userRoleOrRankOrCanAccess, userOrExecutive);
+  } else if (typeof userOrExecutive === "boolean" && userOrExecutive) {
+    canAccess = true;
+  } else if (typeof userRoleOrRankOrCanAccess === "number" && userRoleOrRankOrCanAccess <= 2) {
+    canAccess = true;
+  }
+  if (canAccess) {
     return project;
   }
-  const isRestricted = userRoleOrRank === "Employee" || userRoleOrRank === "Intern" || typeof userRoleOrRank === "number" && userRoleOrRank > 2;
-  if (isRestricted) {
-    return {
-      ...project,
+  return {
+    ...project,
+    plannedBudget: 0,
+    contingency: 0,
+    spendToDate: 0,
+    isBudgetRestricted: true,
+    phases: project.phases?.map((ph) => ({
+      ...ph,
       plannedBudget: 0,
-      contingency: 0,
-      spendToDate: 0,
-      isBudgetRestricted: true,
-      phases: project.phases?.map((ph) => ({
-        ...ph,
-        plannedBudget: 0,
-        spendToDate: 0
-      }))
-    };
-  }
-  return project;
+      spendToDate: 0
+    }))
+  };
 }
 router3.get("/", requireAuth, async (req, res) => {
   try {
@@ -4160,7 +4221,7 @@ router3.get("/", requireAuth, async (req, res) => {
     const limit = Math.max(1, parseInt(String(req.query.limit || "10"), 10) || 10);
     const paginatedItems = isPaginated ? filtered.slice((page - 1) * limit, page * limit) : filtered;
     const sanitized = paginatedItems.map(
-      (p) => sanitizeProjectForRole(p, ctx.roleRank, ctx.isExecutive, p.ownerId === user.id)
+      (p) => sanitizeProjectForRole(p, canAccessBudget(ctx, user))
     );
     if (isPaginated) {
       return res.json({
@@ -4188,6 +4249,9 @@ router3.post("/", requireAuth, requirePermission("add_project"), async (req, res
       return res.status(400).json({ error: validation.error.issues[0]?.message || "Invalid project input" });
     }
     const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0 } = validation.data;
+    const hasBudgetAccess = canAccessBudget(ctx, user);
+    const effectivePlannedBudget = hasBudgetAccess ? Number(plannedBudget) : 0;
+    const effectiveContingency = hasBudgetAccess ? Number(contingency) : 0;
     let designatedOwnerId = user.id;
     if (ctx.isExecutive && validation.data.ownerId) {
       const targetUser = await prisma.user.findUnique({ where: { id: validation.data.ownerId } });
@@ -4206,8 +4270,8 @@ router3.post("/", requireAuth, requirePermission("add_project"), async (req, res
           ownerId: designatedOwnerId,
           startDate: start,
           endDate: end,
-          plannedBudget: Number(plannedBudget),
-          contingency: Number(contingency),
+          plannedBudget: effectivePlannedBudget,
+          contingency: effectiveContingency,
           spendToDate: 0
         }
       });
@@ -4258,7 +4322,7 @@ router3.post("/", requireAuth, requirePermission("add_project"), async (req, res
       }
     });
     const enriched = await enrichProject(fullProject);
-    res.status(201).json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, fullProject?.ownerId === user.id));
+    res.status(201).json(sanitizeProjectForRole(enriched, canAccessBudget(ctx, user)));
   } catch (error) {
     console.error("Failed to create project:", error);
     res.status(500).json({ error: "Failed to create project" });
@@ -4363,7 +4427,7 @@ router3.get("/:id", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Project not found" });
     }
     const enriched = await enrichProject(project);
-    const sanitized = sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, project.ownerId === user.id);
+    const sanitized = sanitizeProjectForRole(enriched, canAccessBudget(ctx, user));
     res.json(sanitized);
   } catch (error) {
     console.error("Failed to fetch project details:", error);
@@ -4556,6 +4620,35 @@ router3.patch("/:id", requireAuth, async (req, res) => {
         details: `Project ownership transferred to ${newOwner.name} by ${user.name}.`
       });
     }
+    const hasBudgetAccess = canAccessBudget(ctx, user);
+    if (hasBudgetAccess) {
+      if (data.plannedBudget !== void 0 || req.body.plannedBudget !== void 0) {
+        const rawBudget = data.plannedBudget ?? req.body.plannedBudget;
+        const pb = Number(rawBudget);
+        if (!isNaN(pb) && pb >= 0 && pb !== project.plannedBudget) {
+          updateData.plannedBudget = pb;
+          changeLogs.push({
+            what: "Planned Budget Updated",
+            fromValue: formatCurrency(project.plannedBudget),
+            toValue: formatCurrency(pb),
+            details: `Project planned budget updated to ${formatCurrency(pb)}.`
+          });
+        }
+      }
+      if (data.contingency !== void 0 || req.body.contingency !== void 0) {
+        const rawContingency = data.contingency ?? req.body.contingency;
+        const ct = Number(rawContingency);
+        if (!isNaN(ct) && ct >= 0 && ct !== project.contingency) {
+          updateData.contingency = ct;
+          changeLogs.push({
+            what: "Contingency Updated",
+            fromValue: formatCurrency(project.contingency),
+            toValue: formatCurrency(ct),
+            details: `Project contingency updated to ${formatCurrency(ct)}.`
+          });
+        }
+      }
+    }
     const updated = await prisma.$transaction(async (tx) => {
       const p = await tx.project.update({
         where: { id: project.id },
@@ -4607,7 +4700,7 @@ router3.patch("/:id", requireAuth, async (req, res) => {
       return p;
     });
     const enriched = await enrichProject(updated);
-    res.json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, updated.ownerId === user.id));
+    res.json(sanitizeProjectForRole(enriched, canAccessBudget(ctx, user)));
   } catch (error) {
     console.error("Failed to update project charter:", error);
     res.status(500).json({ error: "Failed to update project charter" });
@@ -4731,9 +4824,30 @@ router3.post("/:id/members", requireAuth, async (req, res) => {
     if (!userId) {
       return res.status(400).json({ error: "userId is required" });
     }
-    const targetUser = await prisma.user.findUnique({ where: { id: userId } });
+    const targetUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { roleDefinition: true }
+    });
     if (!targetUser) {
       return res.status(404).json({ error: "Target user does not exist" });
+    }
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === "CEO" || targetUser.role === "HR" ? 1 : targetUser.role === "CTO" ? 2 : targetUser.role === "Employee" ? 3 : 4);
+    const targetIsIntern = targetUser.role === "Intern" || targetRank === 4;
+    if (!ctx.isExecutive && !ctx.bypassPermissions) {
+      if (ctx.roleRank <= 2) {
+        if (targetRank <= ctx.roleRank || targetUser.roleDefinition?.bypassPermissions) {
+          return res.status(403).json({
+            error: "Forbidden: You can only add members below your hierarchy role."
+          });
+        }
+      } else if (targetIsIntern) {
+        const isSubordinate = targetUser.managerId === ctx.userId || ctx.allSubordinateIds.includes(targetUser.id);
+        if (!isSubordinate) {
+          return res.status(403).json({
+            error: "Forbidden: Project owners can only add interns who directly report to them."
+          });
+        }
+      }
     }
     const membership = await prisma.projectMembership.upsert({
       where: { projectId_userId: { projectId: project.id, userId } },
@@ -4766,6 +4880,19 @@ router3.delete("/:id/members/:userId", requireAuth, async (req, res) => {
     const targetUserId = req.params.userId;
     if (targetUserId === project.ownerId) {
       return res.status(400).json({ error: "Cannot remove the Project Owner from project membership." });
+    }
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: { roleDefinition: true }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "Target user not found" });
+    }
+    const targetIsLeadership = targetUser.role === "CEO" || targetUser.role === "CTO" || Boolean(targetUser.roleDefinition?.isExecutive) || Boolean(targetUser.roleDefinition?.bypassPermissions) || targetUser.roleDefinition?.rank !== void 0 && targetUser.roleDefinition.rank <= 2 || Boolean(targetUser.roleDefinition?.autoAddToProjects);
+    if (!ctx.isExecutive && !ctx.bypassPermissions && targetIsLeadership) {
+      return res.status(403).json({
+        error: "Forbidden: Project owners cannot remove executive leadership (CEO / CTO) from project membership."
+      });
     }
     await prisma.projectMembership.deleteMany({
       where: { projectId: project.id, userId: targetUserId }
@@ -7040,8 +7167,9 @@ var risks_default = router7;
 // server/routes/milestones.ts
 init_prisma();
 import { Router as Router8 } from "express";
+init_authorizationService();
 var router8 = Router8();
-router8.post("/", requireOwnerOrCEO, async (req, res) => {
+router8.post("/", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const validation = MilestoneCreateSchema.safeParse(req.body);
@@ -7054,10 +7182,9 @@ router8.post("/", requireOwnerOrCEO, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === "CEO";
-    const isCTO = user.roleRank <= 2 || user.role === "CTO" || user.role === "ProjectOwner";
-    if (!isCEO && !isCTO) {
-      return res.status(403).json({ error: "Forbidden: Only CEO and CTO have access to manage milestones." });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageMilestones(ctx, project)) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage milestones for this project." });
     }
     const baselineDate = new Date(validation.data.baselineDate);
     const forecastDate = new Date(validation.data.forecastDate);
@@ -7088,7 +7215,7 @@ router8.post("/", requireOwnerOrCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to create milestone" });
   }
 });
-router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
+router8.patch("/:id", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const { baselineDate, forecastDate, actualDate, title } = req.body;
@@ -7099,10 +7226,9 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
     if (!milestone) {
       return res.status(404).json({ error: "Milestone not found" });
     }
-    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === "CEO";
-    const isCTO = user.roleRank <= 2 || user.role === "CTO" || user.role === "ProjectOwner";
-    if (!isCEO && !isCTO) {
-      return res.status(403).json({ error: "Forbidden: Only CEO and CTO have access to update milestones." });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageMilestones(ctx, milestone.project)) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage milestones for this project." });
     }
     const pStart = new Date(milestone.project.startDate).getTime();
     const pEnd = new Date(milestone.project.endDate).getTime();
@@ -7192,7 +7318,7 @@ router8.patch("/:id", requireOwnerOrCEO, async (req, res) => {
     res.status(500).json({ error: "Failed to update milestone" });
   }
 });
-router8.delete("/:id", requireOwnerOrCEO, async (req, res) => {
+router8.delete("/:id", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const milestone = await prisma.milestone.findUnique({
@@ -7202,10 +7328,9 @@ router8.delete("/:id", requireOwnerOrCEO, async (req, res) => {
     if (!milestone) {
       return res.status(404).json({ error: "Milestone not found" });
     }
-    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === "CEO";
-    const isCTO = user.roleRank <= 2 || user.role === "CTO" || user.role === "ProjectOwner";
-    if (!isCEO && !isCTO) {
-      return res.status(403).json({ error: "Forbidden: Only CEO and CTO have access to delete milestones." });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageMilestones(ctx, milestone.project)) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage milestones for this project." });
     }
     await prisma.milestone.delete({
       where: { id: req.params.id }
@@ -8770,7 +8895,7 @@ router13.get("/:id/baselines", requireAuth, async (req, res) => {
       where: { projectId },
       orderBy: { version: "desc" }
     });
-    const hideFinancials = !ctx.isExecutive && project?.ownerId !== user.id && ctx.roleRank > 2;
+    const hideFinancials = !canAccessBudget(ctx, user);
     const sanitizedBaselines = baselines.map((b) => {
       if (hideFinancials) {
         try {
@@ -9084,8 +9209,8 @@ router15.get("/:id/budget", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: "Access denied. Budget information is confidential and reserved for Project Owners and Executive management." });
+    if (!canAccessBudget(ctx, user) || !canViewProject(ctx, project.id)) {
+      return res.status(403).json({ error: "Forbidden: Budget access restricted" });
     }
     const planPercent = calculatePlanPercentage(
       project.startDate,
@@ -9153,8 +9278,8 @@ router15.post("/:id/budget/spend", requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: "Project not found" });
     }
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: "You are not authorized to modify budget or record spend for this project." });
+    if (!canAccessBudget(ctx, user) || !canViewProject(ctx, project.id)) {
+      return res.status(403).json({ error: "Forbidden: Budget access restricted" });
     }
     const spendDelta = Number(amount);
     if (!spendDelta || spendDelta <= 0) {
@@ -10632,8 +10757,17 @@ router19.post("/pre-register", requireAuth, requirePermission("add_user"), async
     const assignedRoleId = targetRole.id;
     let assignedManagerId = null;
     if (managerId) {
-      const managerUser = await prisma.user.findUnique({ where: { id: String(managerId) } });
+      const managerUser = await prisma.user.findUnique({
+        where: { id: String(managerId) },
+        include: { roleDefinition: true }
+      });
       if (managerUser) {
+        const mgrRank = managerUser.roleDefinition?.rank ?? (managerUser.role === "CEO" || managerUser.role === "HR" ? 1 : managerUser.role === "CTO" ? 2 : 3);
+        if (mgrRank >= targetRole.rank) {
+          return res.status(400).json({
+            error: "Forbidden: A reporting manager must have a higher hierarchy level (lower rank) than the user being assigned."
+          });
+        }
         assignedManagerId = managerUser.id;
       }
     }
@@ -10697,7 +10831,8 @@ router19.patch("/:id/manager", requireAuth, requireCanManageUsers, async (req, r
     const targetUserId = req.params.id;
     const { managerId } = req.body;
     const targetUser = await prisma.user.findUnique({
-      where: { id: targetUserId }
+      where: { id: targetUserId },
+      include: { roleDefinition: true }
     });
     if (!targetUser) {
       return res.status(404).json({ error: "User not found" });
@@ -10713,10 +10848,18 @@ router19.patch("/:id/manager", requireAuth, requireCanManageUsers, async (req, r
       return res.status(400).json({ error: "A user cannot report to themselves." });
     }
     const managerUser = await prisma.user.findUnique({
-      where: { id: String(managerId) }
+      where: { id: String(managerId) },
+      include: { roleDefinition: true }
     });
     if (!managerUser) {
       return res.status(404).json({ error: "Designated manager does not exist." });
+    }
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === "Intern" ? 4 : targetUser.role === "Employee" ? 3 : 2);
+    const mgrRank = managerUser.roleDefinition?.rank ?? (managerUser.role === "CEO" || managerUser.role === "HR" ? 1 : managerUser.role === "CTO" ? 2 : 3);
+    if (mgrRank >= targetRank) {
+      return res.status(400).json({
+        error: "Forbidden: A reporting manager must have a higher hierarchy level (lower rank) than the user being assigned."
+      });
     }
     let currentCheckId = managerUser.managerId;
     const visited = /* @__PURE__ */ new Set([managerUser.id]);

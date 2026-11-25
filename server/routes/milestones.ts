@@ -1,12 +1,13 @@
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { AuthRequest, requireOwnerOrCEO } from '../auth.js';
+import { AuthRequest, requireAuth } from '../auth.js';
 import { MilestoneCreateSchema } from '../../lib/validators.js';
+import { getUserHierarchyContext, canManageMilestones } from '../services/authorizationService.js';
 
 const router = Router();
 
-// POST /api/milestones - Create milestone (CEO and CTO only)
-router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// POST /api/milestones - Create milestone (CEO, CTO, and Project Owner)
+router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
     const validation = MilestoneCreateSchema.safeParse(req.body);
@@ -22,11 +23,9 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // RBAC: Only CEO and CTO (rank <= 2) can create milestones
-    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === 'CEO';
-    const isCTO = user.roleRank <= 2 || user.role === 'CTO' || user.role === 'ProjectOwner';
-    if (!isCEO && !isCTO) {
-      return res.status(403).json({ error: 'Forbidden: Only CEO and CTO have access to manage milestones.' });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageMilestones(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to manage milestones for this project.' });
     }
 
     const baselineDate = new Date(validation.data.baselineDate);
@@ -64,8 +63,8 @@ router.post('/', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// PATCH /api/milestones/:id - Update forecast or actual date (CEO and CTO only)
-router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// PATCH /api/milestones/:id - Update forecast or actual date (CEO, CTO, and Project Owner)
+router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
     const { baselineDate, forecastDate, actualDate, title } = req.body;
@@ -78,11 +77,9 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
       return res.status(404).json({ error: 'Milestone not found' });
     }
 
-    // RBAC: Only CEO and CTO (rank <= 2) can update milestones
-    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === 'CEO';
-    const isCTO = user.roleRank <= 2 || user.role === 'CTO' || user.role === 'ProjectOwner';
-    if (!isCEO && !isCTO) {
-      return res.status(403).json({ error: 'Forbidden: Only CEO and CTO have access to update milestones.' });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageMilestones(ctx, milestone.project)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to manage milestones for this project.' });
     }
 
     const pStart = new Date(milestone.project.startDate).getTime();
@@ -184,8 +181,8 @@ router.patch('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) 
   }
 });
 
-// DELETE /api/milestones/:id - Delete milestone (CEO and CTO only)
-router.delete('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response) => {
+// DELETE /api/milestones/:id - Delete milestone (CEO, CTO, and Project Owner)
+router.delete('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const user = req.user!;
     const milestone = await prisma.milestone.findUnique({
@@ -197,10 +194,9 @@ router.delete('/:id', requireOwnerOrCEO, async (req: AuthRequest, res: Response)
       return res.status(404).json({ error: 'Milestone not found' });
     }
 
-    const isCEO = user.isExecutive || user.roleRank === 1 || user.role === 'CEO';
-    const isCTO = user.roleRank <= 2 || user.role === 'CTO' || user.role === 'ProjectOwner';
-    if (!isCEO && !isCTO) {
-      return res.status(403).json({ error: 'Forbidden: Only CEO and CTO have access to delete milestones.' });
+    const ctx = await getUserHierarchyContext(user.id);
+    if (!canManageMilestones(ctx, milestone.project)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to manage milestones for this project.' });
     }
 
     await prisma.milestone.delete({

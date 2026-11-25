@@ -9,6 +9,7 @@ import {
   canViewProject,
   canManageProject,
   canTransferProjectOwnership,
+  canAccessBudget,
 } from '../services/authorizationService.js';
 import { addAutoJoinRoleUsersToProject } from '../services/permissionService.js';
 
@@ -60,36 +61,43 @@ export async function enrichProject(project: any) {
   };
 }
 
-// Helper to sanitize budget data based on hierarchy and ownership
+// Helper to sanitize budget data based on budget access permissions (strictly excludes owner from automatic budget access)
 export function sanitizeProjectForRole(
   project: any,
-  userRoleOrRank: string | number,
-  isExecutive: boolean = false,
-  isOwner: boolean = false
+  userRoleOrRankOrCanAccess: string | number | boolean | any,
+  userOrExecutive?: any,
+  _isOwner?: boolean
 ) {
-  if (isExecutive || isOwner) {
+  let canAccess = false;
+  if (typeof userRoleOrRankOrCanAccess === 'boolean') {
+    canAccess = userRoleOrRankOrCanAccess;
+  } else if (
+    userRoleOrRankOrCanAccess &&
+    typeof userRoleOrRankOrCanAccess === 'object' &&
+    'roleRank' in userRoleOrRankOrCanAccess
+  ) {
+    canAccess = canAccessBudget(userRoleOrRankOrCanAccess, userOrExecutive);
+  } else if (typeof userOrExecutive === 'boolean' && userOrExecutive) {
+    canAccess = true;
+  } else if (typeof userRoleOrRankOrCanAccess === 'number' && userRoleOrRankOrCanAccess <= 2) {
+    canAccess = true;
+  }
+
+  if (canAccess) {
     return project;
   }
-  const isRestricted =
-    userRoleOrRank === 'Employee' ||
-    userRoleOrRank === 'Intern' ||
-    (typeof userRoleOrRank === 'number' && userRoleOrRank > 2);
-
-  if (isRestricted) {
-    return {
-      ...project,
+  return {
+    ...project,
+    plannedBudget: 0,
+    contingency: 0,
+    spendToDate: 0,
+    isBudgetRestricted: true,
+    phases: project.phases?.map((ph: any) => ({
+      ...ph,
       plannedBudget: 0,
-      contingency: 0,
       spendToDate: 0,
-      isBudgetRestricted: true,
-      phases: project.phases?.map((ph: any) => ({
-        ...ph,
-        plannedBudget: 0,
-        spendToDate: 0,
-      })),
-    };
-  }
-  return project;
+    })),
+  };
 }
 
 // GET /api/projects - List projects with lean field selection, server-side filtering, and optional pagination
@@ -230,7 +238,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       : filtered;
 
     const sanitized = paginatedItems.map((p) =>
-      sanitizeProjectForRole(p, ctx.roleRank, ctx.isExecutive, p.ownerId === user.id)
+      sanitizeProjectForRole(p, canAccessBudget(ctx, user))
     );
 
     if (isPaginated) {
@@ -264,6 +272,9 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
     }
 
     const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0 } = validation.data;
+    const hasBudgetAccess = canAccessBudget(ctx, user);
+    const effectivePlannedBudget = hasBudgetAccess ? Number(plannedBudget) : 0;
+    const effectiveContingency = hasBudgetAccess ? Number(contingency) : 0;
 
     // Executive can designate any owner or themselves; others are owner of their chartered projects
     let designatedOwnerId = user.id;
@@ -286,8 +297,8 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
           ownerId: designatedOwnerId,
           startDate: start,
           endDate: end,
-          plannedBudget: Number(plannedBudget),
-          contingency: Number(contingency),
+          plannedBudget: effectivePlannedBudget,
+          contingency: effectiveContingency,
           spendToDate: 0,
         },
       });
@@ -349,7 +360,7 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
     });
 
     const enriched = await enrichProject(fullProject);
-    res.status(201).json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, fullProject?.ownerId === user.id));
+    res.status(201).json(sanitizeProjectForRole(enriched, canAccessBudget(ctx, user)));
   } catch (error: any) {
     console.error('Failed to create project:', error);
     res.status(500).json({ error: 'Failed to create project' });
@@ -460,7 +471,7 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
     }
 
     const enriched = await enrichProject(project);
-    const sanitized = sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, project.ownerId === user.id);
+    const sanitized = sanitizeProjectForRole(enriched, canAccessBudget(ctx, user));
     res.json(sanitized);
   } catch (error: any) {
     console.error('Failed to fetch project details:', error);
@@ -683,6 +694,38 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       });
     }
 
+    // Budget updates are strictly isolated to authorized roles (CEO, HR, CTO, view_budget)
+    // Non-budget callers (e.g. Employee who owns the project) have plannedBudget & contingency stripped
+    const hasBudgetAccess = canAccessBudget(ctx, user);
+    if (hasBudgetAccess) {
+      if ((data as any).plannedBudget !== undefined || req.body.plannedBudget !== undefined) {
+        const rawBudget = (data as any).plannedBudget ?? req.body.plannedBudget;
+        const pb = Number(rawBudget);
+        if (!isNaN(pb) && pb >= 0 && pb !== project.plannedBudget) {
+          updateData.plannedBudget = pb;
+          changeLogs.push({
+            what: 'Planned Budget Updated',
+            fromValue: formatCurrency(project.plannedBudget),
+            toValue: formatCurrency(pb),
+            details: `Project planned budget updated to ${formatCurrency(pb)}.`,
+          });
+        }
+      }
+      if ((data as any).contingency !== undefined || req.body.contingency !== undefined) {
+        const rawContingency = (data as any).contingency ?? req.body.contingency;
+        const ct = Number(rawContingency);
+        if (!isNaN(ct) && ct >= 0 && ct !== project.contingency) {
+          updateData.contingency = ct;
+          changeLogs.push({
+            what: 'Contingency Updated',
+            fromValue: formatCurrency(project.contingency),
+            toValue: formatCurrency(ct),
+            details: `Project contingency updated to ${formatCurrency(ct)}.`,
+          });
+        }
+      }
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       const p = await tx.project.update({
         where: { id: project.id },
@@ -738,7 +781,7 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
     });
 
     const enriched = await enrichProject(updated);
-    res.json(sanitizeProjectForRole(enriched, ctx.roleRank, ctx.isExecutive, updated.ownerId === user.id));
+    res.json(sanitizeProjectForRole(enriched, canAccessBudget(ctx, user)));
   } catch (error: any) {
     console.error('Failed to update project charter:', error);
     res.status(500).json({ error: 'Failed to update project charter' });
@@ -893,9 +936,42 @@ router.post('/:id/members', requireAuth, async (req: AuthRequest, res: Response)
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const targetUser = await prisma.user.findUnique({ where: { id: userId } });
+    const targetUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { roleDefinition: true },
+    });
     if (!targetUser) {
       return res.status(404).json({ error: 'Target user does not exist' });
+    }
+
+    const targetRank =
+      targetUser.roleDefinition?.rank ??
+      (targetUser.role === 'CEO' || targetUser.role === 'HR'
+        ? 1
+        : targetUser.role === 'CTO'
+        ? 2
+        : targetUser.role === 'Employee'
+        ? 3
+        : 4);
+    const targetIsIntern = targetUser.role === 'Intern' || targetRank === 4;
+
+    if (!ctx.isExecutive && !ctx.bypassPermissions) {
+      if (ctx.roleRank <= 2) {
+        // Leadership (e.g. CTO) can add any member strictly below their hierarchy rank
+        if (targetRank <= ctx.roleRank || targetUser.roleDefinition?.bypassPermissions) {
+          return res.status(403).json({
+            error: 'Forbidden: You can only add members below your hierarchy role.',
+          });
+        }
+      } else if (targetIsIntern) {
+        // Non-executive project owners can only add interns who directly report to them
+        const isSubordinate = targetUser.managerId === ctx.userId || ctx.allSubordinateIds.includes(targetUser.id);
+        if (!isSubordinate) {
+          return res.status(403).json({
+            error: 'Forbidden: Project owners can only add interns who directly report to them.',
+          });
+        }
+      }
     }
 
     const membership = await prisma.projectMembership.upsert({
@@ -936,6 +1012,29 @@ router.delete('/:id/members/:userId', requireAuth, async (req: AuthRequest, res:
     const targetUserId = req.params.userId;
     if (targetUserId === project.ownerId) {
       return res.status(400).json({ error: 'Cannot remove the Project Owner from project membership.' });
+    }
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: { roleDefinition: true },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Target user not found' });
+    }
+
+    const targetIsLeadership =
+      targetUser.role === 'CEO' ||
+      targetUser.role === 'CTO' ||
+      Boolean(targetUser.roleDefinition?.isExecutive) ||
+      Boolean(targetUser.roleDefinition?.bypassPermissions) ||
+      (targetUser.roleDefinition?.rank !== undefined && targetUser.roleDefinition.rank <= 2) ||
+      Boolean(targetUser.roleDefinition?.autoAddToProjects);
+
+    if (!ctx.isExecutive && !ctx.bypassPermissions && targetIsLeadership) {
+      return res.status(403).json({
+        error: 'Forbidden: Project owners cannot remove executive leadership (CEO / CTO) from project membership.',
+      });
     }
 
     await prisma.projectMembership.deleteMany({

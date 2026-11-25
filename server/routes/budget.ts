@@ -4,7 +4,7 @@ import { AuthRequest, requireAuth } from '../auth.js';
 import { calculatePlanPercentage, calculateBudgetHealth } from '../../lib/calculations.js';
 import { formatCurrency } from '../../lib/currency.js';
 import { createNotification } from '../services/notificationService.js';
-import { getUserHierarchyContext, canManageProject } from '../services/authorizationService.js';
+import { getUserHierarchyContext, canManageProject, canAccessBudget, canViewProject } from '../services/authorizationService.js';
 
 const router = Router();
 
@@ -29,9 +29,9 @@ router.get('/:id/budget', requireAuth, async (req: AuthRequest, res: Response) =
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Dynamic authorization check: Must be project owner or executive
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: 'Access denied. Budget information is confidential and reserved for Project Owners and Executive management.' });
+    // Dynamic authorization check: Must have budget access and project visibility
+    if (!canAccessBudget(ctx, user) || !canViewProject(ctx, project.id)) {
+      return res.status(403).json({ error: 'Forbidden: Budget access restricted' });
     }
 
     // Calculate baseline plan percentage
@@ -111,8 +111,8 @@ router.post('/:id/budget/spend', requireAuth, async (req: AuthRequest, res: Resp
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: 'You are not authorized to modify budget or record spend for this project.' });
+    if (!canAccessBudget(ctx, user) || !canViewProject(ctx, project.id)) {
+      return res.status(403).json({ error: 'Forbidden: Budget access restricted' });
     }
 
     const spendDelta = Number(amount);
