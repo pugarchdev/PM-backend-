@@ -40,7 +40,7 @@ function getTransporter(): Transporter | null {
 function getFromAddress(): string {
   return (
     process.env.EMAIL_FROM?.trim() ||
-    'PugArch Security <no-reply@pugarch.internal>'
+    'PugArch Project Management <no-reply@pugarch.internal>'
   );
 }
 

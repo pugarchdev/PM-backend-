@@ -2043,7 +2043,7 @@ function getTransporter() {
   });
 }
 function getFromAddress() {
-  return process.env.EMAIL_FROM?.trim() || "PugArch Security <no-reply@pugarch.internal>";
+  return process.env.EMAIL_FROM?.trim() || "PugArch Project Management <no-reply@pugarch.internal>";
 }
 async function sendVerificationOtpEmail(params) {
   const { to, name, otp } = params;
