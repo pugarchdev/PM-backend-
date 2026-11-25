@@ -33,6 +33,7 @@ var init_prisma = __esm({
 var authorizationService_exports = {};
 __export(authorizationService_exports, {
   canAccessBudget: () => canAccessBudget,
+  canAssignProjectTasks: () => canAssignProjectTasks,
   canDecideLeaveRequest: () => canDecideLeaveRequest,
   canDeleteTask: () => canDeleteTask,
   canManageIssue: () => canManageIssue,
@@ -218,6 +219,9 @@ function canTransferProjectOwnership(ctx) {
 function canManageMilestones(ctx, project) {
   if (ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2) return true;
   return project.ownerId === ctx.userId;
+}
+function canAssignProjectTasks(ctx, project) {
+  return Boolean(ctx.bypassPermissions || ctx.autoAddToProjects || project.ownerId === ctx.userId);
 }
 function canAccessBudget(ctx, user) {
   return ctx.bypassPermissions || ctx.isExecutive || ctx.roleRank <= 2 || Boolean(user?.bypassPermissions) || Boolean(user?.permissions?.includes("view_budget"));
@@ -2693,6 +2697,161 @@ async function dispatchLeaveSubmissionEmails(params) {
     errors
   };
 }
+async function sendTaskAssignmentEmail(params) {
+  try {
+    const {
+      to,
+      assigneeName,
+      assignerName,
+      projectName,
+      taskTitle,
+      priority,
+      plannedStart,
+      plannedEnd,
+      plannedHours,
+      frequency = "ONE_TIME",
+      dailyHours
+    } = params;
+    const from = getFromAddress();
+    const transporter = getTransporter();
+    const portalUrl = resolvePortalUrl();
+    const fmtDate = (d) => new Date(d).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric"
+    });
+    const startStr = fmtDate(plannedStart);
+    const endStr = fmtDate(plannedEnd);
+    const scheduleLabel = frequency === "DAILY" && dailyHours ? `Daily (${dailyHours} hrs/day, ${plannedHours} hrs total)` : frequency === "WEEKLY" ? `Weekly (${plannedHours} hrs planned)` : `One-time (${plannedHours} hrs planned)`;
+    const subject = `New Task Assigned: ${taskTitle} (${projectName})`;
+    const text = `
+Hello ${assigneeName || "Team Member"},
+
+${assignerName} has assigned you a new task in "${projectName}":
+
+Task: ${taskTitle}
+Priority: ${priority}
+Schedule: ${startStr} to ${endStr}
+Effort: ${scheduleLabel}
+
+View your tasks on PugArch: ${portalUrl}/projects
+
+\u2014
+PugArch Projects Cloud
+`.trim();
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background-color:#F7F4ED;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#F7F4ED;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background-color:#FFFFFF;border-radius:20px;border:1px solid #EAE3D5;overflow:hidden;">
+          <tr>
+            <td style="padding:24px 28px;border-bottom:1px solid #F0EAE0;background-color:#FBF9F4;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#C85A32;">Task Assignment</div>
+              <h1 style="margin:6px 0 0;font-size:20px;line-height:1.3;color:#231E1B;">${taskTitle}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 28px;font-size:14px;line-height:1.6;color:#4B443D;">
+              <p style="margin:0 0 16px;">Hello <strong>${assigneeName || "Team Member"}</strong>,</p>
+              <p style="margin:0 0 16px;"><strong>${assignerName}</strong> assigned you a task in <strong>${projectName}</strong>.</p>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#FAF8F4;border:1px solid #EBE4D5;border-radius:12px;padding:14px 16px;margin-bottom:20px;font-size:13px;">
+                <tr><td style="padding:4px 0;color:#70675D;width:110px;">Priority</td><td style="padding:4px 0;font-weight:600;color:#231E1B;">${priority}</td></tr>
+                <tr><td style="padding:4px 0;color:#70675D;">Dates</td><td style="padding:4px 0;font-weight:600;color:#231E1B;">${startStr} \u2013 ${endStr}</td></tr>
+                <tr><td style="padding:4px 0;color:#70675D;">Effort</td><td style="padding:4px 0;font-weight:600;color:#231E1B;">${scheduleLabel}</td></tr>
+              </table>
+              <a href="${portalUrl}/projects" style="display:inline-block;padding:10px 20px;background-color:#C85A32;color:#FFFFFF;text-decoration:none;border-radius:999px;font-size:13px;font-weight:600;">Open PugArch Projects</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`.trim();
+    if (!transporter) {
+      console.log(`[EmailService] SMTP unconfigured \u2014 mock task assignment email to ${to}: ${subject}`);
+      return { delivered: false, mockLogged: true };
+    }
+    await transporter.sendMail({ from, to, subject, text, html });
+    return { delivered: true };
+  } catch (err) {
+    console.error("[EmailService] Failed to send task assignment email:", err?.message || err);
+    return { delivered: false };
+  }
+}
+async function sendReminderEmail(params) {
+  try {
+    const { to, userName, title, description, remindAt } = params;
+    const from = getFromAddress();
+    const transporter = getTransporter();
+    const portalUrl = resolvePortalUrl();
+    const formattedTime = new Date(remindAt).toLocaleString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+    const subject = `Reminder: ${title}`;
+    const text = [
+      `Hello ${userName || "Team Member"},`,
+      "",
+      `This is your scheduled reminder: ${title}`,
+      description ? `Details: ${description}` : "",
+      `Scheduled for: ${formattedTime}`,
+      "",
+      `Open PugArch Calendar: ${portalUrl}/calendar`
+    ].filter(Boolean).join("\n");
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background-color:#F7F4ED;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#F7F4ED;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background-color:#FFFFFF;border-radius:20px;border:1px solid #EAE3D5;overflow:hidden;">
+          <tr>
+            <td style="padding:24px 28px;border-bottom:1px solid #F0EAE0;background-color:#FBF9F4;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#C85A32;">Personal Reminder</div>
+              <h1 style="margin:6px 0 0;font-size:20px;line-height:1.3;color:#231E1B;">${title}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 28px;font-size:14px;line-height:1.6;color:#4B443D;">
+              <p style="margin:0 0 14px;">Hello <strong>${userName || "Team Member"}</strong>,</p>
+              ${description ? `<p style="margin:0 0 16px;padding:12px 14px;background-color:#FAF8F4;border:1px solid #EBE4D5;border-radius:12px;font-size:13px;">${description}</p>` : ""}
+              <p style="margin:0 0 20px;font-size:13px;color:#70675D;">Scheduled time: <strong style="color:#231E1B;">${formattedTime}</strong></p>
+              <a href="${portalUrl}/calendar" style="display:inline-block;padding:10px 20px;background-color:#C85A32;color:#FFFFFF;text-decoration:none;border-radius:999px;font-size:13px;font-weight:600;">Open Calendar</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`.trim();
+    if (!transporter) {
+      console.log(`[EmailService] SMTP unconfigured \u2014 mock reminder email to ${to}: ${subject}`);
+      return false;
+    }
+    await transporter.sendMail({ from, to, subject, text, html });
+    return true;
+  } catch (err) {
+    console.error("[EmailService] Failed to send reminder email:", err?.message || err);
+    return false;
+  }
+}
 
 // server/routes/auth.ts
 var router2 = Router2();
@@ -3899,10 +4058,13 @@ var TaskCreateSchema = z.object({
   title: z.string().trim().min(1, "Title is required").max(120, "Title cannot exceed 120 characters"),
   phaseId: z.string().min(1, "Phase is required"),
   assigneeId: z.string().nullable().optional(),
+  assigneeIds: z.array(z.string().min(1)).max(50).optional(),
   priority: z.enum(["Low", "Normal", "High"]).default("Normal"),
   plannedStart: z.string().or(z.date()),
   plannedEnd: z.string().or(z.date()),
   plannedHours: z.coerce.number().int("Hours must be an integer").min(0, "Min hours is 0").max(999, "Max hours is 999"),
+  frequency: z.enum(["ONE_TIME", "DAILY", "WEEKLY"]).optional().default("ONE_TIME"),
+  dailyHours: z.number().min(0.5).max(24).nullable().optional(),
   dependsOn: z.string().nullable().optional()
 }).refine(
   (data) => {
@@ -3924,11 +4086,26 @@ var TaskUpdateSchema = z.object({
   plannedEnd: z.string().or(z.date()).optional(),
   plannedHours: z.coerce.number().int().min(0).max(999).optional(),
   actualHours: z.coerce.number().int().min(0).optional(),
+  frequency: z.enum(["ONE_TIME", "DAILY", "WEEKLY"]).optional(),
+  dailyHours: z.number().min(0.5).max(24).nullable().optional(),
   state: z.enum(["Not started", "In progress", "Blocked", "Completed"]).optional(),
   dependsOn: z.string().nullable().optional(),
   hasRiskFlag: z.boolean().optional(),
   riskFlagReason: z.string().nullable().optional()
-});
+}).refine(
+  (data) => {
+    if (data.plannedStart && data.plannedEnd) {
+      const start = new Date(data.plannedStart).getTime();
+      const end = new Date(data.plannedEnd).getTime();
+      return end >= start;
+    }
+    return true;
+  },
+  {
+    message: "Planned end date cannot precede planned start date",
+    path: ["plannedEnd"]
+  }
+);
 var PhaseCreateSchema = z.object({
   name: z.string().trim().min(1, "Phase name is required").max(100, "Phase name cannot exceed 100 characters"),
   plannedStart: z.string().or(z.date()),
@@ -5077,6 +5254,22 @@ var phases_default = router4;
 init_prisma();
 import { Router as Router5 } from "express";
 init_authorizationService();
+function computeEffectivePlannedHours(plannedStart, plannedEnd, plannedHours, frequency, dailyHours) {
+  if (frequency === "DAILY" && dailyHours != null && dailyHours > 0) {
+    const startDayMs = Date.UTC(plannedStart.getUTCFullYear(), plannedStart.getUTCMonth(), plannedStart.getUTCDate());
+    const endDayMs = Date.UTC(plannedEnd.getUTCFullYear(), plannedEnd.getUTCMonth(), plannedEnd.getUTCDate());
+    const inclusiveDays = Math.max(1, Math.floor((endDayMs - startDayMs) / 864e5) + 1);
+    return Math.min(999, Math.round(inclusiveDays * dailyHours));
+  }
+  return plannedHours;
+}
+function resolveEffectiveRank(user) {
+  if (user.roleDefinition?.rank !== void 0) return user.roleDefinition.rank;
+  if (user.role === "CEO" || user.role === "HR") return 1;
+  if (user.role === "CTO" || user.role === "ProjectOwner") return 2;
+  if (user.role === "Intern") return 4;
+  return 3;
+}
 var router5 = Router5();
 var taskListSelect = {
   id: true,
@@ -5088,6 +5281,9 @@ var taskListSelect = {
   plannedEnd: true,
   plannedHours: true,
   actualHours: true,
+  frequency: true,
+  dailyHours: true,
+  completedDates: true,
   state: true,
   dependsOn: true,
   isBaselined: true,
@@ -5411,17 +5607,39 @@ router5.post("/", async (req, res) => {
       });
     }
     const isPostBaseline = !!phase.project.baselineId;
-    if (validation.data.assigneeId) {
+    const canAssignOthers = canAssignProjectTasks(ctx, phase.project);
+    const rawIds = validation.data.assigneeIds && validation.data.assigneeIds.length > 0 ? validation.data.assigneeIds : validation.data.assigneeId ? [validation.data.assigneeId] : [];
+    const dedupedIds = Array.from(new Set(rawIds.filter(Boolean)));
+    let targetAssigneeIds;
+    if (!canAssignOthers) {
+      if (dedupedIds.some((id) => id !== ctx.userId) || dedupedIds.length > 1) {
+        return res.status(403).json({ error: "You can only create tasks assigned to yourself" });
+      }
+      targetAssigneeIds = [ctx.userId];
+    } else {
+      targetAssigneeIds = dedupedIds.length > 0 ? dedupedIds : [null];
+    }
+    const startDt = new Date(validation.data.plannedStart);
+    const endDt = new Date(validation.data.plannedEnd);
+    const frequency = validation.data.frequency || "ONE_TIME";
+    const dailyHours = validation.data.dailyHours ?? null;
+    const effectivePlannedHours = computeEffectivePlannedHours(
+      startDt,
+      endDt,
+      validation.data.plannedHours,
+      frequency,
+      dailyHours
+    );
+    const nonNullAssigneeIds = targetAssigneeIds.filter((id) => Boolean(id));
+    if (nonNullAssigneeIds.length > 0) {
       const now = /* @__PURE__ */ new Date();
-      const taskStart = new Date(validation.data.plannedStart);
-      const taskEnd = new Date(validation.data.plannedEnd);
       const activeLeave = await prisma.leaveRequest.findFirst({
         where: {
-          requestedBy: validation.data.assigneeId,
+          requestedBy: { in: nonNullAssigneeIds },
           status: "Approved",
           OR: [
             { startDate: { lte: now }, endDate: { gte: now } },
-            { startDate: { lte: taskEnd }, endDate: { gte: taskStart } }
+            { startDate: { lte: endDt }, endDate: { gte: startDt } }
           ]
         },
         include: { requester: { select: { name: true } } }
@@ -5432,71 +5650,150 @@ router5.post("/", async (req, res) => {
         });
       }
     }
-    const task = await prisma.task.create({
-      data: {
-        phaseId: validation.data.phaseId,
-        title: validation.data.title,
-        assigneeId: validation.data.assigneeId || null,
-        priority: validation.data.priority,
-        plannedStart: new Date(validation.data.plannedStart),
-        plannedEnd: new Date(validation.data.plannedEnd),
-        plannedHours: validation.data.plannedHours,
-        dependsOn: validation.data.dependsOn || null,
-        isBaselined: !isPostBaseline,
-        state: "Not started"
-      },
-      include: {
-        assignee: { select: { id: true, name: true, avatarUrl: true } },
-        qualityChecks: true
-      }
-    });
-    if (isPostBaseline) {
-      await prisma.changeLogEntry.create({
-        data: {
-          projectId: phase.projectId,
-          what: `Task Added Post-Baseline: ${task.title}`,
-          fromValue: "None",
-          toValue: `Planned: ${task.plannedHours} hrs`,
-          actorId: user.id,
-          sourceType: "TASK_POST_BASELINE",
-          sourceId: task.id,
-          entityType: "TASK",
-          entityId: task.id,
-          action: "CREATE_POST_BASELINE",
-          details: `Task "${task.title}" added to phase "${phase.name}" after project baseline.`,
-          changedBy: user.name
-        }
-      });
-    }
-    if (task.assigneeId) {
-      await prisma.projectMembership.upsert({
-        where: {
-          projectId_userId: {
-            projectId: phase.projectId,
-            userId: task.assigneeId
+    const createdTasks = await prisma.$transaction(async (tx) => {
+      const created = [];
+      for (const targetAssigneeId of targetAssigneeIds) {
+        const t = await tx.task.create({
+          data: {
+            phaseId: validation.data.phaseId,
+            title: validation.data.title,
+            assigneeId: targetAssigneeId,
+            createdById: ctx.userId,
+            priority: validation.data.priority,
+            plannedStart: startDt,
+            plannedEnd: endDt,
+            plannedHours: effectivePlannedHours,
+            frequency,
+            dailyHours,
+            dependsOn: validation.data.dependsOn || null,
+            isBaselined: !isPostBaseline,
+            state: "Not started"
+          },
+          include: {
+            assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
+            qualityChecks: true
           }
-        },
-        update: {},
-        create: {
-          projectId: phase.projectId,
-          userId: task.assigneeId,
-          role: "Member"
+        });
+        created.push(t);
+        if (isPostBaseline) {
+          await tx.changeLogEntry.create({
+            data: {
+              projectId: phase.projectId,
+              what: `Task Added Post-Baseline: ${t.title}`,
+              fromValue: "None",
+              toValue: `Planned: ${t.plannedHours} hrs`,
+              actorId: user.id,
+              sourceType: "TASK_POST_BASELINE",
+              sourceId: t.id,
+              entityType: "TASK",
+              entityId: t.id,
+              action: "CREATE_POST_BASELINE",
+              details: `Task "${t.title}" added to phase "${phase.name}" after project baseline.`,
+              changedBy: user.name
+            }
+          });
         }
+      }
+      for (const assigneeUserId of nonNullAssigneeIds) {
+        await tx.projectMembership.upsert({
+          where: {
+            projectId_userId: {
+              projectId: phase.projectId,
+              userId: assigneeUserId
+            }
+          },
+          update: {},
+          create: {
+            projectId: phase.projectId,
+            userId: assigneeUserId,
+            role: "Member"
+          }
+        });
+      }
+      return created;
+    });
+    const assignedTasks = createdTasks.filter((t) => t.assigneeId && t.assigneeId !== ctx.userId);
+    for (const t of assignedTasks) {
+      void createNotification({
+        userId: t.assigneeId,
+        projectId: phase.projectId,
+        title: "New Task Assigned",
+        message: `You were assigned: "${t.title}" (${t.plannedHours} hrs planned)`,
+        type: "task_assignment",
+        linkUrl: `/projects/${phase.projectId}`
       });
+      if (t.assignee?.email) {
+        void sendTaskAssignmentEmail({
+          to: t.assignee.email,
+          assigneeName: t.assignee.name,
+          assignerName: user.name,
+          projectName: phase.project.name,
+          taskTitle: t.title,
+          priority: t.priority,
+          plannedStart: t.plannedStart,
+          plannedEnd: t.plannedEnd,
+          plannedHours: t.plannedHours,
+          frequency: t.frequency,
+          dailyHours: t.dailyHours
+        });
+      }
     }
-    if (task.assigneeId && task.assigneeId !== user.id) {
-      await prisma.notification.create({
-        data: {
-          userId: task.assigneeId,
-          projectId: phase.projectId,
-          title: "New Task Assigned",
-          message: `You were assigned: "${task.title}" (${task.plannedHours} hrs planned)`,
-          type: "TASK_ASSIGNED",
-          linkUrl: `/projects/${phase.projectId}?tab=tasks&task=${task.id}`
+    const selfTasks = createdTasks.filter((t) => t.assigneeId === ctx.userId);
+    if (selfTasks.length > 0) {
+      void (async () => {
+        try {
+          const [memberships, projectOwner] = await Promise.all([
+            prisma.projectMembership.findMany({
+              where: { projectId: phase.projectId },
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    role: true,
+                    roleDefinition: { select: { rank: true } }
+                  }
+                }
+              }
+            }),
+            prisma.user.findUnique({
+              where: { id: phase.project.ownerId },
+              select: {
+                id: true,
+                role: true,
+                roleDefinition: { select: { rank: true } }
+              }
+            })
+          ]);
+          const candidateMap = /* @__PURE__ */ new Map();
+          if (projectOwner) candidateMap.set(projectOwner.id, projectOwner);
+          for (const m of memberships) {
+            if (m.user) candidateMap.set(m.user.id, m.user);
+          }
+          const selfTask = selfTasks[0];
+          for (const [memberId, memberUser] of candidateMap.entries()) {
+            if (memberId === ctx.userId) continue;
+            const memberRank = resolveEffectiveRank(memberUser);
+            if (memberRank < ctx.roleRank) {
+              await createNotification({
+                userId: memberId,
+                projectId: phase.projectId,
+                title: "New Self-Assigned Task",
+                message: `${user.name} created a self-assigned task "${selfTask.title}" in ${phase.project.name}.`,
+                type: "self_task_created",
+                linkUrl: `/projects/${phase.projectId}`
+              });
+            }
+          }
+        } catch (notifyErr) {
+          console.error("[Tasks] Failed to notify higher-ranked members for self-task:", notifyErr);
         }
-      });
+      })();
     }
-    res.status(201).json(task);
+    res.status(201).json({
+      ...createdTasks[0],
+      tasks: createdTasks,
+      createdCount: createdTasks.length
+    });
   } catch (error) {
     console.error("Failed to create task:", error);
     res.status(500).json({ error: "Failed to create task" });
@@ -5528,6 +5825,29 @@ router5.patch("/:id", async (req, res) => {
     const data = { ...validation.data };
     if (data.plannedStart) data.plannedStart = new Date(data.plannedStart);
     if (data.plannedEnd) data.plannedEnd = new Date(data.plannedEnd);
+    const effectiveStart = data.plannedStart || task.plannedStart;
+    const effectiveEnd = data.plannedEnd || task.plannedEnd;
+    if (effectiveEnd.getTime() < effectiveStart.getTime()) {
+      return res.status(400).json({ error: "End date cannot be earlier than start date" });
+    }
+    if (data.assigneeId !== void 0 && data.assigneeId !== task.assigneeId) {
+      if (!canAssignProjectTasks(ctx, task.phase.project)) {
+        return res.status(403).json({
+          error: "Forbidden: Only CEO, CTO, or the Project Owner can reassign tasks."
+        });
+      }
+    }
+    const effectiveFrequency = data.frequency ?? task.frequency ?? "ONE_TIME";
+    const effectiveDailyHours = data.dailyHours !== void 0 ? data.dailyHours : task.dailyHours;
+    if (effectiveFrequency === "DAILY" && effectiveDailyHours != null && effectiveDailyHours > 0) {
+      data.plannedHours = computeEffectivePlannedHours(
+        effectiveStart,
+        effectiveEnd,
+        data.plannedHours ?? task.plannedHours,
+        effectiveFrequency,
+        effectiveDailyHours
+      );
+    }
     if (data.state === "Completed" && task.state !== "Completed") {
       const completionCheck = await verifyTaskCompletion(task.id);
       if (!completionCheck.allowed) {
@@ -5656,6 +5976,72 @@ router5.post("/:id/state", async (req, res) => {
     res.json(updated);
   } catch (error) {
     res.status(500).json({ error: "Failed to update task state" });
+  }
+});
+router5.post("/:id/daily-toggle", async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const ctx = await getUserHierarchyContext(user.id);
+    const task = await prisma.task.findUnique({
+      where: { id: req.params.id },
+      include: { phase: { include: { project: true } } }
+    });
+    if (!task) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+    if (!canUpdateTask(ctx, task)) {
+      return res.status(403).json({
+        error: "Forbidden: You can only update tasks assigned to you, your subordinates, or on projects you manage."
+      });
+    }
+    const dateStr = typeof req.body?.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.body.date) ? req.body.date : (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const existingDates = Array.isArray(task.completedDates) ? task.completedDates : [];
+    const alreadyDone = existingDates.includes(dateStr);
+    const nextDates = alreadyDone ? existingDates.filter((d) => d !== dateStr) : [...existingDates, dateStr].sort();
+    const dailyStep = Math.round(task.dailyHours || 0);
+    const nextActualHours = Math.max(0, task.actualHours + (alreadyDone ? -dailyStep : dailyStep));
+    const startDayMs = Date.UTC(
+      task.plannedStart.getUTCFullYear(),
+      task.plannedStart.getUTCMonth(),
+      task.plannedStart.getUTCDate()
+    );
+    const endDayMs = Date.UTC(
+      task.plannedEnd.getUTCFullYear(),
+      task.plannedEnd.getUTCMonth(),
+      task.plannedEnd.getUTCDate()
+    );
+    const totalDays = Math.max(1, Math.floor((endDayMs - startDayMs) / 864e5) + 1);
+    let nextState = task.state;
+    if (!alreadyDone) {
+      if (nextDates.length >= totalDays) {
+        const check = await verifyTaskCompletion(task.id);
+        if (check.allowed) nextState = "Completed";
+        else if (task.state === "Not started") nextState = "In progress";
+      } else if (task.state === "Not started") {
+        nextState = "In progress";
+      }
+    } else if (task.state === "Completed" && nextDates.length < totalDays) {
+      nextState = "In progress";
+    }
+    const updated = await prisma.task.update({
+      where: { id: task.id },
+      data: {
+        completedDates: nextDates,
+        actualHours: nextActualHours,
+        state: nextState
+      },
+      include: {
+        assignee: { select: { id: true, name: true, avatarUrl: true } },
+        qualityChecks: true
+      }
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error("Failed to toggle daily task completion:", error);
+    res.status(500).json({ error: "Failed to update daily task completion" });
   }
 });
 router5.post("/:id/risk-flag", async (req, res) => {
@@ -10027,8 +10413,8 @@ var documents_default = router17;
 
 // server/routes/calendar.ts
 init_prisma();
-init_authorizationService();
 import { Router as Router18 } from "express";
+init_authorizationService();
 var router18 = Router18();
 async function getCalendarEvents(user, startDate, endDate) {
   const ctx = await getUserHierarchyContext(user.id);
@@ -10366,22 +10752,52 @@ router18.get("/today", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch today's tasks" });
   }
 });
+router18.get("/reminders/due", requireAuth, async (req, res) => {
+  try {
+    const now = /* @__PURE__ */ new Date();
+    const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1e3);
+    const dueReminders = await prisma.reminder.findMany({
+      where: {
+        userId: req.user.id,
+        dismissedAt: null,
+        remindAt: {
+          gte: thirtyMinsAgo,
+          lte: now
+        }
+      },
+      orderBy: { remindAt: "asc" }
+    });
+    res.json(dueReminders);
+  } catch (error) {
+    console.error("Fetch due reminders error:", error);
+    res.status(500).json({ error: "Failed to fetch due reminders" });
+  }
+});
 router18.post("/reminders", async (req, res) => {
   try {
     const user = req.user;
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    const { title, description, reminderDate } = req.body;
-    if (!title || !reminderDate) {
-      return res.status(400).json({ error: "Title and reminder date are required" });
+    const { title, description, reminderDate, remindAt } = req.body;
+    const rawDate = remindAt ?? reminderDate;
+    if (!title || !rawDate) {
+      return res.status(400).json({ error: "Title and reminder date/time are required" });
+    }
+    const parsedDate = new Date(rawDate);
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: "Invalid reminder date/time" });
+    }
+    if (parsedDate.getTime() <= Date.now() - 6e4) {
+      return res.status(400).json({ error: "Reminder time must be in the future" });
     }
     const reminder = await prisma.reminder.create({
       data: {
         userId: user.id,
         title,
         description,
-        reminderDate: new Date(reminderDate)
+        reminderDate: parsedDate,
+        remindAt: parsedDate
       }
     });
     res.json(reminder);
@@ -10397,19 +10813,34 @@ router18.put("/reminders/:id", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
     const { id } = req.params;
-    const { title, description, reminderDate, isCompleted } = req.body;
+    const { title, description, reminderDate, remindAt, isCompleted } = req.body;
     const existingReminder = await prisma.reminder.findFirst({
       where: { id, userId: user.id }
     });
     if (!existingReminder) {
       return res.status(404).json({ error: "Reminder not found" });
     }
+    const rawDate = remindAt ?? reminderDate;
+    let nextDate;
+    let resetDelivery = false;
+    if (rawDate !== void 0) {
+      const parsed = new Date(rawDate);
+      if (isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: "Invalid reminder date/time" });
+      }
+      nextDate = parsed;
+      if (parsed.getTime() > Date.now() - 6e4) {
+        resetDelivery = true;
+      }
+    }
     const reminder = await prisma.reminder.update({
       where: { id },
       data: {
         title,
         description,
-        reminderDate: reminderDate ? new Date(reminderDate) : void 0,
+        reminderDate: nextDate,
+        remindAt: nextDate,
+        ...resetDelivery ? { triggeredAt: null, emailSentAt: null, dismissedAt: null } : {},
         isCompleted
       }
     });
@@ -10417,6 +10848,31 @@ router18.put("/reminders/:id", async (req, res) => {
   } catch (error) {
     console.error("Update reminder error:", error);
     res.status(500).json({ error: "Failed to update reminder" });
+  }
+});
+router18.patch("/reminders/:id/dismiss", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await prisma.reminder.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: "Reminder not found" });
+    }
+    if (existing.userId !== req.user.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const updated = await prisma.reminder.update({
+      where: { id },
+      data: { dismissedAt: /* @__PURE__ */ new Date() }
+    });
+    try {
+      emitToUser(req.user.id, "reminder:dismissed", { id: updated.id });
+    } catch (socketErr) {
+      console.error("Dismiss reminder socket emit error:", socketErr);
+    }
+    res.json({ id: updated.id, dismissedAt: updated.dismissedAt });
+  } catch (error) {
+    console.error("Dismiss reminder error:", error);
+    res.status(500).json({ error: "Failed to dismiss reminder" });
   }
 });
 router18.delete("/reminders/:id", async (req, res) => {
@@ -11864,6 +12320,71 @@ router22.delete("/:id/withdraw", requireAuth, handleWithdraw);
 router22.delete("/:id", requireAuth, handleWithdraw);
 var leave_default = router22;
 
+// server/services/reminderService.ts
+init_prisma();
+var isProcessing = false;
+async function processDueReminders() {
+  if (isProcessing) {
+    return { processed: 0, emailsSent: 0 };
+  }
+  isProcessing = true;
+  let processed = 0;
+  let emailsSent = 0;
+  try {
+    const now = /* @__PURE__ */ new Date();
+    const dueReminders = await prisma.reminder.findMany({
+      where: {
+        remindAt: { lte: now },
+        triggeredAt: null
+      },
+      take: 20,
+      orderBy: { remindAt: "asc" },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true }
+        }
+      }
+    });
+    for (const r of dueReminders) {
+      const claimed = await prisma.reminder.updateMany({
+        where: { id: r.id, triggeredAt: null },
+        data: { triggeredAt: /* @__PURE__ */ new Date() }
+      });
+      if (claimed.count !== 1) continue;
+      processed++;
+      if (r.user?.email && r.remindAt) {
+        const sent = await sendReminderEmail({
+          to: r.user.email,
+          userName: r.user.name,
+          title: r.title,
+          description: r.description,
+          remindAt: r.remindAt
+        });
+        if (sent) {
+          await prisma.reminder.update({
+            where: { id: r.id },
+            data: { emailSentAt: /* @__PURE__ */ new Date() }
+          });
+          emailsSent++;
+        }
+      }
+      try {
+        emitToUser(r.userId, "reminder:due", {
+          id: r.id,
+          title: r.title,
+          description: r.description,
+          remindAt: r.remindAt
+        });
+      } catch (socketErr) {
+        console.error("[ReminderService] Socket emit failed:", socketErr);
+      }
+    }
+    return { processed, emailsSent };
+  } finally {
+    isProcessing = false;
+  }
+}
+
 // server.ts
 if (!process.env.DATABASE_URL || !process.env.APP_URL) {
   dotenv2.config({ path: path4.join(process.cwd(), "backend", ".env") });
@@ -11940,15 +12461,42 @@ app.use("/api/projects", budget_default);
 app.use("/api/portfolio", portfolio_default);
 app.use("/api", documents_default);
 app.use("/api/leave", leave_default);
+app.post("/api/internal/process-reminders", async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    const result = await processDueReminders();
+    return res.json(result);
+  } catch (error) {
+    console.error("[Internal] process-reminders failed:", error);
+    return res.status(500).json({ error: "Failed to process reminders" });
+  }
+});
 if (!process.env.VERCEL && process.env.NODE_ENV !== "test") {
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 5e3;
+  let reminderPoller = null;
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(
       `
   \u279C API Server running on: http://localhost:${PORT}
 `
     );
+    if (process.env.ENABLE_REMINDER_POLLER !== "false") {
+      reminderPoller = setInterval(() => {
+        processDueReminders().catch(console.error);
+      }, 3e4);
+    }
   });
+  const stopPoller = () => {
+    if (reminderPoller) {
+      clearInterval(reminderPoller);
+      reminderPoller = null;
+    }
+  };
+  process.on("SIGINT", stopPoller);
+  process.on("SIGTERM", stopPoller);
 }
 var server_default = app;
 export {

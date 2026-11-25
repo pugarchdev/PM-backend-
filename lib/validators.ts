@@ -5,10 +5,13 @@ export const TaskCreateSchema = z
     title: z.string().trim().min(1, 'Title is required').max(120, 'Title cannot exceed 120 characters'),
     phaseId: z.string().min(1, 'Phase is required'),
     assigneeId: z.string().nullable().optional(),
+    assigneeIds: z.array(z.string().min(1)).max(50).optional(),
     priority: z.enum(['Low', 'Normal', 'High']).default('Normal'),
     plannedStart: z.string().or(z.date()),
     plannedEnd: z.string().or(z.date()),
     plannedHours: z.coerce.number().int('Hours must be an integer').min(0, 'Min hours is 0').max(999, 'Max hours is 999'),
+    frequency: z.enum(['ONE_TIME', 'DAILY', 'WEEKLY']).optional().default('ONE_TIME'),
+    dailyHours: z.number().min(0.5).max(24).nullable().optional(),
     dependsOn: z.string().nullable().optional(),
   })
   .refine(
@@ -23,20 +26,37 @@ export const TaskCreateSchema = z
     }
   );
 
-export const TaskUpdateSchema = z.object({
-  title: z.string().trim().min(1, 'Title is required').max(120, 'Title cannot exceed 120 characters').optional(),
-  phaseId: z.string().min(1, 'Phase is required').optional(),
-  assigneeId: z.string().nullable().optional(),
-  priority: z.enum(['Low', 'Normal', 'High']).optional(),
-  plannedStart: z.string().or(z.date()).optional(),
-  plannedEnd: z.string().or(z.date()).optional(),
-  plannedHours: z.coerce.number().int().min(0).max(999).optional(),
-  actualHours: z.coerce.number().int().min(0).optional(),
-  state: z.enum(['Not started', 'In progress', 'Blocked', 'Completed']).optional(),
-  dependsOn: z.string().nullable().optional(),
-  hasRiskFlag: z.boolean().optional(),
-  riskFlagReason: z.string().nullable().optional(),
-});
+export const TaskUpdateSchema = z
+  .object({
+    title: z.string().trim().min(1, 'Title is required').max(120, 'Title cannot exceed 120 characters').optional(),
+    phaseId: z.string().min(1, 'Phase is required').optional(),
+    assigneeId: z.string().nullable().optional(),
+    priority: z.enum(['Low', 'Normal', 'High']).optional(),
+    plannedStart: z.string().or(z.date()).optional(),
+    plannedEnd: z.string().or(z.date()).optional(),
+    plannedHours: z.coerce.number().int().min(0).max(999).optional(),
+    actualHours: z.coerce.number().int().min(0).optional(),
+    frequency: z.enum(['ONE_TIME', 'DAILY', 'WEEKLY']).optional(),
+    dailyHours: z.number().min(0.5).max(24).nullable().optional(),
+    state: z.enum(['Not started', 'In progress', 'Blocked', 'Completed']).optional(),
+    dependsOn: z.string().nullable().optional(),
+    hasRiskFlag: z.boolean().optional(),
+    riskFlagReason: z.string().nullable().optional(),
+  })
+  .refine(
+    (data) => {
+      if (data.plannedStart && data.plannedEnd) {
+        const start = new Date(data.plannedStart).getTime();
+        const end = new Date(data.plannedEnd).getTime();
+        return end >= start;
+      }
+      return true;
+    },
+    {
+      message: 'Planned end date cannot precede planned start date',
+      path: ['plannedEnd'],
+    }
+  );
 
 export const PhaseCreateSchema = z
   .object({

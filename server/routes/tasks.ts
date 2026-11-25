@@ -8,7 +8,34 @@ import {
   canViewTask,
   canUpdateTask,
   canDeleteTask,
+  canAssignProjectTasks,
 } from '../services/authorizationService.js';
+import { createNotification } from '../services/notificationService.js';
+import { sendTaskAssignmentEmail } from '../services/emailService.js';
+
+function computeEffectivePlannedHours(
+  plannedStart: Date,
+  plannedEnd: Date,
+  plannedHours: number,
+  frequency?: string,
+  dailyHours?: number | null
+): number {
+  if (frequency === 'DAILY' && dailyHours != null && dailyHours > 0) {
+    const startDayMs = Date.UTC(plannedStart.getUTCFullYear(), plannedStart.getUTCMonth(), plannedStart.getUTCDate());
+    const endDayMs = Date.UTC(plannedEnd.getUTCFullYear(), plannedEnd.getUTCMonth(), plannedEnd.getUTCDate());
+    const inclusiveDays = Math.max(1, Math.floor((endDayMs - startDayMs) / 86400000) + 1);
+    return Math.min(999, Math.round(inclusiveDays * dailyHours));
+  }
+  return plannedHours;
+}
+
+function resolveEffectiveRank(user: { role?: string | null; roleDefinition?: { rank: number } | null }): number {
+  if (user.roleDefinition?.rank !== undefined) return user.roleDefinition.rank;
+  if (user.role === 'CEO' || user.role === 'HR') return 1;
+  if (user.role === 'CTO' || user.role === 'ProjectOwner') return 2;
+  if (user.role === 'Intern') return 4;
+  return 3;
+}
 
 const router = Router();
 
@@ -23,6 +50,9 @@ const taskListSelect = {
   plannedEnd: true,
   plannedHours: true,
   actualHours: true,
+  frequency: true,
+  dailyHours: true,
+  completedDates: true,
   state: true,
   dependsOn: true,
   isBaselined: true,
@@ -393,19 +423,49 @@ router.post('/', async (req: AuthRequest, res: Response) => {
     }
 
     const isPostBaseline = !!phase.project.baselineId;
+    const canAssignOthers = canAssignProjectTasks(ctx, phase.project);
 
-    if (validation.data.assigneeId) {
+    const rawIds =
+      validation.data.assigneeIds && validation.data.assigneeIds.length > 0
+        ? validation.data.assigneeIds
+        : validation.data.assigneeId
+          ? [validation.data.assigneeId]
+          : [];
+    const dedupedIds = Array.from(new Set(rawIds.filter(Boolean)));
+
+    let targetAssigneeIds: (string | null)[];
+    if (!canAssignOthers) {
+      if (dedupedIds.some((id) => id !== ctx.userId) || dedupedIds.length > 1) {
+        return res.status(403).json({ error: 'You can only create tasks assigned to yourself' });
+      }
+      targetAssigneeIds = [ctx.userId];
+    } else {
+      targetAssigneeIds = dedupedIds.length > 0 ? dedupedIds : [null];
+    }
+
+    const startDt = new Date(validation.data.plannedStart);
+    const endDt = new Date(validation.data.plannedEnd);
+    const frequency = validation.data.frequency || 'ONE_TIME';
+    const dailyHours = validation.data.dailyHours ?? null;
+    const effectivePlannedHours = computeEffectivePlannedHours(
+      startDt,
+      endDt,
+      validation.data.plannedHours,
+      frequency,
+      dailyHours
+    );
+
+    const nonNullAssigneeIds = targetAssigneeIds.filter((id): id is string => Boolean(id));
+    if (nonNullAssigneeIds.length > 0) {
       const now = new Date();
-      const taskStart = new Date(validation.data.plannedStart);
-      const taskEnd = new Date(validation.data.plannedEnd);
 
       const activeLeave = await prisma.leaveRequest.findFirst({
         where: {
-          requestedBy: validation.data.assigneeId,
+          requestedBy: { in: nonNullAssigneeIds },
           status: 'Approved',
           OR: [
             { startDate: { lte: now }, endDate: { gte: now } },
-            { startDate: { lte: taskEnd }, endDate: { gte: taskStart } },
+            { startDate: { lte: endDt }, endDate: { gte: startDt } },
           ],
         },
         include: { requester: { select: { name: true } } },
@@ -418,78 +478,161 @@ router.post('/', async (req: AuthRequest, res: Response) => {
       }
     }
 
-    const task = await prisma.task.create({
-      data: {
-        phaseId: validation.data.phaseId,
-        title: validation.data.title,
-        assigneeId: validation.data.assigneeId || null,
-        priority: validation.data.priority,
-        plannedStart: new Date(validation.data.plannedStart),
-        plannedEnd: new Date(validation.data.plannedEnd),
-        plannedHours: validation.data.plannedHours,
-        dependsOn: validation.data.dependsOn || null,
-        isBaselined: !isPostBaseline,
-        state: 'Not started',
-      },
-      include: {
-        assignee: { select: { id: true, name: true, avatarUrl: true } },
-        qualityChecks: true,
-      },
+    const createdTasks = await prisma.$transaction(async (tx) => {
+      const created: any[] = [];
+      for (const targetAssigneeId of targetAssigneeIds) {
+        const t = await tx.task.create({
+          data: {
+            phaseId: validation.data.phaseId,
+            title: validation.data.title,
+            assigneeId: targetAssigneeId,
+            createdById: ctx.userId,
+            priority: validation.data.priority,
+            plannedStart: startDt,
+            plannedEnd: endDt,
+            plannedHours: effectivePlannedHours,
+            frequency,
+            dailyHours,
+            dependsOn: validation.data.dependsOn || null,
+            isBaselined: !isPostBaseline,
+            state: 'Not started',
+          },
+          include: {
+            assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
+            qualityChecks: true,
+          },
+        });
+        created.push(t);
+
+        if (isPostBaseline) {
+          await tx.changeLogEntry.create({
+            data: {
+              projectId: phase.projectId,
+              what: `Task Added Post-Baseline: ${t.title}`,
+              fromValue: 'None',
+              toValue: `Planned: ${t.plannedHours} hrs`,
+              actorId: user.id,
+              sourceType: 'TASK_POST_BASELINE',
+              sourceId: t.id,
+              entityType: 'TASK',
+              entityId: t.id,
+              action: 'CREATE_POST_BASELINE',
+              details: `Task "${t.title}" added to phase "${phase.name}" after project baseline.`,
+              changedBy: user.name,
+            },
+          });
+        }
+      }
+
+      for (const assigneeUserId of nonNullAssigneeIds) {
+        await tx.projectMembership.upsert({
+          where: {
+            projectId_userId: {
+              projectId: phase.projectId,
+              userId: assigneeUserId,
+            },
+          },
+          update: {},
+          create: {
+            projectId: phase.projectId,
+            userId: assigneeUserId,
+            role: 'Member',
+          },
+        });
+      }
+
+      return created;
     });
 
-    // If created after baseline, creates a ChangeLogEntry
-    if (isPostBaseline) {
-      await prisma.changeLogEntry.create({
-        data: {
-          projectId: phase.projectId,
-          what: `Task Added Post-Baseline: ${task.title}`,
-          fromValue: 'None',
-          toValue: `Planned: ${task.plannedHours} hrs`,
-          actorId: user.id,
-          sourceType: 'TASK_POST_BASELINE',
-          sourceId: task.id,
-          entityType: 'TASK',
-          entityId: task.id,
-          action: 'CREATE_POST_BASELINE',
-          details: `Task "${task.title}" added to phase "${phase.name}" after project baseline.`,
-          changedBy: user.name,
-        },
+    // Post-transaction notifications & email (non-blocking)
+    const assignedTasks = createdTasks.filter((t) => t.assigneeId && t.assigneeId !== ctx.userId);
+    for (const t of assignedTasks) {
+      void createNotification({
+        userId: t.assigneeId!,
+        projectId: phase.projectId,
+        title: 'New Task Assigned',
+        message: `You were assigned: "${t.title}" (${t.plannedHours} hrs planned)`,
+        type: 'task_assignment',
+        linkUrl: `/projects/${phase.projectId}`,
       });
+
+      if (t.assignee?.email) {
+        void sendTaskAssignmentEmail({
+          to: t.assignee.email,
+          assigneeName: t.assignee.name,
+          assignerName: user.name,
+          projectName: phase.project.name,
+          taskTitle: t.title,
+          priority: t.priority,
+          plannedStart: t.plannedStart,
+          plannedEnd: t.plannedEnd,
+          plannedHours: t.plannedHours,
+          frequency: t.frequency,
+          dailyHours: t.dailyHours,
+        });
+      }
     }
 
-    // If assigned to a user, ensure they have project membership so they can see the project
-    if (task.assigneeId) {
-      await prisma.projectMembership.upsert({
-        where: {
-          projectId_userId: {
-            projectId: phase.projectId,
-            userId: task.assigneeId,
-          },
-        },
-        update: {},
-        create: {
-          projectId: phase.projectId,
-          userId: task.assigneeId,
-          role: 'Member',
-        },
-      });
+    // Self-task notification to higher-ranked project members (no email)
+    const selfTasks = createdTasks.filter((t) => t.assigneeId === ctx.userId);
+    if (selfTasks.length > 0) {
+      void (async () => {
+        try {
+          const [memberships, projectOwner] = await Promise.all([
+            prisma.projectMembership.findMany({
+              where: { projectId: phase.projectId },
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    role: true,
+                    roleDefinition: { select: { rank: true } },
+                  },
+                },
+              },
+            }),
+            prisma.user.findUnique({
+              where: { id: phase.project.ownerId },
+              select: {
+                id: true,
+                role: true,
+                roleDefinition: { select: { rank: true } },
+              },
+            }),
+          ]);
+
+          const candidateMap = new Map<string, { id: string; role?: string | null; roleDefinition?: { rank: number } | null }>();
+          if (projectOwner) candidateMap.set(projectOwner.id, projectOwner);
+          for (const m of memberships) {
+            if (m.user) candidateMap.set(m.user.id, m.user);
+          }
+
+          const selfTask = selfTasks[0];
+          for (const [memberId, memberUser] of candidateMap.entries()) {
+            if (memberId === ctx.userId) continue;
+            const memberRank = resolveEffectiveRank(memberUser);
+            if (memberRank < ctx.roleRank) {
+              await createNotification({
+                userId: memberId,
+                projectId: phase.projectId,
+                title: 'New Self-Assigned Task',
+                message: `${user.name} created a self-assigned task "${selfTask.title}" in ${phase.project.name}.`,
+                type: 'self_task_created',
+                linkUrl: `/projects/${phase.projectId}`,
+              });
+            }
+          }
+        } catch (notifyErr) {
+          console.error('[Tasks] Failed to notify higher-ranked members for self-task:', notifyErr);
+        }
+      })();
     }
 
-    // Send notification if assigned to another user
-    if (task.assigneeId && task.assigneeId !== user.id) {
-      await prisma.notification.create({
-        data: {
-          userId: task.assigneeId,
-          projectId: phase.projectId,
-          title: 'New Task Assigned',
-          message: `You were assigned: "${task.title}" (${task.plannedHours} hrs planned)`,
-          type: 'TASK_ASSIGNED',
-          linkUrl: `/projects/${phase.projectId}?tab=tasks&task=${task.id}`,
-        },
-      });
-    }
-
-    res.status(201).json(task);
+    res.status(201).json({
+      ...createdTasks[0],
+      tasks: createdTasks,
+      createdCount: createdTasks.length,
+    });
   } catch (error: any) {
     console.error('Failed to create task:', error);
     res.status(500).json({ error: 'Failed to create task' });
@@ -529,6 +672,32 @@ router.patch('/:id', async (req: AuthRequest, res: Response) => {
     const data: any = { ...validation.data };
     if (data.plannedStart) data.plannedStart = new Date(data.plannedStart);
     if (data.plannedEnd) data.plannedEnd = new Date(data.plannedEnd);
+
+    const effectiveStart = data.plannedStart || task.plannedStart;
+    const effectiveEnd = data.plannedEnd || task.plannedEnd;
+    if (effectiveEnd.getTime() < effectiveStart.getTime()) {
+      return res.status(400).json({ error: 'End date cannot be earlier than start date' });
+    }
+
+    if (data.assigneeId !== undefined && data.assigneeId !== task.assigneeId) {
+      if (!canAssignProjectTasks(ctx, task.phase.project)) {
+        return res.status(403).json({
+          error: 'Forbidden: Only CEO, CTO, or the Project Owner can reassign tasks.',
+        });
+      }
+    }
+
+    const effectiveFrequency = data.frequency ?? (task as any).frequency ?? 'ONE_TIME';
+    const effectiveDailyHours = data.dailyHours !== undefined ? data.dailyHours : (task as any).dailyHours;
+    if (effectiveFrequency === 'DAILY' && effectiveDailyHours != null && effectiveDailyHours > 0) {
+      data.plannedHours = computeEffectivePlannedHours(
+        effectiveStart,
+        effectiveEnd,
+        data.plannedHours ?? task.plannedHours,
+        effectiveFrequency,
+        effectiveDailyHours
+      );
+    }
 
     // If state change to Completed is attempted here, verify completion rules
     if (data.state === 'Completed' && task.state !== 'Completed') {
@@ -686,6 +855,91 @@ router.post('/:id/state', async (req: AuthRequest, res: Response) => {
     res.json(updated);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to update task state' });
+  }
+});
+
+// POST /api/tasks/:id/daily-toggle - Toggle single-day completion for a DAILY task
+router.post('/:id/daily-toggle', async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const ctx = await getUserHierarchyContext(user.id);
+    const task = await prisma.task.findUnique({
+      where: { id: req.params.id },
+      include: { phase: { include: { project: true } } },
+    });
+
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    if (!canUpdateTask(ctx, task)) {
+      return res.status(403).json({
+        error: 'Forbidden: You can only update tasks assigned to you, your subordinates, or on projects you manage.',
+      });
+    }
+
+    const dateStr =
+      typeof req.body?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.date)
+        ? req.body.date
+        : new Date().toISOString().slice(0, 10);
+
+    const existingDates: string[] = Array.isArray((task as any).completedDates)
+      ? (task as any).completedDates
+      : [];
+    const alreadyDone = existingDates.includes(dateStr);
+    const nextDates = alreadyDone
+      ? existingDates.filter((d) => d !== dateStr)
+      : [...existingDates, dateStr].sort();
+
+    const dailyStep = Math.round((task as any).dailyHours || 0);
+    const nextActualHours = Math.max(0, task.actualHours + (alreadyDone ? -dailyStep : dailyStep));
+
+    const startDayMs = Date.UTC(
+      task.plannedStart.getUTCFullYear(),
+      task.plannedStart.getUTCMonth(),
+      task.plannedStart.getUTCDate()
+    );
+    const endDayMs = Date.UTC(
+      task.plannedEnd.getUTCFullYear(),
+      task.plannedEnd.getUTCMonth(),
+      task.plannedEnd.getUTCDate()
+    );
+    const totalDays = Math.max(1, Math.floor((endDayMs - startDayMs) / 86400000) + 1);
+
+    let nextState = task.state;
+    if (!alreadyDone) {
+      if (nextDates.length >= totalDays) {
+        const check = await verifyTaskCompletion(task.id);
+        if (check.allowed) nextState = 'Completed';
+        else if (task.state === 'Not started') nextState = 'In progress';
+      } else if (task.state === 'Not started') {
+        nextState = 'In progress';
+      }
+    } else if (task.state === 'Completed' && nextDates.length < totalDays) {
+      nextState = 'In progress';
+    }
+
+    const updated = await prisma.task.update({
+      where: { id: task.id },
+      data: {
+        completedDates: nextDates,
+        actualHours: nextActualHours,
+        state: nextState,
+      },
+      include: {
+        assignee: { select: { id: true, name: true, avatarUrl: true } },
+        qualityChecks: true,
+      },
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    console.error('Failed to toggle daily task completion:', error);
+    res.status(500).json({ error: 'Failed to update daily task completion' });
   }
 });
 

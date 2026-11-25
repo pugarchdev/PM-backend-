@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { AuthRequest, AuthenticatedUser } from '../auth.js';
+import { AuthRequest, AuthenticatedUser, requireAuth } from '../auth.js';
+import { emitToUser } from '../socket.js';
 
 const router = Router();
 
@@ -377,6 +378,31 @@ router.get('/today', async (req: AuthRequest, res: Response) => {
   }
 });
 
+// GET /api/calendar/reminders/due - Fetch undismissed due reminders within the last 30 minutes
+router.get('/reminders/due', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const now = new Date();
+    const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
+
+    const dueReminders = await prisma.reminder.findMany({
+      where: {
+        userId: req.user!.id,
+        dismissedAt: null,
+        remindAt: {
+          gte: thirtyMinsAgo,
+          lte: now,
+        },
+      },
+      orderBy: { remindAt: 'asc' },
+    });
+
+    res.json(dueReminders);
+  } catch (error: any) {
+    console.error('Fetch due reminders error:', error);
+    res.status(500).json({ error: 'Failed to fetch due reminders' });
+  }
+});
+
 // POST /api/calendar/reminders - Create a new personal reminder
 router.post('/reminders', async (req: AuthRequest, res: Response) => {
   try {
@@ -385,10 +411,20 @@ router.post('/reminders', async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { title, description, reminderDate } = req.body;
-    
-    if (!title || !reminderDate) {
-      return res.status(400).json({ error: 'Title and reminder date are required' });
+    const { title, description, reminderDate, remindAt } = req.body;
+    const rawDate = remindAt ?? reminderDate;
+
+    if (!title || !rawDate) {
+      return res.status(400).json({ error: 'Title and reminder date/time are required' });
+    }
+
+    const parsedDate = new Date(rawDate);
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid reminder date/time' });
+    }
+
+    if (parsedDate.getTime() <= Date.now() - 60_000) {
+      return res.status(400).json({ error: 'Reminder time must be in the future' });
     }
 
     const reminder = await prisma.reminder.create({
@@ -396,7 +432,8 @@ router.post('/reminders', async (req: AuthRequest, res: Response) => {
         userId: user.id,
         title,
         description,
-        reminderDate: new Date(reminderDate),
+        reminderDate: parsedDate,
+        remindAt: parsedDate,
       },
     });
 
@@ -416,7 +453,7 @@ router.put('/reminders/:id', async (req: AuthRequest, res: Response) => {
     }
 
     const { id } = req.params;
-    const { title, description, reminderDate, isCompleted } = req.body;
+    const { title, description, reminderDate, remindAt, isCompleted } = req.body;
 
     // Verify the reminder belongs to the user
     const existingReminder = await prisma.reminder.findFirst({
@@ -427,12 +464,31 @@ router.put('/reminders/:id', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Reminder not found' });
     }
 
+    const rawDate = remindAt ?? reminderDate;
+    let nextDate: Date | undefined;
+    let resetDelivery = false;
+
+    if (rawDate !== undefined) {
+      const parsed = new Date(rawDate);
+      if (isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: 'Invalid reminder date/time' });
+      }
+      nextDate = parsed;
+      if (parsed.getTime() > Date.now() - 60_000) {
+        resetDelivery = true;
+      }
+    }
+
     const reminder = await prisma.reminder.update({
       where: { id },
       data: {
         title,
         description,
-        reminderDate: reminderDate ? new Date(reminderDate) : undefined,
+        reminderDate: nextDate,
+        remindAt: nextDate,
+        ...(resetDelivery
+          ? { triggeredAt: null, emailSentAt: null, dismissedAt: null }
+          : {}),
         isCompleted,
       },
     });
@@ -441,6 +497,38 @@ router.put('/reminders/:id', async (req: AuthRequest, res: Response) => {
   } catch (error: any) {
     console.error('Update reminder error:', error);
     res.status(500).json({ error: 'Failed to update reminder' });
+  }
+});
+
+// PATCH /api/calendar/reminders/:id/dismiss - Dismiss a due reminder popup
+router.patch('/reminders/:id/dismiss', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const existing = await prisma.reminder.findUnique({ where: { id } });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Reminder not found' });
+    }
+
+    if (existing.userId !== req.user!.id) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const updated = await prisma.reminder.update({
+      where: { id },
+      data: { dismissedAt: new Date() },
+    });
+
+    try {
+      emitToUser(req.user!.id, 'reminder:dismissed', { id: updated.id });
+    } catch (socketErr) {
+      console.error('Dismiss reminder socket emit error:', socketErr);
+    }
+
+    res.json({ id: updated.id, dismissedAt: updated.dismissedAt });
+  } catch (error: any) {
+    console.error('Dismiss reminder error:', error);
+    res.status(500).json({ error: 'Failed to dismiss reminder' });
   }
 });
 

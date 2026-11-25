@@ -50,6 +50,7 @@ model User {
   risksOwned                Risk[]              @relation("RiskOwner")
   statusOverrides           StatusOverrideLog[]
   tasks                     Task[]              @relation("TaskAssignee")
+  createdTasks              Task[]              @relation("TaskCreator")
   permission                Permission?         @relation("UserPermission")
   updatedPermissions        Permission[]        @relation("UpdatedPermissions")
 
@@ -185,11 +186,15 @@ model Task {
   phaseId        String
   title          String
   assigneeId     String?
+  createdById    String?
   priority       String         @default("Normal")
   plannedStart   DateTime
   plannedEnd     DateTime
   plannedHours   Int            @default(0)
   actualHours    Int            @default(0)
+  frequency      String         @default("ONE_TIME") // "ONE_TIME" | "DAILY" | "WEEKLY"
+  dailyHours     Float?
+  completedDates String[]       @default([])
   state          String         @default("Not started")
   dependsOn      String?
   isBaselined    Boolean        @default(false)
@@ -201,10 +206,12 @@ model Task {
   qualityChecks  QualityCheck[]
   risks          Risk[]
   assignee       User?          @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  createdBy      User?          @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
   phase          Phase          @relation(fields: [phaseId], references: [id], onDelete: Cascade)
 
   @@index([phaseId])
   @@index([assigneeId])
+  @@index([createdById])
   @@index([state])
 }
 
@@ -490,17 +497,23 @@ model DocumentVersion {
 }
 
 model Reminder {
-  id           String   @id @default(cuid())
+  id           String    @id @default(cuid())
   userId       String
   title        String
   description  String?
   reminderDate DateTime
-  isCompleted  Boolean  @default(false)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  remindAt     DateTime?
+  triggeredAt  DateTime?
+  emailSentAt  DateTime?
+  dismissedAt  DateTime?
+  isCompleted  Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, reminderDate])
+  @@index([triggeredAt, remindAt])
+  @@index([userId, dismissedAt, remindAt])
 }
 
 model LeaveRequest {

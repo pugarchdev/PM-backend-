@@ -812,3 +812,212 @@ export async function dispatchLeaveSubmissionEmails(params: {
     errors,
   };
 }
+
+export interface SendTaskAssignmentEmailParams {
+  to: string;
+  assigneeName: string;
+  assignerName: string;
+  projectName: string;
+  taskTitle: string;
+  priority: string;
+  plannedStart: Date;
+  plannedEnd: Date;
+  plannedHours: number;
+  frequency?: string;
+  dailyHours?: number | null;
+}
+
+/**
+ * Dispatches a task assignment email notification.
+ * Failures are logged and never thrown so task creation is never blocked.
+ */
+export async function sendTaskAssignmentEmail(
+  params: SendTaskAssignmentEmailParams
+): Promise<{ delivered: boolean; mockLogged?: boolean }> {
+  try {
+    const {
+      to,
+      assigneeName,
+      assignerName,
+      projectName,
+      taskTitle,
+      priority,
+      plannedStart,
+      plannedEnd,
+      plannedHours,
+      frequency = 'ONE_TIME',
+      dailyHours,
+    } = params;
+
+    const from = getFromAddress();
+    const transporter = getTransporter();
+    const portalUrl = resolvePortalUrl();
+
+    const fmtDate = (d: Date) =>
+      new Date(d).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+
+    const startStr = fmtDate(plannedStart);
+    const endStr = fmtDate(plannedEnd);
+    const scheduleLabel =
+      frequency === 'DAILY' && dailyHours
+        ? `Daily (${dailyHours} hrs/day, ${plannedHours} hrs total)`
+        : frequency === 'WEEKLY'
+          ? `Weekly (${plannedHours} hrs planned)`
+          : `One-time (${plannedHours} hrs planned)`;
+
+    const subject = `New Task Assigned: ${taskTitle} (${projectName})`;
+    const text = `
+Hello ${assigneeName || 'Team Member'},
+
+${assignerName} has assigned you a new task in "${projectName}":
+
+Task: ${taskTitle}
+Priority: ${priority}
+Schedule: ${startStr} to ${endStr}
+Effort: ${scheduleLabel}
+
+View your tasks on PugArch: ${portalUrl}/projects
+
+—
+PugArch Projects Cloud
+`.trim();
+
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background-color:#F7F4ED;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#F7F4ED;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background-color:#FFFFFF;border-radius:20px;border:1px solid #EAE3D5;overflow:hidden;">
+          <tr>
+            <td style="padding:24px 28px;border-bottom:1px solid #F0EAE0;background-color:#FBF9F4;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#C85A32;">Task Assignment</div>
+              <h1 style="margin:6px 0 0;font-size:20px;line-height:1.3;color:#231E1B;">${taskTitle}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 28px;font-size:14px;line-height:1.6;color:#4B443D;">
+              <p style="margin:0 0 16px;">Hello <strong>${assigneeName || 'Team Member'}</strong>,</p>
+              <p style="margin:0 0 16px;"><strong>${assignerName}</strong> assigned you a task in <strong>${projectName}</strong>.</p>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#FAF8F4;border:1px solid #EBE4D5;border-radius:12px;padding:14px 16px;margin-bottom:20px;font-size:13px;">
+                <tr><td style="padding:4px 0;color:#70675D;width:110px;">Priority</td><td style="padding:4px 0;font-weight:600;color:#231E1B;">${priority}</td></tr>
+                <tr><td style="padding:4px 0;color:#70675D;">Dates</td><td style="padding:4px 0;font-weight:600;color:#231E1B;">${startStr} – ${endStr}</td></tr>
+                <tr><td style="padding:4px 0;color:#70675D;">Effort</td><td style="padding:4px 0;font-weight:600;color:#231E1B;">${scheduleLabel}</td></tr>
+              </table>
+              <a href="${portalUrl}/projects" style="display:inline-block;padding:10px 20px;background-color:#C85A32;color:#FFFFFF;text-decoration:none;border-radius:999px;font-size:13px;font-weight:600;">Open PugArch Projects</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`.trim();
+
+    if (!transporter) {
+      console.log(`[EmailService] SMTP unconfigured — mock task assignment email to ${to}: ${subject}`);
+      return { delivered: false, mockLogged: true };
+    }
+
+    await transporter.sendMail({ from, to, subject, text, html });
+    return { delivered: true };
+  } catch (err: any) {
+    console.error('[EmailService] Failed to send task assignment email:', err?.message || err);
+    return { delivered: false };
+  }
+}
+
+export interface SendReminderEmailParams {
+  to: string;
+  userName: string;
+  title: string;
+  description?: string | null;
+  remindAt: Date;
+}
+
+/**
+ * Dispatches a scheduled personal reminder email.
+ * Never throws; returns true on delivery and false otherwise.
+ */
+export async function sendReminderEmail(params: SendReminderEmailParams): Promise<boolean> {
+  try {
+    const { to, userName, title, description, remindAt } = params;
+    const from = getFromAddress();
+    const transporter = getTransporter();
+    const portalUrl = resolvePortalUrl();
+
+    const formattedTime = new Date(remindAt).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    const subject = `Reminder: ${title}`;
+    const text = [
+      `Hello ${userName || 'Team Member'},`,
+      '',
+      `This is your scheduled reminder: ${title}`,
+      description ? `Details: ${description}` : '',
+      `Scheduled for: ${formattedTime}`,
+      '',
+      `Open PugArch Calendar: ${portalUrl}/calendar`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background-color:#F7F4ED;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#231E1B;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#F7F4ED;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background-color:#FFFFFF;border-radius:20px;border:1px solid #EAE3D5;overflow:hidden;">
+          <tr>
+            <td style="padding:24px 28px;border-bottom:1px solid #F0EAE0;background-color:#FBF9F4;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#C85A32;">Personal Reminder</div>
+              <h1 style="margin:6px 0 0;font-size:20px;line-height:1.3;color:#231E1B;">${title}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 28px;font-size:14px;line-height:1.6;color:#4B443D;">
+              <p style="margin:0 0 14px;">Hello <strong>${userName || 'Team Member'}</strong>,</p>
+              ${description ? `<p style="margin:0 0 16px;padding:12px 14px;background-color:#FAF8F4;border:1px solid #EBE4D5;border-radius:12px;font-size:13px;">${description}</p>` : ''}
+              <p style="margin:0 0 20px;font-size:13px;color:#70675D;">Scheduled time: <strong style="color:#231E1B;">${formattedTime}</strong></p>
+              <a href="${portalUrl}/calendar" style="display:inline-block;padding:10px 20px;background-color:#C85A32;color:#FFFFFF;text-decoration:none;border-radius:999px;font-size:13px;font-weight:600;">Open Calendar</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`.trim();
+
+    if (!transporter) {
+      console.log(`[EmailService] SMTP unconfigured — mock reminder email to ${to}: ${subject}`);
+      return false;
+    }
+
+    await transporter.sendMail({ from, to, subject, text, html });
+    return true;
+  } catch (err: any) {
+    console.error('[EmailService] Failed to send reminder email:', err?.message || err);
+    return false;
+  }
+}

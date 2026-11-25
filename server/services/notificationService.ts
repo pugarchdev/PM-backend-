@@ -5,6 +5,7 @@ export type NotificationType =
   | 'chat_mention'
   | 'chat_direct'
   | 'task_assignment'
+  | 'self_task_created'
   | 'task_blocked'
   | 'quality_check_assignment'
   | 'approval_awaiting'

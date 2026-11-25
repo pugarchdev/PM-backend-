@@ -247,6 +247,17 @@ export function canManageMilestones(
 }
 
 /**
+ * Checks whether user can assign project tasks to other users.
+ * Granted to bypassPermissions (e.g. CEO), autoAddToProjects (e.g. CTO), or the project owner.
+ */
+export function canAssignProjectTasks(
+  ctx: UserHierarchyContext,
+  project: { ownerId: string }
+): boolean {
+  return Boolean(ctx.bypassPermissions || ctx.autoAddToProjects || project.ownerId === ctx.userId);
+}
+
+/**
  * Checks whether user has permission to access project budget & financial data
  * (strictly reserved for CEO, HR, CTO, or users with view_budget permission).
  * Never grants access solely based on project ownership.

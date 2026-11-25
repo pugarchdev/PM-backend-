@@ -36,6 +36,7 @@ import usersRouter from './server/routes/users.js';
 import rolesRouter from './server/routes/roles.js';
 import permissionsRouter from './server/routes/permissions.js';
 import leaveRouter from './server/routes/leave.js';
+import { processDueReminders } from './server/services/reminderService.js';
 
 const app = express();
 
@@ -137,17 +138,50 @@ app.use('/api/portfolio', portfolioRouter);
 app.use('/api', documentsRouter);
 app.use('/api/leave', leaveRouter);
 
+// Internal cron endpoint for processing due reminders (protected by CRON_SECRET)
+app.post('/api/internal/process-reminders', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const result = await processDueReminders();
+    return res.json(result);
+  } catch (error) {
+    console.error('[Internal] process-reminders failed:', error);
+    return res.status(500).json({ error: 'Failed to process reminders' });
+  }
+});
+
 // Local development only (skip auto-listen in test runner or on Vercel)
 if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   const PORT = process.env.PORT
     ? parseInt(process.env.PORT, 10)
     : 5000;
 
+  let reminderPoller: NodeJS.Timeout | null = null;
+
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(
       `\n  ➜ API Server running on: http://localhost:${PORT}\n`
     );
+
+    if (process.env.ENABLE_REMINDER_POLLER !== 'false') {
+      reminderPoller = setInterval(() => {
+        processDueReminders().catch(console.error);
+      }, 30_000);
+    }
   });
+
+  const stopPoller = () => {
+    if (reminderPoller) {
+      clearInterval(reminderPoller);
+      reminderPoller = null;
+    }
+  };
+  process.on('SIGINT', stopPoller);
+  process.on('SIGTERM', stopPoller);
 }
 
 // Export for Vercel
