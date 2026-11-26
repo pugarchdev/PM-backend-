@@ -58,6 +58,10 @@ function getFromAddress(): string {
   );
 }
 
+function getAppTimeZone(): string {
+  return process.env.APP_TIMEZONE?.trim() || 'Asia/Kolkata';
+}
+
 /**
  * Sends an email via Nodemailer with structured success/error logging.
  * Never throws; returns true on delivery and false otherwise.
@@ -756,9 +760,10 @@ export async function dispatchLeaveSubmissionEmails(params: {
   const { resolveLeaveNotificationRecipients } = await import('./authorizationService.js');
   const recipients = await resolveLeaveNotificationRecipients(requesterId);
 
+  const timeZone = getAppTimeZone();
   const fmtDate = (d: Date | string) => {
     const date = typeof d === 'string' ? new Date(d) : d;
-    return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone });
   };
 
   const fmtSubmission = (d: Date | string) => {
@@ -769,6 +774,7 @@ export async function dispatchLeaveSubmissionEmails(params: {
       year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+      timeZone,
     });
   };
 
@@ -853,11 +859,13 @@ export async function sendTaskAssignmentEmail(
     const transporter = getTransporter();
     const portalUrl = resolvePortalUrl();
 
+    const timeZone = getAppTimeZone();
     const fmtDate = (d: Date) =>
       new Date(d).toLocaleDateString('en-US', {
         month: 'short',
         day: 'numeric',
         year: 'numeric',
+        timeZone,
       });
 
     const startStr = fmtDate(plannedStart);
@@ -946,8 +954,6 @@ export interface SendReminderEmailParams {
 export async function sendReminderEmail(params: SendReminderEmailParams): Promise<boolean> {
   try {
     const { to, userName, title, description, remindAt } = params;
-    const from = getFromAddress();
-    const transporter = getTransporter();
     const portalUrl = resolvePortalUrl();
 
     const formattedTime = new Date(remindAt).toLocaleString('en-US', {
@@ -956,6 +962,8 @@ export async function sendReminderEmail(params: SendReminderEmailParams): Promis
       year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+      timeZone: getAppTimeZone(),
+      timeZoneName: 'short',
     });
 
     const subject = `Reminder: ${title}`;

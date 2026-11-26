@@ -2060,6 +2060,9 @@ function getTransporter() {
 function getFromAddress() {
   return process.env.EMAIL_FROM?.trim() || "PugArch Project Management <no-reply@pugarch.internal>";
 }
+function getAppTimeZone() {
+  return process.env.APP_TIMEZONE?.trim() || "Asia/Kolkata";
+}
 async function deliverMail(params) {
   const transporter = getTransporter();
   if (!transporter) {
@@ -2646,9 +2649,10 @@ async function dispatchLeaveSubmissionEmails(params) {
   } = params;
   const { resolveLeaveNotificationRecipients: resolveLeaveNotificationRecipients2 } = await Promise.resolve().then(() => (init_authorizationService(), authorizationService_exports));
   const recipients = await resolveLeaveNotificationRecipients2(requesterId);
+  const timeZone = getAppTimeZone();
   const fmtDate = (d) => {
     const date = typeof d === "string" ? new Date(d) : d;
-    return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+    return date.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone });
   };
   const fmtSubmission = (d) => {
     const date = typeof d === "string" ? new Date(d) : d;
@@ -2657,7 +2661,8 @@ async function dispatchLeaveSubmissionEmails(params) {
       month: "short",
       year: "numeric",
       hour: "2-digit",
-      minute: "2-digit"
+      minute: "2-digit",
+      timeZone
     });
   };
   const appBaseUrl = resolvePortalUrl();
@@ -2714,10 +2719,12 @@ async function sendTaskAssignmentEmail(params) {
     const from = getFromAddress();
     const transporter = getTransporter();
     const portalUrl = resolvePortalUrl();
+    const timeZone = getAppTimeZone();
     const fmtDate = (d) => new Date(d).toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
-      year: "numeric"
+      year: "numeric",
+      timeZone
     });
     const startStr = fmtDate(plannedStart);
     const endStr = fmtDate(plannedEnd);
@@ -2784,15 +2791,15 @@ PugArch Projects Cloud
 async function sendReminderEmail(params) {
   try {
     const { to, userName, title, description, remindAt } = params;
-    const from = getFromAddress();
-    const transporter = getTransporter();
     const portalUrl = resolvePortalUrl();
     const formattedTime = new Date(remindAt).toLocaleString("en-US", {
       month: "short",
       day: "numeric",
       year: "numeric",
       hour: "2-digit",
-      minute: "2-digit"
+      minute: "2-digit",
+      timeZone: getAppTimeZone(),
+      timeZoneName: "short"
     });
     const subject = `Reminder: ${title}`;
     const text = [
