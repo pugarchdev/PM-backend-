@@ -2034,22 +2034,63 @@ function checkResendCooldown(challenge) {
 import nodemailer from "nodemailer";
 function getTransporter() {
   const host = process.env.SMTP_HOST?.trim();
-  if (!host) {
-    return null;
-  }
-  const port = parseInt(process.env.SMTP_PORT?.trim() || "587", 10);
-  const secure = process.env.SMTP_SECURE === "true" || process.env.SMTP_SECURE === "1" || port === 465;
   const user = process.env.SMTP_USER?.trim();
   const pass = process.env.SMTP_PASS?.trim();
+  const missing = [];
+  if (!host) missing.push("SMTP_HOST");
+  if (!user) missing.push("SMTP_USER");
+  if (!pass) missing.push("SMTP_PASS");
+  if (missing.length > 0) {
+    console.error("[EmailService] Missing SMTP env vars:", missing);
+    return null;
+  }
+  const parsedPort = parseInt(process.env.SMTP_PORT?.trim() || "587", 10);
+  const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 587;
+  const secure = port === 465 ? true : port === 587 ? false : process.env.SMTP_SECURE?.trim() === "true" || process.env.SMTP_SECURE?.trim() === "1";
   return nodemailer.createTransport({
     host,
     port,
     secure,
-    auth: user ? { user, pass } : void 0
+    auth: { user, pass },
+    connectionTimeout: 1e4,
+    greetingTimeout: 1e4,
+    socketTimeout: 15e3
   });
 }
 function getFromAddress() {
   return process.env.EMAIL_FROM?.trim() || "PugArch Project Management <no-reply@pugarch.internal>";
+}
+async function deliverMail(params) {
+  const transporter = getTransporter();
+  if (!transporter) {
+    return { delivered: false, unconfigured: true };
+  }
+  const from = getFromAddress();
+  try {
+    const info = await transporter.sendMail({
+      from,
+      to: params.to,
+      subject: params.subject,
+      text: params.text,
+      html: params.html
+    });
+    console.info("[EmailService] Sent:", {
+      to: params.to,
+      subject: params.subject,
+      messageId: info.messageId
+    });
+    return { delivered: true };
+  } catch (err) {
+    console.error("[EmailService] Failed:", {
+      to: params.to,
+      subject: params.subject,
+      code: err?.code,
+      responseCode: err?.responseCode,
+      command: err?.command,
+      message: err?.message
+    });
+    return { delivered: false };
+  }
 }
 async function sendVerificationOtpEmail(params) {
   const { to, name, otp } = params;
@@ -2145,23 +2186,11 @@ Enterprise Architecture & Access Control
 </body>
 </html>
 `.trim();
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html
-      });
-      return { delivered: true };
-    } catch (err) {
-      console.error(`[EmailService] Failed to deliver verification email to ${to}:`, err.message || err);
-      throw new Error(`Email delivery failed: ${err.message || "SMTP transport error"}`);
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-  const isDev = process.env.NODE_ENV !== "production";
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== "production") {
     console.log(`
 ======================================================`);
     console.log(`[EmailService DEV] Simulated verification email to: ${to}`);
@@ -2170,7 +2199,7 @@ Enterprise Architecture & Access Control
 `);
     return { delivered: true, mockLogged: true };
   }
-  throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+  return { delivered: false };
 }
 async function sendPasswordResetOtpEmail(params) {
   const { to, name, otp } = params;
@@ -2265,23 +2294,11 @@ Enterprise Architecture & Access Control
 </body>
 </html>
 `.trim();
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html
-      });
-      return { delivered: true };
-    } catch (err) {
-      console.error(`[EmailService] Failed to deliver recovery email to ${to}:`, err.message || err);
-      throw new Error(`Email delivery failed: ${err.message || "SMTP transport error"}`);
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-  const isDev = process.env.NODE_ENV !== "production";
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== "production") {
     console.log(`
 ======================================================`);
     console.log(`[EmailService DEV] Simulated password recovery email to: ${to}`);
@@ -2290,7 +2307,7 @@ Enterprise Architecture & Access Control
 `);
     return { delivered: true, mockLogged: true };
   }
-  throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+  return { delivered: false };
 }
 function resolvePortalUrl(req, bodyPortalUrl) {
   if (bodyPortalUrl && typeof bodyPortalUrl === "string" && bodyPortalUrl.startsWith("http")) {
@@ -2437,23 +2454,11 @@ Enterprise Architecture & Access Control
 </body>
 </html>
 `.trim();
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html
-      });
-      return { delivered: true };
-    } catch (err) {
-      console.error(`[EmailService] Failed to deliver pre-registration invitation to ${to}:`, err.message || err);
-      return { delivered: false };
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-  const isDev = process.env.NODE_ENV !== "production";
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== "production") {
     console.log(`
 ======================================================`);
     console.log(`[EmailService DEV] Simulated pre-registration email to: ${to}`);
@@ -2611,23 +2616,11 @@ Organizational Hierarchy & Leave Management
 </body>
 </html>
 `.trim();
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html
-      });
-      return { delivered: true };
-    } catch (err) {
-      console.error(`[EmailService] Failed to deliver leave request email to ${to}:`, err.message || err);
-      throw new Error(`Email delivery failed: ${err.message || "SMTP transport error"}`);
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-  const isDev = process.env.NODE_ENV !== "production";
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== "production") {
     console.log(`
 ======================================================`);
     console.log(`[EmailService DEV] Simulated leave request email to: ${to} (${recipientName})`);
@@ -2637,7 +2630,7 @@ Organizational Hierarchy & Leave Management
 `);
     return { delivered: true, mockLogged: true };
   }
-  throw new Error("Email service configuration error: SMTP_HOST environment variable is required in production.");
+  return { delivered: false };
 }
 async function dispatchLeaveSubmissionEmails(params) {
   const {
@@ -2781,12 +2774,8 @@ PugArch Projects Cloud
   </table>
 </body>
 </html>`.trim();
-    if (!transporter) {
-      console.log(`[EmailService] SMTP unconfigured \u2014 mock task assignment email to ${to}: ${subject}`);
-      return { delivered: false, mockLogged: true };
-    }
-    await transporter.sendMail({ from, to, subject, text, html });
-    return { delivered: true };
+    const result = await deliverMail({ to, subject, text, html });
+    return { delivered: result.delivered, mockLogged: result.unconfigured };
   } catch (err) {
     console.error("[EmailService] Failed to send task assignment email:", err?.message || err);
     return { delivered: false };
@@ -2847,12 +2836,8 @@ async function sendReminderEmail(params) {
   </table>
 </body>
 </html>`.trim();
-    if (!transporter) {
-      console.log(`[EmailService] SMTP unconfigured \u2014 mock reminder email to ${to}: ${subject}`);
-      return false;
-    }
-    await transporter.sendMail({ from, to, subject, text, html });
-    return true;
+    const result = await deliverMail({ to, subject, text, html });
+    return result.delivered;
   } catch (err) {
     console.error("[EmailService] Failed to send reminder email:", err?.message || err);
     return false;
@@ -5720,80 +5705,82 @@ router5.post("/", async (req, res) => {
     });
     const assignedTasks = createdTasks.filter((t) => t.assigneeId && t.assigneeId !== ctx.userId);
     for (const t of assignedTasks) {
-      void createNotification({
-        userId: t.assigneeId,
-        projectId: phase.projectId,
-        title: "New Task Assigned",
-        message: `You were assigned: "${t.title}" (${t.plannedHours} hrs planned)`,
-        type: "task_assignment",
-        linkUrl: `/projects/${phase.projectId}`
-      });
-      if (t.assignee?.email) {
-        void sendTaskAssignmentEmail({
-          to: t.assignee.email,
-          assigneeName: t.assignee.name,
-          assignerName: user.name,
-          projectName: phase.project.name,
-          taskTitle: t.title,
-          priority: t.priority,
-          plannedStart: t.plannedStart,
-          plannedEnd: t.plannedEnd,
-          plannedHours: t.plannedHours,
-          frequency: t.frequency,
-          dailyHours: t.dailyHours
+      try {
+        await createNotification({
+          userId: t.assigneeId,
+          projectId: phase.projectId,
+          title: "New Task Assigned",
+          message: `You were assigned: "${t.title}" (${t.plannedHours} hrs planned)`,
+          type: "task_assignment",
+          linkUrl: `/projects/${phase.projectId}`
         });
+        if (t.assignee?.email) {
+          await sendTaskAssignmentEmail({
+            to: t.assignee.email,
+            assigneeName: t.assignee.name,
+            assignerName: user.name,
+            projectName: phase.project.name,
+            taskTitle: t.title,
+            priority: t.priority,
+            plannedStart: t.plannedStart,
+            plannedEnd: t.plannedEnd,
+            plannedHours: t.plannedHours,
+            frequency: t.frequency,
+            dailyHours: t.dailyHours
+          });
+        }
+      } catch (notifyErr) {
+        console.error("[Tasks] Failed to send assignment notification/email:", notifyErr);
       }
     }
     const selfTasks = createdTasks.filter((t) => t.assigneeId === ctx.userId);
     if (selfTasks.length > 0) {
-      void (async () => {
-        try {
-          const [memberships, projectOwner] = await Promise.all([
-            prisma.projectMembership.findMany({
-              where: { projectId: phase.projectId },
-              include: {
-                user: {
-                  select: {
-                    id: true,
-                    role: true,
-                    roleDefinition: { select: { rank: true } }
-                  }
+      try {
+        const [memberships, projectOwner] = await Promise.all([
+          prisma.projectMembership.findMany({
+            where: { projectId: phase.projectId },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  role: true,
+                  roleDefinition: { select: { rank: true } }
                 }
               }
-            }),
-            prisma.user.findUnique({
-              where: { id: phase.project.ownerId },
-              select: {
-                id: true,
-                role: true,
-                roleDefinition: { select: { rank: true } }
-              }
-            })
-          ]);
-          const candidateMap = /* @__PURE__ */ new Map();
-          if (projectOwner) candidateMap.set(projectOwner.id, projectOwner);
-          for (const m of memberships) {
-            if (m.user) candidateMap.set(m.user.id, m.user);
-          }
-          const selfTask = selfTasks[0];
-          for (const [memberId, memberUser] of candidateMap.entries()) {
-            if (memberId === ctx.userId) continue;
-            const memberRank = resolveEffectiveRank(memberUser);
-            if (memberRank < ctx.roleRank) {
-              await createNotification({
-                userId: memberId,
-                projectId: phase.projectId,
-                title: "New Self-Assigned Task",
-                message: `${user.name} created a self-assigned task "${selfTask.title}" in ${phase.project.name}.`,
-                type: "self_task_created",
-                linkUrl: `/projects/${phase.projectId}`
-              });
             }
-          }
-        } catch (notifyErr) {
-          console.error("[Tasks] Failed to notify higher-ranked members for self-task:", notifyErr);
+          }),
+          prisma.user.findUnique({
+            where: { id: phase.project.ownerId },
+            select: {
+              id: true,
+              role: true,
+              roleDefinition: { select: { rank: true } }
+            }
+          })
+        ]);
+        const candidateMap = /* @__PURE__ */ new Map();
+        if (projectOwner) candidateMap.set(projectOwner.id, projectOwner);
+        for (const m of memberships) {
+          if (m.user) candidateMap.set(m.user.id, m.user);
         }
-      })();
+        const selfTask = selfTasks[0];
+        for (const [memberId, memberUser] of candidateMap.entries()) {
+          if (memberId === ctx.userId) continue;
+          const memberRank = resolveEffectiveRank(memberUser);
+          if (memberRank < ctx.roleRank) {
+            await createNotification({
+              userId: memberId,
+              projectId: phase.projectId,
+              title: "New Self-Assigned Task",
+              message: `${user.name} created a self-assigned task "${selfTask.title}" in ${phase.project.name}.`,
+              type: "self_task_created",
+              linkUrl: `/projects/${phase.projectId}`
+            });
+          }
+        }
+      } catch (notifyErr) {
+        console.error("[Tasks] Failed to notify higher-ranked members for self-task:", notifyErr);
+      }
     }
     res.status(201).json({
       ...createdTasks[0],
@@ -10422,6 +10409,73 @@ init_prisma();
 import { Router as Router18 } from "express";
 import { z as z2 } from "zod";
 init_authorizationService();
+
+// server/services/reminderService.ts
+init_prisma();
+var isProcessing = false;
+async function processDueReminders() {
+  if (isProcessing) {
+    return { processed: 0, emailsSent: 0 };
+  }
+  isProcessing = true;
+  let processed = 0;
+  let emailsSent = 0;
+  try {
+    const now = /* @__PURE__ */ new Date();
+    const dueReminders = await prisma.reminder.findMany({
+      where: {
+        remindAt: { lte: now },
+        triggeredAt: null
+      },
+      take: 20,
+      orderBy: { remindAt: "asc" },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true }
+        }
+      }
+    });
+    for (const r of dueReminders) {
+      const claimed = await prisma.reminder.updateMany({
+        where: { id: r.id, triggeredAt: null },
+        data: { triggeredAt: /* @__PURE__ */ new Date() }
+      });
+      if (claimed.count !== 1) continue;
+      processed++;
+      if (r.user?.email && r.remindAt) {
+        const sent = await sendReminderEmail({
+          to: r.user.email,
+          userName: r.user.name,
+          title: r.title,
+          description: r.description,
+          remindAt: r.remindAt
+        });
+        if (sent) {
+          await prisma.reminder.update({
+            where: { id: r.id },
+            data: { emailSentAt: /* @__PURE__ */ new Date() }
+          });
+          emailsSent++;
+        }
+      }
+      try {
+        emitToUser(r.userId, "reminder:due", {
+          id: r.id,
+          title: r.title,
+          description: r.description,
+          remindAt: r.remindAt
+        });
+      } catch (socketErr) {
+        console.error("[ReminderService] Socket emit failed:", socketErr);
+      }
+    }
+    return { processed, emailsSent };
+  } finally {
+    isProcessing = false;
+  }
+}
+
+// server/routes/calendar.ts
 var router18 = Router18();
 var CompanyCalendarEventCreateSchema = z2.object({
   title: z2.string().trim().min(1, "Title is required").max(120, "Title cannot exceed 120 characters"),
@@ -10670,6 +10724,7 @@ router18.get("/today", async (req, res) => {
 });
 router18.get("/reminders/due", requireAuth, async (req, res) => {
   try {
+    await processDueReminders().catch((err) => console.error("[Reminders] Due processing failed:", err));
     const now = /* @__PURE__ */ new Date();
     const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1e3);
     const dueReminders = await prisma.reminder.findMany({
@@ -12339,71 +12394,6 @@ router22.post("/:id/withdraw", requireAuth, handleWithdraw);
 router22.delete("/:id/withdraw", requireAuth, handleWithdraw);
 router22.delete("/:id", requireAuth, handleWithdraw);
 var leave_default = router22;
-
-// server/services/reminderService.ts
-init_prisma();
-var isProcessing = false;
-async function processDueReminders() {
-  if (isProcessing) {
-    return { processed: 0, emailsSent: 0 };
-  }
-  isProcessing = true;
-  let processed = 0;
-  let emailsSent = 0;
-  try {
-    const now = /* @__PURE__ */ new Date();
-    const dueReminders = await prisma.reminder.findMany({
-      where: {
-        remindAt: { lte: now },
-        triggeredAt: null
-      },
-      take: 20,
-      orderBy: { remindAt: "asc" },
-      include: {
-        user: {
-          select: { id: true, name: true, email: true }
-        }
-      }
-    });
-    for (const r of dueReminders) {
-      const claimed = await prisma.reminder.updateMany({
-        where: { id: r.id, triggeredAt: null },
-        data: { triggeredAt: /* @__PURE__ */ new Date() }
-      });
-      if (claimed.count !== 1) continue;
-      processed++;
-      if (r.user?.email && r.remindAt) {
-        const sent = await sendReminderEmail({
-          to: r.user.email,
-          userName: r.user.name,
-          title: r.title,
-          description: r.description,
-          remindAt: r.remindAt
-        });
-        if (sent) {
-          await prisma.reminder.update({
-            where: { id: r.id },
-            data: { emailSentAt: /* @__PURE__ */ new Date() }
-          });
-          emailsSent++;
-        }
-      }
-      try {
-        emitToUser(r.userId, "reminder:due", {
-          id: r.id,
-          title: r.title,
-          description: r.description,
-          remindAt: r.remindAt
-        });
-      } catch (socketErr) {
-        console.error("[ReminderService] Socket emit failed:", socketErr);
-      }
-    }
-    return { processed, emailsSent };
-  } finally {
-    isProcessing = false;
-  }
-}
 
 // server.ts
 if (!process.env.DATABASE_URL || !process.env.APP_URL) {

@@ -7,6 +7,7 @@ import { emitToUser } from '../socket.js';
 const router = Router();
 
 import { getUserHierarchyContext, canManageCompanyCalendar } from '../services/authorizationService.js';
+import { processDueReminders } from '../services/reminderService.js';
 
 const CompanyCalendarEventCreateSchema = z
   .object({
@@ -290,6 +291,8 @@ router.get('/today', async (req: AuthRequest, res: Response) => {
 // GET /api/calendar/reminders/due - Fetch undismissed due reminders within the last 30 minutes
 router.get('/reminders/due', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
+    await processDueReminders().catch((err) => console.error('[Reminders] Due processing failed:', err));
+
     const now = new Date();
     const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
 

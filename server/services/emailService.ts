@@ -14,26 +14,40 @@ export interface SendPasswordResetEmailParams {
 
 /**
  * Returns a configured Nodemailer transporter or null if SMTP is unconfigured.
+ * Uses non-pooled connections with explicit timeouts for serverless compatibility.
  */
 function getTransporter(): Transporter | null {
   const host = process.env.SMTP_HOST?.trim();
-  if (!host) {
+  const user = process.env.SMTP_USER?.trim();
+  const pass = process.env.SMTP_PASS?.trim();
+
+  const missing: string[] = [];
+  if (!host) missing.push('SMTP_HOST');
+  if (!user) missing.push('SMTP_USER');
+  if (!pass) missing.push('SMTP_PASS');
+
+  if (missing.length > 0) {
+    console.error('[EmailService] Missing SMTP env vars:', missing);
     return null;
   }
 
-  const port = parseInt(process.env.SMTP_PORT?.trim() || '587', 10);
+  const parsedPort = parseInt(process.env.SMTP_PORT?.trim() || '587', 10);
+  const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 587;
   const secure =
-    process.env.SMTP_SECURE === 'true' ||
-    process.env.SMTP_SECURE === '1' ||
-    port === 465;
-  const user = process.env.SMTP_USER?.trim();
-  const pass = process.env.SMTP_PASS?.trim();
+    port === 465
+      ? true
+      : port === 587
+        ? false
+        : process.env.SMTP_SECURE?.trim() === 'true' || process.env.SMTP_SECURE?.trim() === '1';
 
   return nodemailer.createTransport({
     host,
     port,
     secure,
-    auth: user ? { user, pass } : undefined,
+    auth: { user, pass },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000,
   });
 }
 
@@ -42,6 +56,49 @@ function getFromAddress(): string {
     process.env.EMAIL_FROM?.trim() ||
     'PugArch Project Management <no-reply@pugarch.internal>'
   );
+}
+
+/**
+ * Sends an email via Nodemailer with structured success/error logging.
+ * Never throws; returns true on delivery and false otherwise.
+ */
+async function deliverMail(params: {
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}): Promise<{ delivered: boolean; unconfigured?: boolean }> {
+  const transporter = getTransporter();
+  if (!transporter) {
+    return { delivered: false, unconfigured: true };
+  }
+
+  const from = getFromAddress();
+  try {
+    const info = await transporter.sendMail({
+      from,
+      to: params.to,
+      subject: params.subject,
+      text: params.text,
+      html: params.html,
+    });
+    console.info('[EmailService] Sent:', {
+      to: params.to,
+      subject: params.subject,
+      messageId: info.messageId,
+    });
+    return { delivered: true };
+  } catch (err: any) {
+    console.error('[EmailService] Failed:', {
+      to: params.to,
+      subject: params.subject,
+      code: err?.code,
+      responseCode: err?.responseCode,
+      command: err?.command,
+      message: err?.message,
+    });
+    return { delivered: false };
+  }
 }
 
 /**
@@ -147,33 +204,18 @@ Enterprise Architecture & Access Control
 </html>
 `.trim();
 
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html,
-      });
-      return { delivered: true };
-    } catch (err: any) {
-      console.error(`[EmailService] Failed to deliver verification email to ${to}:`, err.message || err);
-      throw new Error(`Email delivery failed: ${err.message || 'SMTP transport error'}`);
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-
-  // Fallback for development / test environments when SMTP_HOST is not configured
-  const isDev = process.env.NODE_ENV !== 'production';
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== 'production') {
     console.log(`\n======================================================`);
     console.log(`[EmailService DEV] Simulated verification email to: ${to}`);
     console.log(`[EmailService DEV] OTP Code: ${otp} (Expires in 5 minutes)`);
     console.log(`======================================================\n`);
     return { delivered: true, mockLogged: true };
   }
-
-  throw new Error('Email service configuration error: SMTP_HOST environment variable is required in production.');
+  return { delivered: false };
 }
 
 /**
@@ -278,32 +320,18 @@ Enterprise Architecture & Access Control
 </html>
 `.trim();
 
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html,
-      });
-      return { delivered: true };
-    } catch (err: any) {
-      console.error(`[EmailService] Failed to deliver recovery email to ${to}:`, err.message || err);
-      throw new Error(`Email delivery failed: ${err.message || 'SMTP transport error'}`);
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-
-  const isDev = process.env.NODE_ENV !== 'production';
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== 'production') {
     console.log(`\n======================================================`);
     console.log(`[EmailService DEV] Simulated password recovery email to: ${to}`);
     console.log(`[EmailService DEV] Recovery Code: ${otp} (Expires in 5 minutes)`);
     console.log(`======================================================\n`);
     return { delivered: true, mockLogged: true };
   }
-
-  throw new Error('Email service configuration error: SMTP_HOST environment variable is required in production.');
+  return { delivered: false };
 }
 
 export interface SendPreRegistrationEmailParams {
@@ -488,31 +516,17 @@ Enterprise Architecture & Access Control
 </html>
 `.trim();
 
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html,
-      });
-      return { delivered: true };
-    } catch (err: any) {
-      console.error(`[EmailService] Failed to deliver pre-registration invitation to ${to}:`, err.message || err);
-      return { delivered: false };
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-
-  const isDev = process.env.NODE_ENV !== 'production';
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== 'production') {
     console.log(`\n======================================================`);
     console.log(`[EmailService DEV] Simulated pre-registration email to: ${to}`);
     console.log(`[EmailService DEV] Signup URL: ${signupLink}`);
     console.log(`======================================================\n`);
     return { delivered: true, mockLogged: true };
   }
-
   return { delivered: false };
 }
 
@@ -690,24 +704,11 @@ Organizational Hierarchy & Leave Management
 </html>
 `.trim();
 
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from,
-        to,
-        subject,
-        text,
-        html,
-      });
-      return { delivered: true };
-    } catch (err: any) {
-      console.error(`[EmailService] Failed to deliver leave request email to ${to}:`, err.message || err);
-      throw new Error(`Email delivery failed: ${err.message || 'SMTP transport error'}`);
-    }
+  const result = await deliverMail({ to, subject, text, html });
+  if (result.delivered) {
+    return { delivered: true };
   }
-
-  const isDev = process.env.NODE_ENV !== 'production';
-  if (isDev) {
+  if (result.unconfigured && process.env.NODE_ENV !== 'production') {
     console.log(`\n======================================================`);
     console.log(`[EmailService DEV] Simulated leave request email to: ${to} (${recipientName})`);
     console.log(`[EmailService DEV] Requester: ${requesterName} (${requesterRole})`);
@@ -715,8 +716,7 @@ Organizational Hierarchy & Leave Management
     console.log(`======================================================\n`);
     return { delivered: true, mockLogged: true };
   }
-
-  throw new Error('Email service configuration error: SMTP_HOST environment variable is required in production.');
+  return { delivered: false };
 }
 
 /**
@@ -923,13 +923,8 @@ PugArch Projects Cloud
 </body>
 </html>`.trim();
 
-    if (!transporter) {
-      console.log(`[EmailService] SMTP unconfigured — mock task assignment email to ${to}: ${subject}`);
-      return { delivered: false, mockLogged: true };
-    }
-
-    await transporter.sendMail({ from, to, subject, text, html });
-    return { delivered: true };
+    const result = await deliverMail({ to, subject, text, html });
+    return { delivered: result.delivered, mockLogged: result.unconfigured };
   } catch (err: any) {
     console.error('[EmailService] Failed to send task assignment email:', err?.message || err);
     return { delivered: false };
@@ -1009,13 +1004,8 @@ export async function sendReminderEmail(params: SendReminderEmailParams): Promis
 </body>
 </html>`.trim();
 
-    if (!transporter) {
-      console.log(`[EmailService] SMTP unconfigured — mock reminder email to ${to}: ${subject}`);
-      return false;
-    }
-
-    await transporter.sendMail({ from, to, subject, text, html });
-    return true;
+    const result = await deliverMail({ to, subject, text, html });
+    return result.delivered;
   } catch (err: any) {
     console.error('[EmailService] Failed to send reminder email:', err?.message || err);
     return false;

@@ -544,88 +544,90 @@ router.post('/', async (req: AuthRequest, res: Response) => {
       return created;
     });
 
-    // Post-transaction notifications & email (non-blocking)
+    // Post-transaction notifications & email (awaited before response for serverless compatibility)
     const assignedTasks = createdTasks.filter((t) => t.assigneeId && t.assigneeId !== ctx.userId);
     for (const t of assignedTasks) {
-      void createNotification({
-        userId: t.assigneeId!,
-        projectId: phase.projectId,
-        title: 'New Task Assigned',
-        message: `You were assigned: "${t.title}" (${t.plannedHours} hrs planned)`,
-        type: 'task_assignment',
-        linkUrl: `/projects/${phase.projectId}`,
-      });
-
-      if (t.assignee?.email) {
-        void sendTaskAssignmentEmail({
-          to: t.assignee.email,
-          assigneeName: t.assignee.name,
-          assignerName: user.name,
-          projectName: phase.project.name,
-          taskTitle: t.title,
-          priority: t.priority,
-          plannedStart: t.plannedStart,
-          plannedEnd: t.plannedEnd,
-          plannedHours: t.plannedHours,
-          frequency: t.frequency,
-          dailyHours: t.dailyHours,
+      try {
+        await createNotification({
+          userId: t.assigneeId!,
+          projectId: phase.projectId,
+          title: 'New Task Assigned',
+          message: `You were assigned: "${t.title}" (${t.plannedHours} hrs planned)`,
+          type: 'task_assignment',
+          linkUrl: `/projects/${phase.projectId}`,
         });
+
+        if (t.assignee?.email) {
+          await sendTaskAssignmentEmail({
+            to: t.assignee.email,
+            assigneeName: t.assignee.name,
+            assignerName: user.name,
+            projectName: phase.project.name,
+            taskTitle: t.title,
+            priority: t.priority,
+            plannedStart: t.plannedStart,
+            plannedEnd: t.plannedEnd,
+            plannedHours: t.plannedHours,
+            frequency: t.frequency,
+            dailyHours: t.dailyHours,
+          });
+        }
+      } catch (notifyErr) {
+        console.error('[Tasks] Failed to send assignment notification/email:', notifyErr);
       }
     }
 
     // Self-task notification to higher-ranked project members (no email)
     const selfTasks = createdTasks.filter((t) => t.assigneeId === ctx.userId);
     if (selfTasks.length > 0) {
-      void (async () => {
-        try {
-          const [memberships, projectOwner] = await Promise.all([
-            prisma.projectMembership.findMany({
-              where: { projectId: phase.projectId },
-              include: {
-                user: {
-                  select: {
-                    id: true,
-                    role: true,
-                    roleDefinition: { select: { rank: true } },
-                  },
+      try {
+        const [memberships, projectOwner] = await Promise.all([
+          prisma.projectMembership.findMany({
+            where: { projectId: phase.projectId },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  role: true,
+                  roleDefinition: { select: { rank: true } },
                 },
               },
-            }),
-            prisma.user.findUnique({
-              where: { id: phase.project.ownerId },
-              select: {
-                id: true,
-                role: true,
-                roleDefinition: { select: { rank: true } },
-              },
-            }),
-          ]);
+            },
+          }),
+          prisma.user.findUnique({
+            where: { id: phase.project.ownerId },
+            select: {
+              id: true,
+              role: true,
+              roleDefinition: { select: { rank: true } },
+            },
+          }),
+        ]);
 
-          const candidateMap = new Map<string, { id: string; role?: string | null; roleDefinition?: { rank: number } | null }>();
-          if (projectOwner) candidateMap.set(projectOwner.id, projectOwner);
-          for (const m of memberships) {
-            if (m.user) candidateMap.set(m.user.id, m.user);
-          }
-
-          const selfTask = selfTasks[0];
-          for (const [memberId, memberUser] of candidateMap.entries()) {
-            if (memberId === ctx.userId) continue;
-            const memberRank = resolveEffectiveRank(memberUser);
-            if (memberRank < ctx.roleRank) {
-              await createNotification({
-                userId: memberId,
-                projectId: phase.projectId,
-                title: 'New Self-Assigned Task',
-                message: `${user.name} created a self-assigned task "${selfTask.title}" in ${phase.project.name}.`,
-                type: 'self_task_created',
-                linkUrl: `/projects/${phase.projectId}`,
-              });
-            }
-          }
-        } catch (notifyErr) {
-          console.error('[Tasks] Failed to notify higher-ranked members for self-task:', notifyErr);
+        const candidateMap = new Map<string, { id: string; role?: string | null; roleDefinition?: { rank: number } | null }>();
+        if (projectOwner) candidateMap.set(projectOwner.id, projectOwner);
+        for (const m of memberships) {
+          if (m.user) candidateMap.set(m.user.id, m.user);
         }
-      })();
+
+        const selfTask = selfTasks[0];
+        for (const [memberId, memberUser] of candidateMap.entries()) {
+          if (memberId === ctx.userId) continue;
+          const memberRank = resolveEffectiveRank(memberUser);
+          if (memberRank < ctx.roleRank) {
+            await createNotification({
+              userId: memberId,
+              projectId: phase.projectId,
+              title: 'New Self-Assigned Task',
+              message: `${user.name} created a self-assigned task "${selfTask.title}" in ${phase.project.name}.`,
+              type: 'self_task_created',
+              linkUrl: `/projects/${phase.projectId}`,
+            });
+          }
+        }
+      } catch (notifyErr) {
+        console.error('[Tasks] Failed to notify higher-ranked members for self-task:', notifyErr);
+      }
     }
 
     res.status(201).json({
