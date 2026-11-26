@@ -1,4 +1,6 @@
 import { Router, Response } from 'express';
+import multer from 'multer';
+import { v2 as cloudinary } from 'cloudinary';
 import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth, requirePermission } from '../auth.js';
 import { calculateProgress, calculatePlanPercentage, calculateProjectStatus } from '../../lib/calculations.js';
@@ -11,9 +13,22 @@ import {
   canTransferProjectOwnership,
   canAccessBudget,
 } from '../services/authorizationService.js';
-import { addAutoJoinRoleUsersToProject } from '../services/permissionService.js';
+import { addAutoJoinRoleUsersToProject, hasPermission } from '../services/permissionService.js';
 
 const router = Router();
+
+const ALLOWED_LOGO_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+const logoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_LOGO_MIME_TYPES.has(file.mimetype)) {
+      cb(new Error('Invalid file type. Only PNG, JPEG, and WebP images are allowed (SVG is not permitted).'));
+      return;
+    }
+    cb(null, true);
+  },
+});
 
 // Helper to compute rich project metrics
 export async function enrichProject(project: any) {
@@ -121,6 +136,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
           startDate: true,
           endDate: true,
           statusOverride: true,
+          logoUrl: true,
         },
         orderBy: { name: 'asc' },
       });
@@ -170,6 +186,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
         contingency: true,
         spendToDate: true,
         statusOverride: true,
+        logoUrl: true,
         ownerId: true,
         owner: {
           select: { id: true, name: true, email: true, role: true, avatarUrl: true },
@@ -271,7 +288,7 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid project input' });
     }
 
-    const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0 } = validation.data;
+    const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0, logoUrl } = validation.data;
     const hasBudgetAccess = canAccessBudget(ctx, user);
     const effectivePlannedBudget = hasBudgetAccess ? Number(plannedBudget) : 0;
     const effectiveContingency = hasBudgetAccess ? Number(contingency) : 0;
@@ -300,6 +317,7 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
           plannedBudget: effectivePlannedBudget,
           contingency: effectiveContingency,
           spendToDate: 0,
+          logoUrl: logoUrl ?? null,
         },
       });
 
@@ -364,6 +382,98 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
   } catch (error: any) {
     console.error('Failed to create project:', error);
     res.status(500).json({ error: 'Failed to create project' });
+  }
+});
+
+// POST /api/projects/logo - Upload a project logo (Cloudinary or Base64 fallback)
+router.post('/logo', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+    const canAdd = await hasPermission(user, 'add_project');
+    const ownsProject = ctx.isExecutive || ctx.bypassPermissions || canAdd
+      ? true
+      : (await prisma.project.count({ where: { ownerId: user.id } })) > 0;
+
+    if (!ownsProject) {
+      return res.status(403).json({ error: 'Forbidden: You are not authorized to upload project logos.' });
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      logoUpload.single('logo')(req, res, (err: any) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'Logo image file is required (field name: "logo").' });
+    }
+
+    const cloudinaryUrl = process.env.CLOUDINARY_URL?.trim();
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+    const apiKey = process.env.CLOUDINARY_API_KEY?.trim();
+    const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim();
+    const isCloudinaryConfigured = Boolean(cloudinaryUrl || (cloudName && apiKey && apiSecret));
+
+    if (isCloudinaryConfigured) {
+      if (cloudinaryUrl) {
+        cloudinary.config({ secure: true });
+      } else {
+        cloudinary.config({
+          cloud_name: cloudName,
+          api_key: apiKey,
+          api_secret: apiSecret,
+          secure: true,
+        });
+      }
+
+      const uploadResult = await new Promise<{ secure_url: string }>((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: 'project-logos',
+            resource_type: 'image',
+            transformation: {
+              width: 256,
+              height: 256,
+              crop: 'limit',
+              quality: 'auto',
+              fetch_format: 'auto',
+            },
+          },
+          (error, result) => {
+            if (error || !result?.secure_url) {
+              return reject(error || new Error('Cloudinary upload failed'));
+            }
+            resolve({ secure_url: result.secure_url });
+          }
+        );
+        stream.end(req.file!.buffer);
+      });
+
+      return res.status(200).json({ logoUrl: uploadResult.secure_url });
+    }
+
+    if (req.file.size > 250 * 1024) {
+      return res.status(400).json({
+        error: 'Logo must be under 250KB when cloud storage is not configured.',
+      });
+    }
+
+    const base64Logo = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    return res.status(200).json({ logoUrl: base64Logo });
+  } catch (err: any) {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Logo file size must not exceed 2 MB.' });
+      }
+      return res.status(400).json({ error: err.message });
+    }
+    if (err?.message?.includes('Invalid file type')) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('[Projects] Logo upload failed:', err);
+    return res.status(500).json({ error: 'Failed to upload project logo' });
   }
 });
 
@@ -660,6 +770,18 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       });
     }
 
+    if (data.logoUrl !== undefined && data.logoUrl !== project.logoUrl) {
+      updateData.logoUrl = data.logoUrl;
+      changeLogs.push({
+        what: 'Project Logo Updated',
+        fromValue: project.logoUrl ? 'Custom Logo' : 'None',
+        toValue: data.logoUrl ? 'Custom Logo' : 'Removed',
+        details: data.logoUrl
+          ? `Project logo updated by ${user.name}.`
+          : `Project logo removed by ${user.name}.`,
+      });
+    }
+
     if (data.startDate && new Date(data.startDate).getTime() !== project.startDate.getTime()) {
       updateData.startDate = newStart;
       changeLogs.push({
@@ -726,58 +848,63 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       }
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const p = await tx.project.update({
-        where: { id: project.id },
-        data: updateData,
-        include: {
-          owner: { select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true } },
-          memberships: { include: { user: true } },
-          phases: {
-            orderBy: { order: 'asc' },
-            include: {
-              tasks: {
-                include: {
-                  assignee: { select: { id: true, name: true, avatarUrl: true } },
-                  qualityChecks: true,
-                },
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.project.update({
+          where: { id: project.id },
+          data: updateData,
+        });
+
+        if (updateData.ownerId) {
+          await tx.projectMembership.upsert({
+            where: { projectId_userId: { projectId: project.id, userId: updateData.ownerId } },
+            create: { projectId: project.id, userId: updateData.ownerId, role: 'Owner' },
+            update: { role: 'Owner' },
+          });
+        }
+
+        if (changeLogs.length > 0) {
+          await tx.changeLogEntry.createMany({
+            data: changeLogs.map((log) => ({
+              projectId: project.id,
+              entityType: 'PROJECT',
+              entityId: project.id,
+              action: 'CHARTER_UPDATE',
+              what: log.what,
+              fromValue: log.fromValue,
+              toValue: log.toValue,
+              actorId: user.id,
+              sourceType: 'PROJECT',
+              sourceId: project.id,
+              details: log.details,
+              changedBy: user.name,
+            })),
+          });
+        }
+      },
+      { maxWait: 10000, timeout: 15000 }
+    );
+
+    const updated = await prisma.project.findUnique({
+      where: { id: project.id },
+      include: {
+        owner: { select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true } },
+        memberships: { include: { user: true } },
+        phases: {
+          orderBy: { order: 'asc' },
+          include: {
+            tasks: {
+              include: {
+                assignee: { select: { id: true, name: true, avatarUrl: true } },
+                qualityChecks: true,
               },
             },
           },
-          milestones: true,
-          issues: true,
-          risks: true,
         },
-      });
-
-      if (updateData.ownerId) {
-        await tx.projectMembership.upsert({
-          where: { projectId_userId: { projectId: project.id, userId: updateData.ownerId } },
-          create: { projectId: project.id, userId: updateData.ownerId, role: 'Owner' },
-          update: { role: 'Owner' },
-        });
-      }
-
-      for (const log of changeLogs) {
-        await tx.changeLogEntry.create({
-          data: {
-            projectId: project.id,
-            entityType: 'PROJECT',
-            entityId: project.id,
-            action: 'CHARTER_UPDATE',
-            what: log.what,
-            fromValue: log.fromValue,
-            toValue: log.toValue,
-            actorId: user.id,
-            sourceType: 'PROJECT',
-            sourceId: project.id,
-            details: log.details,
-            changedBy: user.name,
-          },
-        });
-      }
-
-      return p;
+        milestones: true,
+        issues: true,
+        risks: true,
+      },
     });
 
     const enriched = await enrichProject(updated);
@@ -988,6 +1115,59 @@ router.post('/:id/members', requireAuth, async (req: AuthRequest, res: Response)
     res.status(201).json(membership);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to add project member' });
+  }
+});
+
+// PATCH /api/projects/:id/members/:userId - Update member's project role
+router.patch('/:id/members/:userId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage project team members.' });
+    }
+
+    const targetUserId = req.params.userId;
+    if (targetUserId === project.ownerId) {
+      return res.status(400).json({ error: 'Cannot change the Project Owner role here.' });
+    }
+
+    const rawRole = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
+    if (!rawRole) {
+      return res.status(400).json({ error: 'role is required' });
+    }
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: { id: true, deletedAt: true },
+    });
+    if (!targetUser || targetUser.deletedAt) {
+      return res.status(404).json({ error: 'Target user not found' });
+    }
+
+    const membership = await prisma.projectMembership.upsert({
+      where: { projectId_userId: { projectId: project.id, userId: targetUserId } },
+      create: { projectId: project.id, userId: targetUserId, role: rawRole },
+      update: { role: rawRole },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, role: true, avatarUrl: true },
+        },
+      },
+    });
+
+    res.json(membership);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to update project member role' });
   }
 });
 

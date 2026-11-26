@@ -402,7 +402,10 @@ export function canManageIssue(
 export async function getVisibleWorkloadUserIds(ctx: UserHierarchyContext): Promise<string[]> {
   if (ctx.bypassPermissions || ctx.isExecutive) {
     // Executive / unrestricted users have organization-wide workload visibility
-    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    const allUsers = await prisma.user.findMany({
+      where: { deletedAt: null },
+      select: { id: true },
+    });
     return allUsers.map((u) => u.id);
   }
 
@@ -410,6 +413,7 @@ export async function getVisibleWorkloadUserIds(ctx: UserHierarchyContext): Prom
     // Roles with autoAddToProjects see themselves and all users strictly below their rank (excluding bypassPermissions)
     const lowerRankUsers = await prisma.user.findMany({
       where: {
+        deletedAt: null,
         roleDefinition: {
           is: {
             rank: { gt: ctx.roleRank },
@@ -462,8 +466,11 @@ export async function getVisibleWorkloadUserIds(ctx: UserHierarchyContext): Prom
  */
 export async function getVisibleDirectoryUserIds(ctx: UserHierarchyContext): Promise<string[]> {
   if (ctx.isExecutive || ctx.canManageUsers) {
-    // Executive and HR/User Managers see all users
-    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    // Executive and HR/User Managers see all active users
+    const allUsers = await prisma.user.findMany({
+      where: { deletedAt: null },
+      select: { id: true },
+    });
     return allUsers.map((u) => u.id);
   }
 
@@ -476,6 +483,7 @@ export async function getVisibleDirectoryUserIds(ctx: UserHierarchyContext): Pro
     // Leadership roles (e.g. CTO) can see all users strictly below their rank (Employees & Interns)
     const lowerRankUsers = await prisma.user.findMany({
       where: {
+        deletedAt: null,
         OR: [
           { roleDefinition: { is: { rank: { gt: ctx.roleRank }, bypassPermissions: false } } },
           { role: { in: ['Employee', 'Intern'] } },
@@ -496,6 +504,7 @@ export async function getVisibleDirectoryUserIds(ctx: UserHierarchyContext): Pro
     // Project owners need to see all employees across the organization to staff them onto projects
     const allEmployees = await prisma.user.findMany({
       where: {
+        deletedAt: null,
         OR: [
           { role: 'Employee' },
           { roleDefinition: { is: { rank: 3 } } },

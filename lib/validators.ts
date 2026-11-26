@@ -122,6 +122,75 @@ export const MilestoneCreateSchema = z
     forecastDate: z.string().or(z.date()),
   });
 
+const DATA_URI_IMAGE_REGEX = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/;
+
+export const logoUrlSchema = z
+  .union([z.string().trim(), z.null()])
+  .optional()
+  .transform((val) => (val === '' ? null : val))
+  .superRefine((val, ctx) => {
+    if (val === undefined || val === null) return;
+    const lower = val.toLowerCase();
+    if (lower.startsWith('data:image/svg+xml')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'SVG logos are not allowed for security reasons. Use PNG, JPEG, or WebP.',
+      });
+      return;
+    }
+    if (lower.startsWith('javascript:')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Invalid logo URL protocol.',
+      });
+      return;
+    }
+    if (lower.startsWith('data:')) {
+      if (!DATA_URI_IMAGE_REGEX.test(val)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Logo data URI must be a valid Base64 PNG, JPEG, or WebP image.',
+        });
+        return;
+      }
+      if (val.length > 350_000) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Logo image exceeds maximum allowed size (~250 KB).',
+        });
+      }
+      return;
+    }
+    if (!val.startsWith('https://')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Logo URL must be an https:// URL or a valid PNG/JPEG/WebP Base64 data URI.',
+      });
+      return;
+    }
+    if (val.length > 2048) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Logo URL cannot exceed 2048 characters.',
+      });
+      return;
+    }
+    try {
+      const parsed = new URL(val);
+      if (parsed.protocol !== 'https:') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Logo URL must use https://.',
+        });
+      }
+    } catch {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Invalid logo URL format.',
+      });
+    }
+  });
+
 export const ProjectCreateSchema = z
   .object({
     name: z.string().trim().min(1, 'Project name is required').max(150, 'Name cannot exceed 150 characters'),
@@ -132,6 +201,7 @@ export const ProjectCreateSchema = z
     ownerId: z.string().min(1).optional(),
     plannedBudget: z.coerce.number().min(0, 'Budget must be positive').max(100000000).optional().default(0),
     contingency: z.coerce.number().min(0, 'Contingency must be positive').max(100000000).optional().default(0),
+    logoUrl: logoUrlSchema,
   })
   .refine(
     (data) => {
@@ -155,6 +225,7 @@ export const ProjectCharterUpdateSchema = z
     ownerId: z.string().min(1).optional(),
     plannedBudget: z.coerce.number().min(0, 'Planned budget cannot be negative').optional(),
     contingency: z.coerce.number().min(0, 'Contingency cannot be negative').optional(),
+    logoUrl: logoUrlSchema,
   })
   .refine(
     (data) => {

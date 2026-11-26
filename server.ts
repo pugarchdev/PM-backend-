@@ -82,7 +82,7 @@ app.use((req, res, next) => {
 });
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // Public health check and root endpoints (zero authentication dependency)
 app.get('/', (req, res) => {

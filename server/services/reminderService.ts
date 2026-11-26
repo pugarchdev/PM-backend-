@@ -23,6 +23,7 @@ export async function processDueReminders(): Promise<{ processed: number; emails
       where: {
         remindAt: { lte: now },
         triggeredAt: null,
+        user: { deletedAt: null },
       },
       take: 20,
       orderBy: { remindAt: 'asc' },

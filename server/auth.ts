@@ -182,6 +182,7 @@ export function clearAuthCache(userId?: string): void {
 export function invalidateUserAuthCache(userId: string): void {
   clearAuthCache(userId);
 }
+export const invalidateAuthUserCache = invalidateUserAuthCache;
 registerAuthCacheInvalidator(invalidateUserAuthCache);
 
 /**
@@ -223,6 +224,11 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
       });
 
       if (user) {
+        if ((user as any).deletedAt !== null && (user as any).deletedAt !== undefined) {
+          authUserCache.delete(user.id);
+          req.user = undefined;
+          return next();
+        }
         const roleDef = user.roleDefinition;
         const roleName = roleDef?.name || user.role;
         const roleRank = roleDef?.rank ?? (user.role === 'CEO' ? 1 : user.role === 'CTO' || user.role === 'ProjectOwner' ? 2 : user.role === 'Intern' ? 4 : 3);

@@ -33,6 +33,7 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
         where: {
           id: { in: visibleUserIds },
           isSignupCompleted: true,
+          deletedAt: null,
         },
         select: {
           id: true,
@@ -177,6 +178,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
         where: {
           id: { in: visibleUserIds },
           isSignupCompleted: true,
+          deletedAt: null,
         },
         select: {
           id: true,

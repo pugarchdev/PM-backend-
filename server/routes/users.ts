@@ -9,6 +9,7 @@ import {
   normalizePhone,
   isValidEmail,
   isValidPhone,
+  invalidateAuthUserCache,
 } from '../auth.js';
 import {
   canManageTargetRank,
@@ -19,6 +20,7 @@ import {
 import {
   getUserHierarchyContext,
   getVisibleDirectoryUserIds,
+  clearUserHierarchyCache,
 } from '../services/authorizationService.js';
 import { sendPreRegistrationEmail, resolvePortalUrl } from '../services/emailService.js';
 
@@ -38,12 +40,14 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: 'Forbidden: Insufficient privileges to view user summary metrics.' });
     }
 
-    const [totalUsers, activeUsers, pendingUsers, departmentGroups] = await Promise.all([
-      prisma.user.count(),
-      prisma.user.count({ where: { isSignupCompleted: true } }),
-      prisma.user.count({ where: { isSignupCompleted: false } }),
+    const [totalUsers, activeUsers, pendingUsers, deletedUsers, departmentGroups] = await Promise.all([
+      prisma.user.count({ where: { deletedAt: null } }),
+      prisma.user.count({ where: { isSignupCompleted: true, deletedAt: null } }),
+      prisma.user.count({ where: { isSignupCompleted: false, deletedAt: null } }),
+      prisma.user.count({ where: { deletedAt: { not: null } } }),
       prisma.user.groupBy({
         by: ['department'],
+        where: { deletedAt: null },
         _count: { id: true },
       }),
     ]);
@@ -52,6 +56,7 @@ router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
       totalUsers,
       activeUsers,
       pendingUsers,
+      deletedUsers,
       departmentCounts: departmentGroups.map((d) => ({
         department: d.department || 'Unassigned',
         count: d._count.id,
@@ -89,6 +94,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     const where: any = {
       id: { in: visibleIds },
       isSignupCompleted: true,
+      deletedAt: null,
     };
 
     if (search && typeof search === 'string' && search.trim()) {
@@ -229,8 +235,9 @@ router.get('/management', requireAuth, requirePermission('add_user'), async (req
       AND: [hierarchyFilter],
     };
 
+    const isDeletedView = status === 'deleted';
     const where: any = {
-      AND: [hierarchyFilter],
+      AND: [hierarchyFilter, isDeletedView ? { deletedAt: { not: null } } : { deletedAt: null }],
     };
 
     if (status === 'pending') {
@@ -276,6 +283,8 @@ router.get('/management', requireAuth, requirePermission('add_user'), async (req
       department: true,
       avatarUrl: true,
       isSignupCompleted: true,
+      deletedAt: true,
+      deletedById: true,
       createdAt: true,
       roleDefinition: {
         select: { id: true, name: true, rank: true, isExecutive: true },
@@ -283,24 +292,34 @@ router.get('/management', requireAuth, requirePermission('add_user'), async (req
       manager: {
         select: { id: true, name: true, role: true },
       },
+      deletedBy: {
+        select: { id: true, name: true },
+      },
     };
 
-    const validSortFields = ['name', 'email', 'department', 'role', 'createdAt', 'isSignupCompleted'];
+    const validSortFields = ['name', 'email', 'department', 'role', 'createdAt', 'isSignupCompleted', 'deletedAt'];
     const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : 'name';
     const order = String(sortOrder).toLowerCase() === 'desc' ? 'desc' : 'asc';
-    const orderBy = [{ isSignupCompleted: 'asc' as const }, { [field]: order }];
+    const orderBy = isDeletedView
+      ? [{ deletedAt: 'desc' as const }]
+      : [{ isSignupCompleted: 'asc' as const }, { [field]: order }];
 
     if (isPaginated) {
-      const [total, pendingCount, completedCount, users] = await Promise.all([
+      const [total, pendingCount, completedCount, deletedCount, users] = await Promise.all([
         prisma.user.count({ where }),
         prisma.user.count({
           where: {
-            AND: [...hierarchyWhere.AND, { isSignupCompleted: false }],
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: false, deletedAt: null }],
           },
         }),
         prisma.user.count({
           where: {
-            AND: [...hierarchyWhere.AND, { isSignupCompleted: true }],
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: true, deletedAt: null }],
+          },
+        }),
+        prisma.user.count({
+          where: {
+            AND: [...hierarchyWhere.AND, { deletedAt: { not: null } }],
           },
         }),
         prisma.user.findMany({
@@ -326,6 +345,7 @@ router.get('/management', requireAuth, requirePermission('add_user'), async (req
           total: pendingCount + completedCount,
           pending: pendingCount,
           completed: completedCount,
+          deleted: deletedCount,
         },
       });
     }
@@ -333,7 +353,7 @@ router.get('/management', requireAuth, requirePermission('add_user'), async (req
     const users = await prisma.user.findMany({
       where,
       select: selectProjection,
-      orderBy: [{ isSignupCompleted: 'asc' }, { name: 'asc' }],
+      orderBy: isDeletedView ? [{ deletedAt: 'desc' }] : [{ isSignupCompleted: 'asc' }, { name: 'asc' }],
     });
 
     res.setHeader('X-Total-Count', String(users.length));
@@ -373,6 +393,11 @@ router.post('/pre-register', requireAuth, requirePermission('add_user'), async (
       where: { email: cleanEmail },
     });
     if (existingEmail) {
+      if ((existingEmail as any).deletedAt !== null && (existingEmail as any).deletedAt !== undefined) {
+        return res.status(409).json({
+          error: 'A deleted user with this email/phone already exists. Restore the account from the Deleted Users tab instead.',
+        });
+      }
       return res.status(400).json({ error: 'An account with this email address already exists.' });
     }
 
@@ -381,6 +406,11 @@ router.post('/pre-register', requireAuth, requirePermission('add_user'), async (
       where: { phone: cleanPhone },
     });
     if (existingPhone) {
+      if ((existingPhone as any).deletedAt !== null && (existingPhone as any).deletedAt !== undefined) {
+        return res.status(409).json({
+          error: 'A deleted user with this email/phone already exists. Restore the account from the Deleted Users tab instead.',
+        });
+      }
       return res.status(400).json({ error: 'An account with this phone number already exists.' });
     }
 
@@ -504,6 +534,14 @@ router.patch('/:id/manager', requireAuth, requireCanManageUsers, async (req: Aut
       return res.status(404).json({ error: 'User not found' });
     }
 
+    if ((targetUser as any).deletedAt !== null && (targetUser as any).deletedAt !== undefined) {
+      return res.status(400).json({ error: 'Cannot change role for a deleted user.' });
+    }
+
+    if ((targetUser as any).deletedAt !== null && (targetUser as any).deletedAt !== undefined) {
+      return res.status(400).json({ error: 'Cannot modify reporting manager for a deleted user.' });
+    }
+
     if (managerId === null || managerId === '') {
       const updated = await prisma.user.update({
         where: { id: targetUserId },
@@ -523,6 +561,10 @@ router.patch('/:id/manager', requireAuth, requireCanManageUsers, async (req: Aut
 
     if (!managerUser) {
       return res.status(404).json({ error: 'Designated manager does not exist.' });
+    }
+
+    if ((managerUser as any).deletedAt !== null && (managerUser as any).deletedAt !== undefined) {
+      return res.status(400).json({ error: 'Cannot assign a deleted user as reporting manager.' });
     }
 
     const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === 'Intern' ? 4 : targetUser.role === 'Employee' ? 3 : 2);
@@ -580,6 +622,10 @@ router.patch('/:id/role', requireAuth, requireCanManageUsers, async (req: AuthRe
 
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    if ((targetUser as any).deletedAt !== null && (targetUser as any).deletedAt !== undefined) {
+      return res.status(400).json({ error: 'Cannot change role for a deleted user.' });
     }
 
     let targetRole = null;
@@ -887,6 +933,10 @@ router.get('/:id', requireAuth, requirePermission('add_user'), async (req: AuthR
       return res.status(404).json({ error: 'User not found' });
     }
 
+    if ((targetUser as any).deletedAt !== null && (targetUser as any).deletedAt !== undefined) {
+      return res.status(400).json({ error: 'Cannot change role for a deleted user.' });
+    }
+
     const targetRoleRank = targetUser.roleDefinition?.rank ?? 4;
     const targetBypassPermissions = Boolean(targetUser.roleDefinition?.bypassPermissions);
 
@@ -925,6 +975,123 @@ router.get('/:id', requireAuth, requirePermission('add_user'), async (req: AuthR
   } catch (error: any) {
     console.error('Failed to retrieve user details:', error);
     res.status(500).json({ error: 'Failed to retrieve user details' });
+  }
+});
+
+/**
+ * DELETE /api/users/:id
+ * Soft-deletes a user account while preserving historical tasks, projects, and audit records.
+ * Restricted to executive / user managers with sufficient hierarchy rank.
+ */
+router.delete('/:id', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
+  try {
+    const targetUserId = req.params.id;
+    if (targetUserId === req.user!.id) {
+      return res.status(400).json({ error: 'You cannot delete your own account.' });
+    }
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: { roleDefinition: true },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (targetUser.deletedAt !== null) {
+      return res.status(400).json({ error: 'User is already deleted.' });
+    }
+
+    const targetRank =
+      targetUser.roleDefinition?.rank ?? (targetUser.role === 'Intern' ? 4 : targetUser.role === 'Employee' ? 3 : 2);
+    const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+
+    if (
+      !canManageTargetRank(req.user!, targetRank) ||
+      (!isUnrestrictedUser(req.user) && targetBypass)
+    ) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient hierarchy privileges to delete this user.' });
+    }
+
+    const deletedAt = new Date();
+    await prisma.user.update({
+      where: { id: targetUser.id },
+      data: {
+        deletedAt,
+        deletedById: req.user!.id,
+      },
+    });
+
+    invalidateAuthUserCache(targetUser.id);
+    clearUserHierarchyCache(targetUser.id);
+
+    res.json({
+      message: 'User soft-deleted successfully',
+      id: targetUser.id,
+      deletedAt,
+    });
+  } catch (error: any) {
+    console.error('Failed to soft-delete user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+/**
+ * PATCH /api/users/:id/restore
+ * Restores a soft-deleted user account and re-enables login/API access.
+ * Restricted to executive / user managers with sufficient hierarchy rank.
+ */
+router.patch('/:id/restore', requireAuth, requireCanManageUsers, async (req: AuthRequest, res: Response) => {
+  try {
+    const targetUserId = req.params.id;
+
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: { roleDefinition: true },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (targetUser.deletedAt === null) {
+      return res.status(400).json({ error: 'User is not deleted.' });
+    }
+
+    const targetRank =
+      targetUser.roleDefinition?.rank ?? (targetUser.role === 'Intern' ? 4 : targetUser.role === 'Employee' ? 3 : 2);
+    const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+
+    if (
+      !canManageTargetRank(req.user!, targetRank) ||
+      (!isUnrestrictedUser(req.user) && targetBypass)
+    ) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient hierarchy privileges to restore this user.' });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: targetUser.id },
+      data: {
+        deletedAt: null,
+        deletedById: null,
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } },
+      },
+    });
+
+    invalidateAuthUserCache(targetUser.id);
+    clearUserHierarchyCache(targetUser.id);
+
+    res.json({
+      message: 'User restored successfully',
+      user: updatedUser,
+    });
+  } catch (error: any) {
+    console.error('Failed to restore user:', error);
+    res.status(500).json({ error: 'Failed to restore user' });
   }
 });
 

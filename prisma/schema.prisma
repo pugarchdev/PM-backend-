@@ -24,11 +24,15 @@ model User {
   department                String?
   avatarUrl                 String?
   isSignupCompleted         Boolean             @default(false)
+  deletedAt                 DateTime?
+  deletedById               String?
   createdAt                 DateTime            @default(now())
   updatedAt                 DateTime            @updatedAt
   roleDefinition            Role?               @relation(fields: [roleId], references: [id], onDelete: SetNull)
   manager                   User?               @relation("ReportingLine", fields: [managerId], references: [id], onDelete: SetNull)
   subordinates              User[]              @relation("ReportingLine")
+  deletedBy                 User?               @relation("UserDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  deletedUsers              User[]              @relation("UserDeletedBy")
   allocations               Allocation[]
   approvalRequestsApproving ApprovalRequest[]   @relation("ApprovalApprover")
   approvalRequestsRequested ApprovalRequest[]   @relation("ApprovalRequester")
@@ -58,6 +62,7 @@ model User {
   @@index([role])
   @@index([roleId])
   @@index([managerId])
+  @@index([deletedAt])
 }
 
 model Role {
@@ -113,6 +118,7 @@ model Project {
   spendToDate      Float               @default(0)
   statusOverride   String?
   baselineId       String?
+  logoUrl          String?
   createdAt        DateTime            @default(now())
   updatedAt        DateTime            @updatedAt
   allocations      Allocation[]

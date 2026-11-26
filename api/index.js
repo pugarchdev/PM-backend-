@@ -1,7 +1,12 @@
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+var __esm = (fn, res, err) => function __init() {
+  if (err) throw err[0];
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    throw err = [e], e;
+  }
 };
 var __export = (target, all) => {
   for (var name in all)
@@ -269,12 +274,16 @@ function canManageIssue(ctx, issue) {
 }
 async function getVisibleWorkloadUserIds(ctx) {
   if (ctx.bypassPermissions || ctx.isExecutive) {
-    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    const allUsers = await prisma.user.findMany({
+      where: { deletedAt: null },
+      select: { id: true }
+    });
     return allUsers.map((u) => u.id);
   }
   if (ctx.autoAddToProjects) {
     const lowerRankUsers = await prisma.user.findMany({
       where: {
+        deletedAt: null,
         roleDefinition: {
           is: {
             rank: { gt: ctx.roleRank },
@@ -316,7 +325,10 @@ async function getVisibleWorkloadUserIds(ctx) {
 }
 async function getVisibleDirectoryUserIds(ctx) {
   if (ctx.isExecutive || ctx.canManageUsers) {
-    const allUsers = await prisma.user.findMany({ select: { id: true } });
+    const allUsers = await prisma.user.findMany({
+      where: { deletedAt: null },
+      select: { id: true }
+    });
     return allUsers.map((u) => u.id);
   }
   const visibleIds = /* @__PURE__ */ new Set([ctx.userId]);
@@ -324,6 +336,7 @@ async function getVisibleDirectoryUserIds(ctx) {
   if (ctx.roleRank <= 2 || ctx.autoAddToProjects) {
     const lowerRankUsers = await prisma.user.findMany({
       where: {
+        deletedAt: null,
         OR: [
           { roleDefinition: { is: { rank: { gt: ctx.roleRank }, bypassPermissions: false } } },
           { role: { in: ["Employee", "Intern"] } }
@@ -340,6 +353,7 @@ async function getVisibleDirectoryUserIds(ctx) {
   if (isProjectOwner) {
     const allEmployees = await prisma.user.findMany({
       where: {
+        deletedAt: null,
         OR: [
           { role: "Employee" },
           { roleDefinition: { is: { rank: 3 } } }
@@ -977,6 +991,7 @@ function clearAuthCache(userId) {
 function invalidateUserAuthCache2(userId) {
   clearAuthCache(userId);
 }
+var invalidateAuthUserCache = invalidateUserAuthCache2;
 registerAuthCacheInvalidator(invalidateUserAuthCache2);
 async function authenticate(req, res, next) {
   let userId;
@@ -1008,6 +1023,11 @@ async function authenticate(req, res, next) {
         include: { roleDefinition: true }
       });
       if (user) {
+        if (user.deletedAt !== null && user.deletedAt !== void 0) {
+          authUserCache.delete(user.id);
+          req.user = void 0;
+          return next();
+        }
         const roleDef = user.roleDefinition;
         const roleName = roleDef?.name || user.role;
         const roleRank = roleDef?.rank ?? (user.role === "CEO" ? 1 : user.role === "CTO" || user.role === "ProjectOwner" ? 2 : user.role === "Intern" ? 4 : 3);
@@ -2905,6 +2925,11 @@ router2.post("/login", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Invalid credentials. User not found." });
     }
+    if (user.deletedAt !== null && user.deletedAt !== void 0) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator."
+      });
+    }
     if (!user.isSignupCompleted) {
       return res.status(403).json({
         error: "Your account registration has not been completed. Please complete signup first before signing in."
@@ -3000,6 +3025,13 @@ async function resolvePreRegisteredCandidate(reqBody) {
     return {
       errorStatus: 403,
       errorMessage: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account.",
+      user: null
+    };
+  }
+  if (user.deletedAt !== null && user.deletedAt !== void 0) {
+    return {
+      errorStatus: 403,
+      errorMessage: "This account has been deactivated. Contact your administrator.",
       user: null
     };
   }
@@ -3249,6 +3281,11 @@ var handleRegister = async (req, res) => {
         error: "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account."
       });
     }
+    if (preRegisteredUser.deletedAt !== null && preRegisteredUser.deletedAt !== void 0) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator."
+      });
+    }
     const prePhone = preRegisteredUser.phone ? normalizePhone(preRegisteredUser.phone) : null;
     if (!prePhone || !isMatchingPhone(prePhone, cleanPhone)) {
       return res.status(403).json({
@@ -3405,6 +3442,11 @@ router2.post("/forgot-password", async (req, res) => {
         where: { phone: parsed.value }
       });
     }
+    if (user && user.deletedAt !== null && user.deletedAt !== void 0) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator."
+      });
+    }
     if (!user || !user.isSignupCompleted) {
       return res.json({
         success: true,
@@ -3483,6 +3525,11 @@ router2.post("/reset-password", async (req, res) => {
     }
     if (!user) {
       return res.status(400).json({ error: "Invalid recovery code or account details." });
+    }
+    if (user.deletedAt !== null && user.deletedAt !== void 0) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator."
+      });
     }
     const storedToken = user.resetToken;
     const tokenExpiry = user.resetTokenExpiry;
@@ -8301,7 +8348,8 @@ router10.get("/summary", requireAuth, async (req, res) => {
       prisma.user.findMany({
         where: {
           id: { in: visibleUserIds },
-          isSignupCompleted: true
+          isSignupCompleted: true,
+          deletedAt: null
         },
         select: {
           id: true,
@@ -8426,7 +8474,8 @@ router10.get("/", requireAuth, async (req, res) => {
       prisma.user.findMany({
         where: {
           id: { in: visibleUserIds },
-          isSignupCompleted: true
+          isSignupCompleted: true,
+          deletedAt: null
         },
         select: {
           id: true,
@@ -10432,7 +10481,8 @@ async function processDueReminders() {
     const dueReminders = await prisma.reminder.findMany({
       where: {
         remindAt: { lte: now },
-        triggeredAt: null
+        triggeredAt: null,
+        user: { deletedAt: null }
       },
       take: 20,
       orderBy: { remindAt: "asc" },
@@ -10993,12 +11043,14 @@ router19.get("/summary", requireAuth, async (req, res) => {
     if (!ctx.isExecutive && ctx.roleRank > 2) {
       return res.status(403).json({ error: "Forbidden: Insufficient privileges to view user summary metrics." });
     }
-    const [totalUsers, activeUsers, pendingUsers, departmentGroups] = await Promise.all([
-      prisma.user.count(),
-      prisma.user.count({ where: { isSignupCompleted: true } }),
-      prisma.user.count({ where: { isSignupCompleted: false } }),
+    const [totalUsers, activeUsers, pendingUsers, deletedUsers, departmentGroups] = await Promise.all([
+      prisma.user.count({ where: { deletedAt: null } }),
+      prisma.user.count({ where: { isSignupCompleted: true, deletedAt: null } }),
+      prisma.user.count({ where: { isSignupCompleted: false, deletedAt: null } }),
+      prisma.user.count({ where: { deletedAt: { not: null } } }),
       prisma.user.groupBy({
         by: ["department"],
+        where: { deletedAt: null },
         _count: { id: true }
       })
     ]);
@@ -11006,6 +11058,7 @@ router19.get("/summary", requireAuth, async (req, res) => {
       totalUsers,
       activeUsers,
       pendingUsers,
+      deletedUsers,
       departmentCounts: departmentGroups.map((d) => ({
         department: d.department || "Unassigned",
         count: d._count.id
@@ -11032,7 +11085,8 @@ router19.get("/", requireAuth, async (req, res) => {
     } = req.query;
     const where = {
       id: { in: visibleIds },
-      isSignupCompleted: true
+      isSignupCompleted: true,
+      deletedAt: null
     };
     if (search && typeof search === "string" && search.trim()) {
       const term = search.trim();
@@ -11150,8 +11204,9 @@ router19.get("/management", requireAuth, requirePermission("add_user"), async (r
     const hierarchyWhere = {
       AND: [hierarchyFilter]
     };
+    const isDeletedView = status === "deleted";
     const where = {
-      AND: [hierarchyFilter]
+      AND: [hierarchyFilter, isDeletedView ? { deletedAt: { not: null } } : { deletedAt: null }]
     };
     if (status === "pending") {
       where.AND.push({ isSignupCompleted: false });
@@ -11191,29 +11246,39 @@ router19.get("/management", requireAuth, requirePermission("add_user"), async (r
       department: true,
       avatarUrl: true,
       isSignupCompleted: true,
+      deletedAt: true,
+      deletedById: true,
       createdAt: true,
       roleDefinition: {
         select: { id: true, name: true, rank: true, isExecutive: true }
       },
       manager: {
         select: { id: true, name: true, role: true }
+      },
+      deletedBy: {
+        select: { id: true, name: true }
       }
     };
-    const validSortFields = ["name", "email", "department", "role", "createdAt", "isSignupCompleted"];
+    const validSortFields = ["name", "email", "department", "role", "createdAt", "isSignupCompleted", "deletedAt"];
     const field = validSortFields.includes(String(sortBy)) ? String(sortBy) : "name";
     const order = String(sortOrder).toLowerCase() === "desc" ? "desc" : "asc";
-    const orderBy = [{ isSignupCompleted: "asc" }, { [field]: order }];
+    const orderBy = isDeletedView ? [{ deletedAt: "desc" }] : [{ isSignupCompleted: "asc" }, { [field]: order }];
     if (isPaginated) {
-      const [total, pendingCount, completedCount, users2] = await Promise.all([
+      const [total, pendingCount, completedCount, deletedCount, users2] = await Promise.all([
         prisma.user.count({ where }),
         prisma.user.count({
           where: {
-            AND: [...hierarchyWhere.AND, { isSignupCompleted: false }]
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: false, deletedAt: null }]
           }
         }),
         prisma.user.count({
           where: {
-            AND: [...hierarchyWhere.AND, { isSignupCompleted: true }]
+            AND: [...hierarchyWhere.AND, { isSignupCompleted: true, deletedAt: null }]
+          }
+        }),
+        prisma.user.count({
+          where: {
+            AND: [...hierarchyWhere.AND, { deletedAt: { not: null } }]
           }
         }),
         prisma.user.findMany({
@@ -11237,14 +11302,15 @@ router19.get("/management", requireAuth, requirePermission("add_user"), async (r
         summary: {
           total: pendingCount + completedCount,
           pending: pendingCount,
-          completed: completedCount
+          completed: completedCount,
+          deleted: deletedCount
         }
       });
     }
     const users = await prisma.user.findMany({
       where,
       select: selectProjection,
-      orderBy: [{ isSignupCompleted: "asc" }, { name: "asc" }]
+      orderBy: isDeletedView ? [{ deletedAt: "desc" }] : [{ isSignupCompleted: "asc" }, { name: "asc" }]
     });
     res.setHeader("X-Total-Count", String(users.length));
     res.json(users);
@@ -11271,12 +11337,22 @@ router19.post("/pre-register", requireAuth, requirePermission("add_user"), async
       where: { email: cleanEmail }
     });
     if (existingEmail) {
+      if (existingEmail.deletedAt !== null && existingEmail.deletedAt !== void 0) {
+        return res.status(409).json({
+          error: "A deleted user with this email/phone already exists. Restore the account from the Deleted Users tab instead."
+        });
+      }
       return res.status(400).json({ error: "An account with this email address already exists." });
     }
     const existingPhone = await prisma.user.findUnique({
       where: { phone: cleanPhone }
     });
     if (existingPhone) {
+      if (existingPhone.deletedAt !== null && existingPhone.deletedAt !== void 0) {
+        return res.status(409).json({
+          error: "A deleted user with this email/phone already exists. Restore the account from the Deleted Users tab instead."
+        });
+      }
       return res.status(400).json({ error: "An account with this phone number already exists." });
     }
     let targetRole = null;
@@ -11375,6 +11451,12 @@ router19.patch("/:id/manager", requireAuth, requireCanManageUsers, async (req, r
     if (!targetUser) {
       return res.status(404).json({ error: "User not found" });
     }
+    if (targetUser.deletedAt !== null && targetUser.deletedAt !== void 0) {
+      return res.status(400).json({ error: "Cannot change role for a deleted user." });
+    }
+    if (targetUser.deletedAt !== null && targetUser.deletedAt !== void 0) {
+      return res.status(400).json({ error: "Cannot modify reporting manager for a deleted user." });
+    }
     if (managerId === null || managerId === "") {
       const updated2 = await prisma.user.update({
         where: { id: targetUserId },
@@ -11391,6 +11473,9 @@ router19.patch("/:id/manager", requireAuth, requireCanManageUsers, async (req, r
     });
     if (!managerUser) {
       return res.status(404).json({ error: "Designated manager does not exist." });
+    }
+    if (managerUser.deletedAt !== null && managerUser.deletedAt !== void 0) {
+      return res.status(400).json({ error: "Cannot assign a deleted user as reporting manager." });
     }
     const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === "Intern" ? 4 : targetUser.role === "Employee" ? 3 : 2);
     const mgrRank = managerUser.roleDefinition?.rank ?? (managerUser.role === "CEO" || managerUser.role === "HR" ? 1 : managerUser.role === "CTO" ? 2 : 3);
@@ -11435,6 +11520,9 @@ router19.patch("/:id/role", requireAuth, requireCanManageUsers, async (req, res)
     });
     if (!targetUser) {
       return res.status(404).json({ error: "User not found" });
+    }
+    if (targetUser.deletedAt !== null && targetUser.deletedAt !== void 0) {
+      return res.status(400).json({ error: "Cannot change role for a deleted user." });
     }
     let targetRole = null;
     if (roleId) {
@@ -11694,6 +11782,9 @@ router19.get("/:id", requireAuth, requirePermission("add_user"), async (req, res
     if (!targetUser) {
       return res.status(404).json({ error: "User not found" });
     }
+    if (targetUser.deletedAt !== null && targetUser.deletedAt !== void 0) {
+      return res.status(400).json({ error: "Cannot change role for a deleted user." });
+    }
     const targetRoleRank = targetUser.roleDefinition?.rank ?? 4;
     const targetBypassPermissions = Boolean(targetUser.roleDefinition?.bypassPermissions);
     if (!canManageTargetRank(req.user, targetRoleRank) || !isUnrestrictedUser(req.user) && targetBypassPermissions) {
@@ -11723,6 +11814,87 @@ router19.get("/:id", requireAuth, requirePermission("add_user"), async (req, res
   } catch (error) {
     console.error("Failed to retrieve user details:", error);
     res.status(500).json({ error: "Failed to retrieve user details" });
+  }
+});
+router19.delete("/:id", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    if (targetUserId === req.user.id) {
+      return res.status(400).json({ error: "You cannot delete your own account." });
+    }
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: { roleDefinition: true }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (targetUser.deletedAt !== null) {
+      return res.status(400).json({ error: "User is already deleted." });
+    }
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === "Intern" ? 4 : targetUser.role === "Employee" ? 3 : 2);
+    const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+    if (!canManageTargetRank(req.user, targetRank) || !isUnrestrictedUser(req.user) && targetBypass) {
+      return res.status(403).json({ error: "Forbidden: Insufficient hierarchy privileges to delete this user." });
+    }
+    const deletedAt = /* @__PURE__ */ new Date();
+    await prisma.user.update({
+      where: { id: targetUser.id },
+      data: {
+        deletedAt,
+        deletedById: req.user.id
+      }
+    });
+    invalidateAuthUserCache(targetUser.id);
+    clearUserHierarchyCache(targetUser.id);
+    res.json({
+      message: "User soft-deleted successfully",
+      id: targetUser.id,
+      deletedAt
+    });
+  } catch (error) {
+    console.error("Failed to soft-delete user:", error);
+    res.status(500).json({ error: "Failed to delete user" });
+  }
+});
+router19.patch("/:id/restore", requireAuth, requireCanManageUsers, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+      include: { roleDefinition: true }
+    });
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (targetUser.deletedAt === null) {
+      return res.status(400).json({ error: "User is not deleted." });
+    }
+    const targetRank = targetUser.roleDefinition?.rank ?? (targetUser.role === "Intern" ? 4 : targetUser.role === "Employee" ? 3 : 2);
+    const targetBypass = Boolean(targetUser.roleDefinition?.bypassPermissions);
+    if (!canManageTargetRank(req.user, targetRank) || !isUnrestrictedUser(req.user) && targetBypass) {
+      return res.status(403).json({ error: "Forbidden: Insufficient hierarchy privileges to restore this user." });
+    }
+    const updatedUser = await prisma.user.update({
+      where: { id: targetUser.id },
+      data: {
+        deletedAt: null,
+        deletedById: null
+      },
+      include: {
+        roleDefinition: true,
+        manager: { select: { id: true, name: true, role: true } }
+      }
+    });
+    invalidateAuthUserCache(targetUser.id);
+    clearUserHierarchyCache(targetUser.id);
+    res.json({
+      message: "User restored successfully",
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error("Failed to restore user:", error);
+    res.status(500).json({ error: "Failed to restore user" });
   }
 });
 var users_default = router19;

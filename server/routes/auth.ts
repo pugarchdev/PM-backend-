@@ -105,6 +105,12 @@ router.post("/login", async (req: AuthRequest, res: Response) => {
         .json({ error: "Invalid credentials. User not found." });
     }
 
+    if ((user as any).deletedAt !== null && (user as any).deletedAt !== undefined) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator.",
+      });
+    }
+
     // Block login if signup has not been completed
     if (!(user as any).isSignupCompleted) {
       return res.status(403).json({
@@ -237,6 +243,15 @@ async function resolvePreRegisteredCandidate(reqBody: any) {
       errorStatus: 403,
       errorMessage:
         "Your details have not been registered by HR/CEO. Please contact HR/CEO before creating your account.",
+      user: null,
+    };
+  }
+
+  if ((user as any).deletedAt !== null && (user as any).deletedAt !== undefined) {
+    return {
+      errorStatus: 403,
+      errorMessage:
+        "This account has been deactivated. Contact your administrator.",
       user: null,
     };
   }
@@ -626,6 +641,16 @@ const handleRegister = async (req: AuthRequest, res: Response) => {
       });
     }
 
+    if (
+      (preRegisteredUser as any).deletedAt !== null &&
+      (preRegisteredUser as any).deletedAt !== undefined
+    ) {
+      return res.status(403).json({
+        error:
+          "This account has been deactivated. Contact your administrator.",
+      });
+    }
+
     const prePhone = (preRegisteredUser as any).phone
       ? normalizePhone((preRegisteredUser as any).phone)
       : null;
@@ -841,6 +866,12 @@ router.post("/forgot-password", async (req: AuthRequest, res: Response) => {
       });
     }
 
+    if (user && (user as any).deletedAt !== null && (user as any).deletedAt !== undefined) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator.",
+      });
+    }
+
     // Prevent account enumeration: return uniform success message even if account not found
     if (!user || !(user as any).isSignupCompleted) {
       return res.json({
@@ -950,6 +981,12 @@ router.post("/reset-password", async (req: AuthRequest, res: Response) => {
       return res
         .status(400)
         .json({ error: "Invalid recovery code or account details." });
+    }
+
+    if ((user as any).deletedAt !== null && (user as any).deletedAt !== undefined) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Contact your administrator.",
+      });
     }
 
     const storedToken = (user as any).resetToken;
