@@ -322,10 +322,11 @@ router.get('/documents/:id/download', requireAuth, async (req: AuthRequest, res:
 
     const s3Data = await getFromS3(versionRecord.s3Key);
 
+    const disposition = req.query.inline === 'true' ? 'inline' : 'attachment';
     res.setHeader('Content-Type', versionRecord.mimeType || 'application/octet-stream');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${encodeURIComponent(versionRecord.fileName)}"`
+      `${disposition}; filename="${encodeURIComponent(versionRecord.fileName)}"`
     );
     res.send(s3Data.buffer);
   } catch (error) {

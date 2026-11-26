@@ -117,4 +117,33 @@ router.post('/read-all', requireAuth, async (req: AuthRequest, res: Response) =>
   }
 });
 
+// DELETE /api/notifications/:id
+router.delete('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user!.id;
+
+    const notification = await prisma.notification.findFirst({
+      where: { id, userId },
+    });
+
+    if (!notification) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    await prisma.notification.delete({
+      where: { id },
+    });
+
+    const unreadCount = await prisma.notification.count({
+      where: { userId, isRead: false },
+    });
+
+    res.json({ success: true, unreadCount });
+  } catch (error) {
+    console.error('Failed to delete notification:', error);
+    res.status(500).json({ error: 'Failed to delete notification' });
+  }
+});
+
 export default router;
