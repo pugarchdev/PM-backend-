@@ -54,10 +54,37 @@ export function isUnrestrictedUser(user: { bypassPermissions?: boolean | null } 
   return Boolean(user?.bypassPermissions);
 }
 
+export const CANONICAL_PERMISSIONS = [
+  {
+    key: 'add_project_member',
+    name: 'Add Project Members',
+    description: 'Can add active users to projects they belong to',
+  },
+] as const;
+
+let canonicalPermissionsSynced = false;
+
+export async function ensureCanonicalPermissions(): Promise<void> {
+  if (canonicalPermissionsSynced) return;
+  try {
+    for (const perm of CANONICAL_PERMISSIONS) {
+      await prisma.configuration.upsert({
+        where: { key: perm.key },
+        update: {},
+        create: { key: perm.key, name: perm.name },
+      });
+    }
+    canonicalPermissionsSynced = true;
+  } catch (err) {
+    console.warn('[PermissionService] Failed to ensure canonical permissions:', err);
+  }
+}
+
 /**
  * Retrieves all configuration rows ordered by creation date
  */
 export async function getConfigurations(): Promise<Array<{ id: string; name: string; key: string; createdAt: Date }>> {
+  await ensureCanonicalPermissions();
   return prisma.configuration.findMany({
     orderBy: { createdAt: 'asc' },
     select: {
@@ -122,6 +149,7 @@ export async function createConfiguration(
  */
 export async function getUserPermissionKeys(userId: string): Promise<string[]> {
   if (!userId) return [];
+  await ensureCanonicalPermissions();
   const [permissionRow, configRows] = await Promise.all([
     prisma.permission.findUnique({
       where: { userId },

@@ -5,15 +5,24 @@ import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth, requirePermission } from '../auth.js';
 import { calculateProgress, calculatePlanPercentage, calculateProjectStatus } from '../../lib/calculations.js';
 import { formatCurrency } from '../../lib/currency.js';
-import { StatusOverrideSchema, ProjectCreateSchema, ProjectCharterUpdateSchema } from '../../lib/validators.js';
+import {
+  StatusOverrideSchema,
+  ProjectCreateSchema,
+  ProjectCharterUpdateSchema,
+  ProjectTransferOwnershipSchema,
+  SubProjectCreateSchema,
+  SubProjectUpdateSchema,
+} from '../../lib/validators.js';
 import {
   getUserHierarchyContext,
+  clearUserHierarchyCache,
   canViewProject,
   canManageProject,
-  canTransferProjectOwnership,
+  canAddProjectMember,
   canAccessBudget,
 } from '../services/authorizationService.js';
-import { addAutoJoinRoleUsersToProject, hasPermission } from '../services/permissionService.js';
+import { addAutoJoinRoleUsersToProject, getUserPermissionKeys, hasPermission } from '../services/permissionService.js';
+import { createNotification } from '../services/notificationService.js';
 
 const router = Router();
 
@@ -288,7 +297,7 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid project input' });
     }
 
-    const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0, logoUrl } = validation.data;
+    const { name, goal, sponsor, startDate, endDate, plannedBudget = 0, contingency = 0, logoUrl, subProjects } = validation.data;
     const hasBudgetAccess = canAccessBudget(ctx, user);
     const effectivePlannedBudget = hasBudgetAccess ? Number(plannedBudget) : 0;
     const effectiveContingency = hasBudgetAccess ? Number(contingency) : 0;
@@ -344,6 +353,26 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
       // Automatically add users with auto-join roles to the project
       await addAutoJoinRoleUsersToProject(tx, p.id);
 
+      // Create initial sub-projects if provided (deduplicated case-insensitively)
+      if (subProjects && subProjects.length > 0) {
+        const seenNames = new Set<string>();
+        const uniqueSubProjects: Array<{ projectId: string; name: string; type: string; description: string | null }> = [];
+        for (const sp of subProjects) {
+          const key = sp.name.trim().toLowerCase();
+          if (!key || seenNames.has(key)) continue;
+          seenNames.add(key);
+          uniqueSubProjects.push({
+            projectId: p.id,
+            name: sp.name.trim(),
+            type: sp.type || 'APP',
+            description: sp.description ?? null,
+          });
+        }
+        if (uniqueSubProjects.length > 0) {
+          await tx.subProject.createMany({ data: uniqueSubProjects });
+        }
+      }
+
       // Record creation in Change Log
       await tx.changeLogEntry.create({
         data: {
@@ -374,6 +403,7 @@ router.post('/', requireAuth, requirePermission('add_project'), async (req: Auth
         milestones: true,
         issues: true,
         risks: true,
+        subProjects: { orderBy: { createdAt: 'asc' } },
       },
     });
 
@@ -546,6 +576,8 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
         issues: {
           include: {
             owner: { select: { id: true, name: true } },
+            assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
+            subProject: { select: { id: true, name: true, type: true } },
             raiser: { select: { id: true, name: true } },
             attachments: {
               select: {
@@ -559,6 +591,10 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
             },
           },
           orderBy: { raisedAt: 'desc' },
+        },
+        subProjects: {
+          orderBy: { createdAt: 'asc' },
+          include: { _count: { select: { issues: true } } },
         },
         risks: {
           include: {
@@ -719,17 +755,18 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: 'Forbidden: You can only edit projects you own or manage.' });
     }
 
+    if (req.body && req.body.ownerId !== undefined) {
+      return res.status(400).json({
+        error: 'Project ownership cannot be changed via charter update. Use PATCH /api/projects/:id/transfer-ownership.',
+      });
+    }
+
     const validation = ProjectCharterUpdateSchema.safeParse(req.body);
     if (!validation.success) {
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid input' });
     }
 
     const data = validation.data;
-
-    // Only executive leadership can transfer project ownership
-    if (data.ownerId && data.ownerId !== project.ownerId && !canTransferProjectOwnership(ctx)) {
-      return res.status(403).json({ error: 'Only executive leadership can transfer project ownership to another user.' });
-    }
 
     const newStart = data.startDate ? new Date(data.startDate) : project.startDate;
     const newEnd = data.endDate ? new Date(data.endDate) : project.endDate;
@@ -802,20 +839,6 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       });
     }
 
-    if (data.ownerId && data.ownerId !== project.ownerId) {
-      const newOwner = await prisma.user.findUnique({ where: { id: data.ownerId } });
-      if (!newOwner) {
-        return res.status(400).json({ error: 'Designated new owner does not exist.' });
-      }
-      updateData.ownerId = newOwner.id;
-      changeLogs.push({
-        what: 'Project Ownership Transferred',
-        fromValue: project.owner?.name || project.ownerId,
-        toValue: newOwner.name,
-        details: `Project ownership transferred to ${newOwner.name} by ${user.name}.`,
-      });
-    }
-
     // Budget updates are strictly isolated to authorized roles (CEO, HR, CTO, view_budget)
     // Non-budget callers (e.g. Employee who owns the project) have plannedBudget & contingency stripped
     const hasBudgetAccess = canAccessBudget(ctx, user);
@@ -854,14 +877,6 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
           where: { id: project.id },
           data: updateData,
         });
-
-        if (updateData.ownerId) {
-          await tx.projectMembership.upsert({
-            where: { projectId_userId: { projectId: project.id, userId: updateData.ownerId } },
-            create: { projectId: project.id, userId: updateData.ownerId, role: 'Owner' },
-            update: { role: 'Owner' },
-          });
-        }
 
         if (changeLogs.length > 0) {
           await tx.changeLogEntry.createMany({
@@ -904,6 +919,7 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
         milestones: true,
         issues: true,
         risks: true,
+        subProjects: { orderBy: { createdAt: 'asc' } },
       },
     });
 
@@ -1040,6 +1056,135 @@ router.get('/:id/members', requireAuth, async (req: AuthRequest, res: Response) 
   }
 });
 
+// PATCH /api/projects/:id/transfer-ownership - Transactional Project Ownership Transfer
+router.patch('/:id/transfer-ownership', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      include: {
+        owner: { select: { id: true, name: true, deletedAt: true } },
+      },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (project.ownerId !== user.id && !ctx.bypassPermissions && !ctx.isExecutive) {
+      return res.status(403).json({
+        error: 'Forbidden: Only the current Project Owner or an Executive can transfer project ownership.',
+      });
+    }
+
+    const validation = ProjectTransferOwnershipSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: validation.error.issues[0]?.message || 'newOwnerId is required' });
+    }
+
+    const { newOwnerId } = validation.data;
+    if (newOwnerId === project.ownerId) {
+      return res.status(400).json({ error: 'This user is already the project owner.' });
+    }
+
+    const targetMembership = await prisma.projectMembership.findUnique({
+      where: { projectId_userId: { projectId: project.id, userId: newOwnerId } },
+      include: {
+        user: {
+          select: { id: true, name: true, deletedAt: true, isSignupCompleted: true },
+        },
+      },
+    });
+
+    if (
+      !targetMembership ||
+      !targetMembership.user ||
+      targetMembership.user.deletedAt !== null ||
+      !targetMembership.user.isSignupCompleted
+    ) {
+      return res.status(400).json({
+        error: 'Ownership can only be transferred to an existing active member of this project.',
+      });
+    }
+
+    const previousOwnerId = project.ownerId;
+    const previousOwnerDeleted = project.owner?.deletedAt !== null;
+
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.project.update({
+          where: { id: project.id },
+          data: { ownerId: newOwnerId },
+        });
+
+        if (!previousOwnerDeleted) {
+          await tx.projectMembership.upsert({
+            where: { projectId_userId: { projectId: project.id, userId: previousOwnerId } },
+            create: { projectId: project.id, userId: previousOwnerId, role: 'Member' },
+            update: {},
+          });
+        }
+
+        await tx.changeLogEntry.create({
+          data: {
+            projectId: project.id,
+            entityType: 'PROJECT',
+            entityId: project.id,
+            action: 'OWNERSHIP_TRANSFERRED',
+            what: 'Project Ownership Transferred',
+            fromValue: project.owner?.name || previousOwnerId,
+            toValue: targetMembership.user.name,
+            actorId: user.id,
+            sourceType: 'PROJECT',
+            sourceId: project.id,
+            details: `Project ownership transferred from ${project.owner?.name || previousOwnerId} to ${targetMembership.user.name} by ${user.name}.`,
+            changedBy: user.name,
+          },
+        });
+      },
+      { maxWait: 10000, timeout: 15000 }
+    );
+
+    clearUserHierarchyCache();
+
+    try {
+      await createNotification({
+        userId: newOwnerId,
+        projectId: project.id,
+        title: 'Project Ownership Transferred',
+        message: `You are now the owner of project "${project.name}"`,
+        type: 'project_ownership_transfer',
+        linkUrl: `/projects/${project.id}`,
+      });
+    } catch (notifyErr) {
+      console.error('[Projects] Ownership transfer notification failed:', notifyErr);
+    }
+
+    const updatedProject = await prisma.project.findUnique({
+      where: { id: project.id },
+      include: {
+        owner: {
+          select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true },
+        },
+        memberships: {
+          include: {
+            user: {
+              select: { id: true, name: true, email: true, role: true, department: true, avatarUrl: true },
+            },
+          },
+        },
+      },
+    });
+
+    res.json(updatedProject);
+  } catch (error: any) {
+    console.error('Failed to transfer project ownership:', error);
+    res.status(500).json({ error: 'Failed to transfer project ownership' });
+  }
+});
+
 // POST /api/projects/:id/members - Add member to project
 router.post('/:id/members', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
@@ -1054,57 +1199,51 @@ router.post('/:id/members', requireAuth, async (req: AuthRequest, res: Response)
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    if (!canManageProject(ctx, project)) {
-      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage project team members.' });
+    const callerMembership = await prisma.projectMembership.findUnique({
+      where: { projectId_userId: { projectId: project.id, userId: user.id } },
+      select: { id: true },
+    });
+    const isProjectMember = project.ownerId === user.id || Boolean(callerMembership);
+    const userPermissions = Array.isArray(user.permissions)
+      ? user.permissions
+      : await getUserPermissionKeys(user.id);
+
+    if (!canAddProjectMember(ctx, project, userPermissions, isProjectMember)) {
+      return res.status(403).json({
+        error: 'Forbidden: You do not have permission to add members to this project.',
+      });
     }
 
     const { userId, role = 'Member' } = req.body;
-    if (!userId) {
+    if (!userId || typeof userId !== 'string') {
       return res.status(400).json({ error: 'userId is required' });
     }
 
     const targetUser = await prisma.user.findUnique({
       where: { id: userId },
-      include: { roleDefinition: true },
+      select: { id: true, deletedAt: true, isSignupCompleted: true },
     });
-    if (!targetUser) {
+    if (!targetUser || targetUser.deletedAt !== null) {
       return res.status(404).json({ error: 'Target user does not exist' });
     }
-
-    const targetRank =
-      targetUser.roleDefinition?.rank ??
-      (targetUser.role === 'CEO' || targetUser.role === 'HR'
-        ? 1
-        : targetUser.role === 'CTO'
-        ? 2
-        : targetUser.role === 'Employee'
-        ? 3
-        : 4);
-    const targetIsIntern = targetUser.role === 'Intern' || targetRank === 4;
-
-    if (!ctx.isExecutive && !ctx.bypassPermissions) {
-      if (ctx.roleRank <= 2) {
-        // Leadership (e.g. CTO) can add any member strictly below their hierarchy rank
-        if (targetRank <= ctx.roleRank || targetUser.roleDefinition?.bypassPermissions) {
-          return res.status(403).json({
-            error: 'Forbidden: You can only add members below your hierarchy role.',
-          });
-        }
-      } else if (targetIsIntern) {
-        // Non-executive project owners can only add interns who directly report to them
-        const isSubordinate = targetUser.managerId === ctx.userId || ctx.allSubordinateIds.includes(targetUser.id);
-        if (!isSubordinate) {
-          return res.status(403).json({
-            error: 'Forbidden: Project owners can only add interns who directly report to them.',
-          });
-        }
-      }
+    if (!targetUser.isSignupCompleted) {
+      return res.status(400).json({ error: 'Only active users who have completed signup can be added.' });
     }
 
-    const membership = await prisma.projectMembership.upsert({
+    if (targetUser.id === project.ownerId) {
+      return res.status(409).json({ error: 'This user is already the owner of this project.' });
+    }
+
+    const existingMembership = await prisma.projectMembership.findUnique({
       where: { projectId_userId: { projectId: project.id, userId } },
-      create: { projectId: project.id, userId, role },
-      update: { role },
+      select: { id: true },
+    });
+    if (existingMembership) {
+      return res.status(409).json({ error: 'User is already a member of this project.' });
+    }
+
+    const membership = await prisma.projectMembership.create({
+      data: { projectId: project.id, userId, role: typeof role === 'string' && role.trim() ? role.trim() : 'Member' },
       include: {
         user: {
           select: { id: true, name: true, email: true, role: true, avatarUrl: true },
@@ -1112,9 +1251,67 @@ router.post('/:id/members', requireAuth, async (req: AuthRequest, res: Response)
       },
     });
 
+    clearUserHierarchyCache(userId);
     res.status(201).json(membership);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to add project member' });
+  }
+});
+
+// GET /api/projects/:id/member-candidates - Active users eligible to be added to this project
+router.get('/:id/member-candidates', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      select: {
+        id: true,
+        ownerId: true,
+        memberships: { select: { userId: true } },
+      },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const isProjectMember =
+      project.ownerId === user.id || project.memberships.some((m) => m.userId === user.id);
+    const userPermissions = Array.isArray(user.permissions)
+      ? user.permissions
+      : await getUserPermissionKeys(user.id);
+
+    if (!canAddProjectMember(ctx, project, userPermissions, isProjectMember)) {
+      return res.status(403).json({
+        error: 'Forbidden: You do not have permission to view member candidates for this project.',
+      });
+    }
+
+    const excludedIds = Array.from(
+      new Set([project.ownerId, ...project.memberships.map((m) => m.userId)])
+    );
+
+    const candidates = await prisma.user.findMany({
+      where: {
+        deletedAt: null,
+        isSignupCompleted: true,
+        id: { notIn: excludedIds },
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        avatarUrl: true,
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    res.json(candidates);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch member candidates' });
   }
 });
 
@@ -1191,7 +1388,7 @@ router.delete('/:id/members/:userId', requireAuth, async (req: AuthRequest, res:
 
     const targetUserId = req.params.userId;
     if (targetUserId === project.ownerId) {
-      return res.status(400).json({ error: 'Cannot remove the Project Owner from project membership.' });
+      return res.status(400).json({ error: 'Transfer project ownership before removing the owner.' });
     }
 
     const targetUser = await prisma.user.findUnique({
@@ -1224,6 +1421,214 @@ router.delete('/:id/members/:userId', requireAuth, async (req: AuthRequest, res:
     res.json({ success: true, message: 'Member removed from project.' });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to remove project member' });
+  }
+});
+
+// -------------------------------------------------------------
+// SUB-PROJECTS (COMPONENTS / APPS) & ASSIGNABLE MEMBERS
+// -------------------------------------------------------------
+
+// GET /api/projects/:id/sub-projects - List sub-projects for a project
+router.get('/:id/sub-projects', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to view this project.' });
+    }
+
+    const subProjects = await prisma.subProject.findMany({
+      where: { projectId: req.params.id },
+      orderBy: { createdAt: 'asc' },
+      include: { _count: { select: { issues: true } } },
+    });
+
+    res.json(subProjects);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch sub-projects' });
+  }
+});
+
+// POST /api/projects/:id/sub-projects - Create a sub-project
+router.post('/:id/sub-projects', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({ where: { id: req.params.id } });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage sub-projects.' });
+    }
+
+    const validation = SubProjectCreateSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid sub-project input' });
+    }
+
+    const { name, type, description } = validation.data;
+    const duplicate = await prisma.subProject.findFirst({
+      where: {
+        projectId: project.id,
+        name: { equals: name, mode: 'insensitive' },
+      },
+    });
+    if (duplicate) {
+      return res.status(409).json({ error: `A sub-project named "${name}" already exists in this project.` });
+    }
+
+    const created = await prisma.subProject.create({
+      data: {
+        projectId: project.id,
+        name,
+        type,
+        description: description ?? null,
+      },
+      include: { _count: { select: { issues: true } } },
+    });
+
+    res.status(201).json(created);
+  } catch (error: any) {
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ error: 'A sub-project with that name already exists in this project.' });
+    }
+    res.status(500).json({ error: 'Failed to create sub-project' });
+  }
+});
+
+// PATCH /api/projects/:id/sub-projects/:subProjectId - Update a sub-project
+router.patch('/:id/sub-projects/:subProjectId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({ where: { id: req.params.id } });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage sub-projects.' });
+    }
+
+    const existing = await prisma.subProject.findUnique({ where: { id: req.params.subProjectId } });
+    if (!existing || existing.projectId !== project.id) {
+      return res.status(404).json({ error: 'Sub-project not found in this project' });
+    }
+
+    const validation = SubProjectUpdateSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid sub-project input' });
+    }
+
+    const { name, type, description } = validation.data;
+    if (name !== undefined && name.toLowerCase() !== existing.name.toLowerCase()) {
+      const duplicate = await prisma.subProject.findFirst({
+        where: {
+          projectId: project.id,
+          id: { not: existing.id },
+          name: { equals: name, mode: 'insensitive' },
+        },
+      });
+      if (duplicate) {
+        return res.status(409).json({ error: `A sub-project named "${name}" already exists in this project.` });
+      }
+    }
+
+    const updated = await prisma.subProject.update({
+      where: { id: existing.id },
+      data: {
+        ...(name !== undefined ? { name } : {}),
+        ...(type !== undefined ? { type } : {}),
+        ...(description !== undefined ? { description } : {}),
+      },
+      include: { _count: { select: { issues: true } } },
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ error: 'A sub-project with that name already exists in this project.' });
+    }
+    res.status(500).json({ error: 'Failed to update sub-project' });
+  }
+});
+
+// DELETE /api/projects/:id/sub-projects/:subProjectId - Delete a sub-project
+router.delete('/:id/sub-projects/:subProjectId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    const project = await prisma.project.findUnique({ where: { id: req.params.id } });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    if (!canManageProject(ctx, project)) {
+      return res.status(403).json({ error: 'Forbidden: Only the Project Owner or Executive can manage sub-projects.' });
+    }
+
+    const existing = await prisma.subProject.findUnique({ where: { id: req.params.subProjectId } });
+    if (!existing || existing.projectId !== project.id) {
+      return res.status(404).json({ error: 'Sub-project not found in this project' });
+    }
+
+    await prisma.subProject.delete({ where: { id: existing.id } });
+    res.json({ deleted: true, id: existing.id });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to delete sub-project' });
+  }
+});
+
+// GET /api/projects/:id/assignable-members - Active project members eligible for issue assignment
+router.get('/:id/assignable-members', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const ctx = await getUserHierarchyContext(user.id);
+
+    if (!canViewProject(ctx, req.params.id)) {
+      return res.status(403).json({ error: 'Forbidden: You do not have access to view this project.' });
+    }
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      select: {
+        ownerId: true,
+        memberships: { select: { userId: true } },
+      },
+    });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const candidateIds = Array.from(
+      new Set([project.ownerId, ...project.memberships.map((m) => m.userId)])
+    );
+
+    const activeMembers = await prisma.user.findMany({
+      where: {
+        id: { in: candidateIds },
+        deletedAt: null,
+        isSignupCompleted: true,
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        avatarUrl: true,
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    res.json(activeMembers);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch assignable project members' });
   }
 });
 

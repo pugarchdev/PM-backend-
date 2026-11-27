@@ -228,6 +228,23 @@ export function canManageProject(ctx: UserHierarchyContext, project: { ownerId: 
 }
 
 /**
+ * Checks whether user can add active members to a project.
+ * Granted to bypassPermissions, executive, project owner, project managers,
+ * or users with 'add_project_member' permission who belong to the project.
+ */
+export function canAddProjectMember(
+  ctx: UserHierarchyContext,
+  project: { ownerId: string },
+  userPermissions: string[],
+  isProjectMember: boolean
+): boolean {
+  if (ctx.bypassPermissions || ctx.isExecutive || project.ownerId === ctx.userId || canManageProject(ctx, project)) {
+    return true;
+  }
+  return userPermissions.includes('add_project_member') && isProjectMember === true;
+}
+
+/**
  * Checks whether user can transfer project ownership
  */
 export function canTransferProjectOwnership(ctx: UserHierarchyContext): boolean {

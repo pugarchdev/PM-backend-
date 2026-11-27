@@ -81,8 +81,15 @@ export const PhaseRenameSchema = z.object({
   name: z.string().trim().min(1, 'Phase name is required').max(100, 'Phase name cannot exceed 100 characters'),
 });
 
+const nullableTrimmedId = z
+  .union([z.string().trim(), z.null()])
+  .optional()
+  .transform((val) => (val === '' ? null : val));
+
 export const IssueCreateSchema = z.object({
   projectId: z.string({ error: 'Project is required' }).min(1, 'Project is required'),
+  subProjectId: nullableTrimmedId,
+  assigneeId: nullableTrimmedId,
   taskId: z.string().nullable().optional(),
   title: z.string({ error: 'Title is required' }).trim().min(1, 'Title is required').max(150, 'Title cannot exceed 150 characters'),
   severity: z.enum(['Minor', 'Major', 'Critical'], { error: 'Severity is required' }),
@@ -97,7 +104,22 @@ export const IssueUpdateSchema = z.object({
   stepsToReproduce: z.string().trim().min(1).optional(),
   state: z.enum(['Open', 'In progress', 'Closed']).optional(),
   reopenComment: z.string().trim().optional(),
+  subProjectId: nullableTrimmedId,
+  assigneeId: nullableTrimmedId,
 });
+
+export const SUB_PROJECT_TYPES = ['APP', 'DASHBOARD', 'WEB', 'API', 'OTHER'] as const;
+
+export const SubProjectCreateSchema = z.object({
+  name: z.string().trim().min(1, 'Sub-project name is required').max(100, 'Name cannot exceed 100 characters'),
+  type: z.enum(SUB_PROJECT_TYPES).optional().default('APP'),
+  description: z
+    .union([z.string().trim().max(300, 'Description cannot exceed 300 characters'), z.null()])
+    .optional()
+    .transform((val) => (val === '' ? null : val)),
+});
+
+export const SubProjectUpdateSchema = SubProjectCreateSchema.partial();
 
 export const RiskCreateSchema = z.object({
   projectId: z.string().min(1, 'Project is required'),
@@ -202,6 +224,7 @@ export const ProjectCreateSchema = z
     plannedBudget: z.coerce.number().min(0, 'Budget must be positive').max(100000000).optional().default(0),
     contingency: z.coerce.number().min(0, 'Contingency must be positive').max(100000000).optional().default(0),
     logoUrl: logoUrlSchema,
+    subProjects: z.array(SubProjectCreateSchema).max(20, 'Maximum 20 sub-projects allowed').optional(),
   })
   .refine(
     (data) => {
@@ -222,7 +245,6 @@ export const ProjectCharterUpdateSchema = z
     sponsor: z.string().trim().min(1, 'Client is required').optional(),
     startDate: z.string().or(z.date()).optional(),
     endDate: z.string().or(z.date()).optional(),
-    ownerId: z.string().min(1).optional(),
     plannedBudget: z.coerce.number().min(0, 'Planned budget cannot be negative').optional(),
     contingency: z.coerce.number().min(0, 'Contingency cannot be negative').optional(),
     logoUrl: logoUrlSchema,
@@ -241,6 +263,10 @@ export const ProjectCharterUpdateSchema = z
       path: ['endDate'],
     }
   );
+
+export const ProjectTransferOwnershipSchema = z.object({
+  newOwnerId: z.string().trim().min(1, 'newOwnerId is required'),
+});
 
 export const ApprovalRequestCreateSchema = z.object({
   projectId: z.string().min(1, 'Project is required'),

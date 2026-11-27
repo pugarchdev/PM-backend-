@@ -11,6 +11,8 @@ export type NotificationType =
   | 'approval_awaiting'
   | 'approval_decision'
   | 'critical_issue'
+  | 'issue_assignment'
+  | 'project_ownership_transfer'
   | 'high_risk'
   | 'budget_warning'
   | 'milestone_movement';
@@ -33,6 +35,8 @@ const PUSH_NOTIFICATION_TYPES = new Set([
   'approval_awaiting',
   'approval_decision',
   'critical_issue',
+  'issue_assignment',
+  'project_ownership_transfer',
 ]);
 
 export async function createNotification(params: CreateNotificationParams) {

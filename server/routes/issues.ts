@@ -4,6 +4,7 @@ import { prisma } from '../../lib/prisma.js';
 import { AuthRequest, requireAuth } from '../auth.js';
 import { IssueCreateSchema, IssueUpdateSchema } from '../../lib/validators.js';
 import { getUserHierarchyContext, canViewProject, canManageIssue } from '../services/authorizationService.js';
+import { createNotification } from '../services/notificationService.js';
 import {
   validateEvidenceFile,
   storeEvidenceAttachment,
@@ -15,6 +16,48 @@ import {
 import { deleteFromS3 } from '../services/s3Service.js';
 
 const router = Router();
+
+async function validateIssueSubProjectAndAssignee(
+  projectId: string,
+  projectOwnerId: string,
+  subProjectId?: string | null,
+  assigneeId?: string | null
+): Promise<{ error?: string; subProjectName?: string | null }> {
+  let subProjectName: string | null = null;
+
+  if (subProjectId) {
+    const sp = await prisma.subProject.findFirst({
+      where: { id: subProjectId, projectId },
+      select: { id: true, name: true },
+    });
+    if (!sp) {
+      return { error: 'Selected sub-project does not belong to this project.' };
+    }
+    subProjectName = sp.name;
+  }
+
+  if (assigneeId) {
+    const targetUser = await prisma.user.findUnique({
+      where: { id: assigneeId },
+      select: { id: true, deletedAt: true },
+    });
+    if (!targetUser || targetUser.deletedAt !== null) {
+      return { error: 'Issue assignee must be an active member of this project.' };
+    }
+
+    if (assigneeId !== projectOwnerId) {
+      const membership = await prisma.projectMembership.findUnique({
+        where: { projectId_userId: { projectId, userId: assigneeId } },
+        select: { id: true },
+      });
+      if (!membership) {
+        return { error: 'Issue assignee must be an active member of this project.' };
+      }
+    }
+  }
+
+  return { subProjectName };
+}
 
 // Configure multer memory storage for evidence attachments
 const upload = multer({
@@ -99,6 +142,8 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     const ctx = await getUserHierarchyContext(user.id);
     const {
       projectId,
+      subProjectId,
+      assigneeId,
       severity,
       state,
       search,
@@ -125,6 +170,14 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       where.severity = String(severity);
     }
 
+    if (subProjectId && subProjectId !== 'ALL') {
+      where.subProjectId = String(subProjectId);
+    }
+
+    if (assigneeId && assigneeId !== 'ALL') {
+      where.assigneeId = String(assigneeId);
+    }
+
     if (state && state !== 'ALL') {
       const s = String(state);
       if (s === 'OPEN' || s === 'Open') {
@@ -148,6 +201,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     const selectProjection = {
       id: true,
       projectId: true,
+      subProjectId: true,
       taskId: true,
       title: true,
       severity: true,
@@ -155,6 +209,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       stepsToReproduce: true,
       state: true,
       ownerId: true,
+      assigneeId: true,
       raisedBy: true,
       raisedAt: true,
       closedAt: true,
@@ -162,8 +217,10 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       createdAt: true,
       updatedAt: true,
       project: { select: { id: true, name: true, ownerId: true } },
+      subProject: { select: { id: true, name: true, type: true } },
       task: { select: { id: true, title: true } },
       owner: { select: { id: true, name: true, avatarUrl: true } },
+      assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
       raiser: { select: { id: true, name: true, avatarUrl: true } },
       attachments: {
         select: {
@@ -259,6 +316,16 @@ router.post('/', requireAuth, upload.array('evidence', MAX_EVIDENCE_ATTACHMENTS)
       return res.status(403).json({ error: 'Forbidden: You must have access to the project to raise an issue.' });
     }
 
+    const refCheck = await validateIssueSubProjectAndAssignee(
+      project.id,
+      project.ownerId,
+      validation.data.subProjectId,
+      validation.data.assigneeId
+    );
+    if (refCheck.error) {
+      return res.status(400).json({ error: refCheck.error });
+    }
+
     // Process and validate evidence files if present
     const files = (req.files as Express.Multer.File[]) || [];
     const validatedFilesData: Array<{
@@ -306,6 +373,8 @@ router.post('/', requireAuth, upload.array('evidence', MAX_EVIDENCE_ATTACHMENTS)
     const issue = await prisma.issue.create({
       data: {
         projectId: validation.data.projectId,
+        subProjectId: validation.data.subProjectId ?? null,
+        assigneeId: validation.data.assigneeId ?? null,
         taskId: validation.data.taskId || null,
         title: validation.data.title,
         severity: validation.data.severity,
@@ -320,7 +389,9 @@ router.post('/', requireAuth, upload.array('evidence', MAX_EVIDENCE_ATTACHMENTS)
       },
       include: {
         project: { select: { id: true, name: true, ownerId: true } },
+        subProject: { select: { id: true, name: true, type: true } },
         owner: { select: { id: true, name: true, avatarUrl: true } },
+        assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
         raiser: { select: { id: true, name: true, avatarUrl: true } },
         attachments: {
           select: {
@@ -334,6 +405,18 @@ router.post('/', requireAuth, upload.array('evidence', MAX_EVIDENCE_ATTACHMENTS)
         },
       },
     });
+
+    if (issue.assigneeId && issue.assigneeId !== user.id) {
+      const subLabel = issue.subProject?.name ? ` [${issue.subProject.name}]` : '';
+      await createNotification({
+        userId: issue.assigneeId,
+        projectId: project.id,
+        title: 'Issue Assigned',
+        message: `${user.name} assigned you to "${issue.title}" on ${project.name}${subLabel}`,
+        type: 'issue_assignment',
+        linkUrl: `/issues?issue=${issue.id}`,
+      });
+    }
 
     // Rule: Critical issues must generate the appropriate notification event
     if (issue.severity === 'Critical') {
@@ -392,8 +475,10 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       where: { id: req.params.id },
       include: {
         project: true,
+        subProject: { select: { id: true, name: true, type: true } },
         task: true,
         owner: { select: { id: true, name: true, email: true, avatarUrl: true } },
+        assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
         raiser: { select: { id: true, name: true, email: true, avatarUrl: true } },
         attachments: {
           select: {
@@ -509,15 +594,43 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: validation.error.issues[0]?.message || 'Invalid input' });
     }
 
+    const refCheck = await validateIssueSubProjectAndAssignee(
+      issue.projectId,
+      issue.project.ownerId,
+      validation.data.subProjectId,
+      validation.data.assigneeId
+    );
+    if (refCheck.error) {
+      return res.status(400).json({ error: refCheck.error });
+    }
+
     const updated = await prisma.issue.update({
       where: { id: req.params.id },
       data: validation.data,
       include: {
         project: { select: { id: true, name: true } },
+        subProject: { select: { id: true, name: true, type: true } },
         owner: { select: { id: true, name: true } },
+        assignee: { select: { id: true, name: true, email: true, avatarUrl: true } },
         raiser: { select: { id: true, name: true } },
       },
     });
+
+    if (
+      validation.data.assigneeId &&
+      validation.data.assigneeId !== issue.assigneeId &&
+      validation.data.assigneeId !== user.id
+    ) {
+      const subLabel = updated.subProject?.name ? ` [${updated.subProject.name}]` : '';
+      await createNotification({
+        userId: validation.data.assigneeId,
+        projectId: issue.projectId,
+        title: 'Issue Assigned',
+        message: `${user.name} assigned you to "${updated.title}" on ${updated.project.name}${subLabel}`,
+        type: 'issue_assignment',
+        linkUrl: `/issues?issue=${updated.id}`,
+      });
+    }
 
     res.json(updated);
   } catch (error: any) {
